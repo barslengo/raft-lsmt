@@ -57,3 +57,4 @@ build/
 **/build/
 libs/
 store/
+deps/libuv/
