@@ -58,3 +58,4 @@ build/
 libs/
 store/
 deps/libuv/
+include/uv/
