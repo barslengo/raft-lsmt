@@ -114,12 +114,12 @@ void mdb_gets(MDB_env *env, MDB_dbi dbi, char* keystr, MDB_val* val)
     e = mdb_get(txn, dbi, &key, val);
     switch (e)
     {
-    case 0: {
-      void *buf = malloc(val->mv_size);
-      memcpy(buf, val->mv_data, val->mv_size);
-      val->mv_data = buf;
-        break;
-    }
+      case 0: {
+                void *buff = malloc(val->mv_size);
+                memcpy(buff, val->mv_data, val->mv_size);
+                val->mv_data = buff;
+                break;
+              }
     case MDB_NOTFOUND:
         val->mv_data = NULL;
         val->mv_size = 0;
