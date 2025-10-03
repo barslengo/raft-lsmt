@@ -58,4 +58,6 @@ build/
 libs/
 store/
 deps/libuv/
+deps/h2o/
 include/uv/
+include/h2o/
