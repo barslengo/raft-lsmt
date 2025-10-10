@@ -14,6 +14,7 @@ typedef struct lsmt {
   sl_t *memtable;
   index_t *last_index;
   uint32_t sstable_id; //incremental id for the next sstable
+  char *db_path;
 
   pthread_mutex_t metadata_lock;
 } lsmt_t;
@@ -24,7 +25,7 @@ typedef struct lsmt {
  * | T | L | L | L | L | DATA |
  */
 uint8_t *encode_data(uint8_t type, uint32_t length, void *data);
-lsmt_t *lsmt_init();
+lsmt_t *lsmt_init(const char *db_path);
 void lsmt_flush(lsmt_t *lsmt);
 void lsmt_free(lsmt_t *lsmt);
 int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size);

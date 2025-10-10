@@ -9,8 +9,8 @@
 typedef struct queue queue_t;
 
 typedef struct sst_metadata_record {
-  char sstable_filename[128];
-  char sst_index_filename[128];
+  char sstable_filename[256];
+  char sst_index_filename[256];
   uint32_t id;
   uint32_t level;
   uint64_t created_at;
@@ -26,7 +26,7 @@ typedef struct sst_node {
 } sst_node_t;
 
 typedef struct sst_metadata {
-  char *disk_path;
+  char disk_path[512];
   uint8_t version;
   /* bytes offset on disk to the position of the start of the last write.
    * This way i can easily load metadata of the last N sstables. 
@@ -43,7 +43,7 @@ typedef struct sst_metadata {
   double tier_size[64];
 } sst_metadata_t;
 
-sst_metadata_t *sst_metadata_init();
+sst_metadata_t *sst_metadata_init(const char *path);
 sst_metadata_t *sst_metadata_load(const char *path);
 int sst_metadata_free(sst_metadata_t *sst_meta);
 int sst_metadata_flush(sst_metadata_t *sst_meta);

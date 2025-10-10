@@ -11,7 +11,7 @@
 #endif
 
 /* clang-format off */
-#define RAFT__LEGACY_
+#define RAFT__LEGACY_@enable_v0@
 /* clang-format on */
 
 /* Handle C/C++ differences for static asserts */

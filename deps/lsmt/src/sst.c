@@ -83,9 +83,9 @@ static sst_node_t *node_remove(sst_node_t *list, sst_node_t *node) {
   return list;
 }
 
-sst_metadata_t *sst_metadata_init() {
+sst_metadata_t *sst_metadata_init(const char *path) {
   sst_metadata_t *meta = malloc(sizeof(sst_metadata_t));
-  meta->disk_path = ".metadata";
+  snprintf(meta->disk_path, sizeof(meta->disk_path), "%s/.lsmt_metadata", path); 
   meta->version = 1;
   meta->highest_tier = 0;
 

@@ -10,12 +10,26 @@
 #include "index.h"
 #include "utils.h"
 
+
+
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+
+
 #define SIZE_THRESHOLD (2 * 1024 * 1024)
+
 #define POOL_SIZE 4 
 #define ZERO_LEVEL_MAX_SIZE (8 * 1024 * 1024) //maximum size for level 0 sstables.
 #define SSTABLE_MERGE_LIMIT 4 //maximum number of sstable to merge
 
-#define SST_FILENAME_MAX_LENGTH 128
+#define SST_FILENAME_MAX_LENGTH 256
 #define SST_EXT ".sbrolf"
 #define SST_INDEX_EXT ".prot"
 
@@ -53,7 +67,7 @@ uint8_t *encode_data(uint8_t type, uint32_t length, void *data) {
   return out;
 }
 
-static sst_file_paths_t new_sstable_filename() {
+static sst_file_paths_t new_sstable_filename(const char *dir) {
   static _Atomic(uint16_t) counter = 0;
 
   char filename[SST_FILENAME_MAX_LENGTH];
@@ -61,7 +75,7 @@ static sst_file_paths_t new_sstable_filename() {
   uint64_t epoch_ms = get_unix_epoch();
   uint16_t counter_val = atomic_fetch_add(&counter, 1); 
 
-  snprintf(filename, sizeof(filename), "db_%lu_%u", epoch_ms, counter_val); 
+  snprintf(filename, sizeof(filename), "%s/db_%lu_%u", dir, epoch_ms, counter_val); 
 
   files.sst_file = malloc(strlen(filename) + strlen(SST_EXT) + 1);
   files.index_file = malloc(strlen(filename) + strlen(SST_EXT) + 1);
@@ -144,8 +158,8 @@ static written_record_t write_min_record(FILE *out, FILE *sstables[], uint8_t ss
   return result;
 }
 
-static sst_metadata_record_t sst_merge(sst_metadata_record_t records[], uint8_t length) { 
-  sst_file_paths_t file_paths = new_sstable_filename();
+static sst_metadata_record_t sst_merge(sst_metadata_record_t records[], uint8_t length, const char *db_path) { 
+  sst_file_paths_t file_paths = new_sstable_filename(db_path);
 
   FILE *fp[length];
   for (uint8_t i = 0; i < length; i++) {
@@ -180,6 +194,7 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t records[], uint8_t 
   }
 
   fclose(new_file);
+  //snprintf(sst_path, sizeof(sst_path), "%s/%s", db_path, file_paths.index_file); 
   index_flush(index, file_paths.index_file);
   index_free(index);
 
@@ -204,7 +219,7 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t records[], uint8_t 
 
 /* Iterate over all the tiers and compact the sstables
  * whose sum of their size exceed the tier threshold. */
-static int sst_compact(sst_metadata_t *sst_meta, pthread_mutex_t *mutex) {
+static int sst_compact(sst_metadata_t *sst_meta, const char *db_path, pthread_mutex_t *mutex) {
   uint8_t highest_tier = sst_meta->highest_tier;
 
   for (uint8_t tier = 0; tier < highest_tier; tier++) {
@@ -239,7 +254,7 @@ static int sst_compact(sst_metadata_t *sst_meta, pthread_mutex_t *mutex) {
       //fflush(stdout);
       pthread_mutex_unlock(mutex);
 
-      sst_metadata_record_t new_sst = sst_merge(records, j);
+      sst_metadata_record_t new_sst = sst_merge(records, j, db_path);
 
       pthread_mutex_lock(mutex);
       sst_metadata_add(sst_meta, new_sst); 
@@ -258,7 +273,7 @@ static void *dump_to_disk(void *arg) {
   sl_t *memtable = task_args->memtable;
   free(task_args);
 
-  sst_file_paths_t files = new_sstable_filename();
+  sst_file_paths_t files = new_sstable_filename(lsmt->db_path);
 
   FILE *fp = fopen(files.sst_file, "wb");
   if (!fp) {
@@ -297,7 +312,7 @@ static void *dump_to_disk(void *arg) {
   }
 
   fclose(fp);
-  index_flush(index, files.index_file);
+  index_flush(index, files.index_file); 
   index_free(index);
   sl_free(memtable);
 
@@ -312,7 +327,7 @@ static void *dump_to_disk(void *arg) {
 
   pthread_mutex_unlock(&lsmt->metadata_lock);
 
-  sst_compact(lsmt->metadata, &lsmt->metadata_lock);
+  sst_compact(lsmt->metadata, lsmt->db_path, &lsmt->metadata_lock);
 /*
   size_t total_size = memtable->size + sizeof(sl_t);
   printf("levels: %ld\n", memtable->levels);
@@ -323,11 +338,46 @@ static void *dump_to_disk(void *arg) {
   return NULL;
 }
 
-lsmt_t *lsmt_init() {
+
+static int ensureDir(const char *dir)
+{
+    int rv;
+    struct stat sb;
+    rv = stat(dir, &sb);
+    if (rv == -1) {
+        if (errno == ENOENT) {
+            rv = mkdir(dir, 0700);
+            if (rv != 0) {
+                printf("error: create directory '%s': %s", dir,
+                       strerror(errno));
+                return 1;
+            }
+        } else {
+            printf("error: stat directory '%s': %s", dir, strerror(errno));
+            return 1;
+        }
+    } else {
+        if ((sb.st_mode & S_IFMT) != S_IFDIR) {
+            printf("error: path '%s' is not a directory", dir);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+lsmt_t *lsmt_init(const char *db_path) {
   lsmt_t *db = malloc(sizeof(lsmt_t));
   db->last_index = NULL;
   db->memtable = sl_init();
-  db->metadata = sst_metadata_init();
+  db->db_path = strdup(db_path);
+
+  int res = ensureDir(db->db_path);
+  if (res != 0) {
+    perror("LSMT INIT");
+    exit(1);
+  }
+
+  db->metadata = sst_metadata_init(db_path);
   if (pthread_mutex_init(&db->metadata_lock, NULL) != 0) {
     perror("LSMT INIT");
     exit(1);
@@ -353,14 +403,21 @@ void lsmt_free(lsmt_t *lsmt) {
   if (lsmt == NULL) return;
   if (lsmt->last_index != NULL) index_free(lsmt->last_index);
   if (lsmt->metadata) sst_metadata_free(lsmt->metadata); 
+  if (lsmt->db_path) free(lsmt->db_path);
   pthread_mutex_destroy(&lsmt->metadata_lock);
 
   free(lsmt);
 }
 
 int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size) {
+  static size_t count = 0;
   if (lsmt == NULL || lsmt->memtable == NULL) return -1;
 
+  /*
+  if (count % 256 == 0) {
+    printf("inserted %lu items.\n", count);
+  }
+  */
   if (lsmt->memtable->size > SIZE_THRESHOLD) {
     //dump content to disk in a new thread.
     dump_task_t *task_args = malloc(sizeof(dump_task_t));
@@ -378,8 +435,10 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
       pthread_create(&thread_pool[thread_idx++], NULL, dump_to_disk, task_args);
     }
 
+    count = 0;
     lsmt->memtable = sl_init();
   }
+  count++;
 
   //TODO: write ahead log
   return sl_insert(lsmt->memtable, key, content, size);

@@ -15,6 +15,10 @@ endif
 
 # Linker flags - Note: -L and -l flags are now used for linking the executable
 LDFLAGS = -L./libs/lsmt -llsmt \
+					-L./libs/raft -lraft \
+					-luv -lpthread -ldl -lrt -lm -llz4
+
+#LDFLAGS = -L./libs/lsmt -llsmt \
 					-L./libs/lmdb -llmdb \
 					-L./libs/raft -lraft \
 					-L./libs/libuv -luv \
@@ -24,20 +28,20 @@ LDFLAGS = -L./libs/lsmt -llsmt \
 
 # Source files
 SRC = $(wildcard src/*.c)
-INCLUDED_SRC = src/usage.c src/parse_addr.c 
+INCLUDED_SRC = src/main.c src/usage.c src/lmdb_helpers.c 
 
 # Separate main.c from other source files which will form the library
-MAIN_SRC = src/main.c
+MAIN_SRC = src/server.c
 APP_SRC = $(filter-out $(MAIN_SRC) $(INCLUDED_SRC), $(SRC))
 
 # Object files for the application/library
 APP_OBJ = $(patsubst %.c, build/%.o, $(APP_SRC))
 
 # Object file for the main entry point
-MAIN_OBJ = build/src/main.o
+MAIN_OBJ = build/src/server.o
 
 # Executable targets
-EXEC = build/ddb
+EXEC = build/server
 
 # Default target: build the main executable
 main: $(EXEC)
@@ -92,25 +96,6 @@ lmdb:
 	cp deps/lmdb/build/lib/liblmdb.a ./libs/lmdb/
 .PHONY : lmdb
 
-raft_build:
-	cd deps/raft && make all
-	mkdir -p include/raft
-	mkdir -p libs/raft
-	cp deps/raft/*.h ./include/raft/ 
-	cp deps/raft/build/lib/libraft.a ./libs/raft/
-.PHONY : raft_build
-
-raft_fetch:
-	if test -e deps/raft; \
-	then cd deps/raft && git pull origin master; \
-	else git clone https://github.com/willemt/raft.git deps/raft; \
-	fi
-.PHONY : raft_fetch
-
-raft: raft_fetch raft_build 
-.PHONY : raft
-
-
 
 libh2o_build:
 	cd deps/h2o && cmake . -DCMAKE_INCLUDE_PATH=../libuv/include -DLIBUV_LIBRARIES=1 -DLIBUV_VERSION="1.18.0" -DOPENSSL_INCLUDE_DIR=/usr/include/openssl
@@ -159,7 +144,7 @@ libuv_fetch:
 libuv: libuv_fetch libuv_build
 .PHONY : libuv
 
-deps: lsmt lmdb tpl raft_build libuv
+deps: lsmt lmdb 
 .PHONY : deps
 
 all: deps main
