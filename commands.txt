@@ -1,2 +1,0 @@
-./build/ddb start --id 1 --raft_port 9001 --http_port 8001
-./build/ddb join 127.0.0.1:9001 --id 2 --raft_port 9002 --http_port 8002
