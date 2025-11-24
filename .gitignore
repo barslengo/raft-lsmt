@@ -58,6 +58,7 @@ build/
 libs/
 store/
 deps/libuv/
+deps/raft/
 deps/h2o/
 include/uv/
 include/h2o/
