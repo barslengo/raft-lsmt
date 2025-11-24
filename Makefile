@@ -1,5 +1,8 @@
-LIBUV_BRANCH=v1.18.0
-LIBH2O_BRANCH=v2.2.4
+#LIBUV_BRANCH=v1.18.0
+
+LIBUV_BRANCH=v1.51.0
+RAFT_TAG=v0.22.1
+
 # Compiler
 CC = gcc
 
@@ -16,7 +19,9 @@ endif
 # Linker flags - Note: -L and -l flags are now used for linking the executable
 LDFLAGS = -L./libs/lsmt -llsmt \
 					-L./libs/raft -lraft \
-					-luv -lpthread -ldl -lrt -lm -llz4
+					-L./libs/libuv -luv \
+					-lpthread -lm -llz4
+					#-L./libs/libh2o -lh2o \
 
 #LDFLAGS = -L./libs/lsmt -llsmt \
 					-L./libs/lmdb -llmdb \
@@ -28,7 +33,7 @@ LDFLAGS = -L./libs/lsmt -llsmt \
 
 # Source files
 SRC = $(wildcard src/*.c)
-INCLUDED_SRC = src/main.c src/usage.c src/lmdb_helpers.c 
+INCLUDED_SRC = src/main.c 
 
 # Separate main.c from other source files which will form the library
 MAIN_SRC = src/server.c
@@ -42,6 +47,9 @@ MAIN_OBJ = build/src/server.o
 
 # Executable targets
 EXEC = build/server
+
+main_example: CFLAGS += -D__RUN_EXAMPLE
+main_example: clean main
 
 # Default target: build the main executable
 main: $(EXEC)
@@ -79,50 +87,6 @@ lsmt:
 	cp deps/lsmt/build/lib/liblsmt.a ./libs/lsmt
 .PHONY : lsmt
 
-tpl:
-	cd deps/tpl && make
-	mkdir -p include/tpl
-	mkdir -p libs/tpl
-	cp deps/tpl/*.h ./include/tpl/ 
-	cp deps/tpl/build/lib/libtpl.a ./libs/tpl/
-.PHONY : tpl
-
-lmdb:
-	cd deps/lmdb && make
-	mkdir -p include/lmdb
-	mkdir -p libs/lmdb
-	cp deps/lmdb/*.h ./include/lmdb/ 
-	cp -r deps/lmdb/lmdb/ ./include/lmdb/ 
-	cp deps/lmdb/build/lib/liblmdb.a ./libs/lmdb/
-.PHONY : lmdb
-
-
-libh2o_build:
-	cd deps/h2o && cmake . -DCMAKE_INCLUDE_PATH=../libuv/include -DLIBUV_LIBRARIES=1 -DLIBUV_VERSION="1.18.0" -DOPENSSL_INCLUDE_DIR=/usr/include/openssl
-	cd deps/h2o && make libh2o
-	mkdir -p libs/libh2o
-	mkdir -p include/h2o
-	cp deps/h2o/libh2o.a libs/libh2o
-	cp -r deps/h2o/include/* ./include/h2o
-.PHONY : libh2o_build
-
-libh2o_fetch:
-	if test -e deps/h2o; \
-	then cd deps/h2o && rm -f CMakeCache.txt && git pull origin $(LIBH2O_BRANCH) ; \
-	else git clone https://github.com/h2o/h2o deps/h2o; \
-	fi
-	cd deps/h2o && git checkout $(LIBH2O_BRANCH)
-.PHONY : libh2o_fetch
-
-libh2o: libh2o_fetch libh2o_build
-.PHONY : libh2o
-
-libh2o_vendor:
-	rm -rf deps/h2o/.git > /dev/null
-.PHONY : libh2o_vendor
-
-
-
 libuv_build:
 	cd deps/libuv && sh autogen.sh
 	cd deps/libuv && ./configure
@@ -144,7 +108,30 @@ libuv_fetch:
 libuv: libuv_fetch libuv_build
 .PHONY : libuv
 
-deps: lsmt lmdb 
+raft_build:
+	cd deps/raft && autoreconf -i
+	cd deps/raft && ./configure \
+		UV_CFLAGS="-I$(CURDIR)/deps/libuv/include" \
+		UV_LIBS="-L$(CURDIR)/deps/libuv/.libs -L$(CURDIR)/deps/libuv -luv"
+	cd deps/raft && make
+	mkdir -p include/raft
+	mkdir -p libs/raft
+	cp -r deps/raft/include/* ./include/raft/
+	cp deps/raft/.libs/libraft.a ./libs/raft
+.PHONY : raft_build
+
+raft_fetch:
+	if test -e deps/raft; \
+	then cd deps/raft && git pull origin main; \
+	else git clone https://github.com/cowsql/raft deps/raft; \
+	fi
+	cd deps/raft && git checkout $(RAFT_TAG)
+.PHONY : raft_fetch
+
+raft: raft_fetch raft_build 
+.PHONY : raft
+
+deps: lsmt libuv raft
 .PHONY : deps
 
 all: deps main
@@ -155,9 +142,9 @@ libuv_vendor:
 .PHONY : libuv_vendor
 
 clean_deps:
+	rm -r deps/lsmt/build
 	rm -r deps/libuv
 	rm -r deps/raft/build
-	rm -r deps/tpl/build
-	rm -r deps/lsmt/build
-	rm -r deps/lmdb/build
 .PHONY : clean_deps
+
+.PHONY : main_example
