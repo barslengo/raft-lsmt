@@ -81,10 +81,10 @@ int main(int argc, char *argv[])
         forkServer(topLevelDir, i, &pids[i]);
     }
 
+    return 0;
     /* Seed the random generator */
     timespec_get(&now, TIME_UTC);
     srandom((unsigned)(now.tv_nsec ^ now.tv_sec));
-    return 0;
 
     while (1) {
         struct timespec interval;
