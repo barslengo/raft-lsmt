@@ -1,3 +1,11 @@
+/*
+ *  TODO: Build something for monitoring performances and correctness.
+ *
+ *  TODO: Build something for handling the clusters:
+ *    -Creating clusters.
+ *    -Adding/Removing/Starting/Stopping nodes from a cluster at runtime. 
+ */
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +24,7 @@
   printf("%d: " FORMAT "\n", SERVER_ID, __VA_ARGS__)
 
 
+#define BATCH_SIZE 100
 #define CONTENT_MAX_SIZE 255
 
 const uint8_t CONTENT_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t); 
@@ -41,70 +50,100 @@ struct Fsm
   insert_cmd_t insert_cmd;
 };
 
-/* buf struct:
- * 4 bytes: msg_length.
- * 16 bytes: record key.
- * (msg_length-4-16)bytes: record value.
- */
+
 static int FsmApply(struct raft_fsm *fsm,
     const struct raft_buffer *buf,
     void **result)
 {
   struct Fsm *f = fsm->data;
 
-  /* Check if the buffer is at least the size of the header. */
-  if (buf->len < sizeof(uint32_t) + sizeof(sl_uint128_t)) {
-    return RAFT_MALFORMED;
+  /* We treat the buffer as a stream of concatenated commands. 
+   * We loop until we have consumed the entire buffer length. */
+  size_t offset = 0;
+
+  /* Iterate until i don't have enought space even
+   * for reading the msg size (4 bytes). */
+  while (offset + sizeof(uint32_t) <= buf->len) {
+    uint32_t msg_size;
+
+    memcpy(&msg_size, (const uint8_t *)buf->base + offset,
+        sizeof(uint32_t)); 
+
+    /* I've reached the 0-filled padding added by the batch_flush. */
+    if (msg_size == 0) {
+      break;
+    }
+
+    /* Validation: Ensure the declared size fits in the remaining buffer */
+    if (msg_size + offset > buf->len) {
+      return RAFT_MALFORMED;
+    }
+
+    /* Validation: Ensure the message is at least as big as the header */
+    /* Header = Size(4) + Key(16) */
+    if (msg_size < sizeof(uint32_t) + sizeof(sl_uint128_t)) {
+      return RAFT_MALFORMED;
+    }
+
+    /* Calculate record value size */
+    const uint32_t record_value_size = msg_size - sizeof(uint32_t) - sizeof(sl_uint128_t);
+
+    if (record_value_size > CONTENT_MAX_SIZE) {
+      return RAFT_MALFORMED;
+    }
+
+    /* Deserialize into the persistent struct in fsm->data */
+    const uint8_t *data_ptr = (const uint8_t *)buf->base + offset;
+
+    /* Skip the size (4 bytes), copy the key (16 bytes) */
+    memcpy(&f->insert_cmd.record_key,
+        data_ptr + sizeof(uint32_t), 
+        sizeof(sl_uint128_t));
+
+    /* Copy the value */
+    memcpy(f->insert_cmd.record_value,
+        data_ptr + sizeof(uint32_t) + sizeof(sl_uint128_t), 
+        record_value_size);
+
+    /*
+    uint32_t value_size = *((uint32_t *)(f->insert_cmd.record_value + sizeof(uint8_t)));
+    printf("insert: key=%lu %lu, record_length=%u, value_type=%u, value_size=%u, value_content: \n[",
+        f->insert_cmd.record_key.id,
+        f->insert_cmd.record_key.timestamp,
+        record_value_size,
+        f->insert_cmd.record_value[0],
+        value_size);
+
+    uint32_t value_offset = record_value_size - value_size;
+    for (uint32_t i = record_value_size-1; i >= value_offset; i--) {
+      printf(" %02x", f->insert_cmd.record_value[i]);
+    }
+    printf("]\n\n");
+    fflush(stdout);
+    */
+
+    int e = lsmt_insert(db, f->insert_cmd.record_key,
+        f->insert_cmd.record_value, 
+        record_value_size);
+
+    if (e != 0) {
+      return RAFT_INVALID;
+    }
+    /* 6. Advance the offset to the next message in the batch */
+    offset += msg_size;
   }
-  const uint32_t msg_size = *(const uint32_t *)buf->base;
 
-  if (buf->len < msg_size) {
-    return RAFT_MALFORMED;
-  }
-
-  const uint32_t record_value_size = msg_size - sizeof(uint32_t) - sizeof(sl_uint128_t);
-
-  if (record_value_size > CONTENT_MAX_SIZE) {
-    return RAFT_MALFORMED;
-  }
-
-  const uint8_t *data = (const uint8_t *)buf->base; 
-
-  memcpy(&f->insert_cmd.record_key,
-      data + sizeof(uint32_t), sizeof(sl_uint128_t));
-
-  memcpy(f->insert_cmd.record_value,
-      data + sizeof(uint32_t) + sizeof(sl_uint128_t), record_value_size);
-
-  uint32_t value_size = *((uint32_t *)(f->insert_cmd.record_value + sizeof(uint8_t)));
-
-  /*
-  printf("insert: key=%lu %lu, record_length=%u, value_type=%u, value_size=%u, value_content: \n[",
-      f->insert_cmd.record_key.id,
-      f->insert_cmd.record_key.timestamp,
-      record_value_size,
-      f->insert_cmd.record_value[0],
-      value_size);
-
-  uint32_t value_offset = record_value_size - value_size;
-  for (uint32_t i = record_value_size-1; i >= value_offset; i--) {
-    printf(" %02x", f->insert_cmd.record_value[i]);
-  }
-  printf("]\n\n");
-  fflush(stdout);
-  */
-
-  int e = lsmt_insert(db, f->insert_cmd.record_key,
-      f->insert_cmd.record_value, record_value_size);
-
-  if (e != 0) {
-    return RAFT_INVALID;
-  }
-
-  //f->count += *(uint64_t*)buf->base;
-  //*result = &f->count;
   return 0;
 }
+
+
+
+/* buf struct:
+ * 4 bytes: msg_length.
+ * 16 bytes: record key.
+ * (msg_length-4-16)bytes: record value.
+ */
+
 
 static int FsmSnapshot(struct raft_fsm *fsm,
     struct raft_buffer *bufs[],
@@ -164,14 +203,14 @@ static void FsmClose(struct raft_fsm *f)
 
 // --- NEW: Struct to hold the state for each connected client ---
 typedef struct {
-    uv_tcp_t handle;
-    struct Server *server;
-    uv_write_t write_req;
+  uv_tcp_t handle;
+  struct Server *server;
+  uv_write_t write_req;
 
-    // A dynamic buffer to handle the incoming TCP stream
-    char *buffer;
-    size_t buffer_len;
-    size_t buffer_cap;
+  // A dynamic buffer to handle the incoming TCP stream
+  char *buffer;
+  size_t buffer_len;
+  size_t buffer_cap;
 } client_t;
 
 /********************************************************************
@@ -200,6 +239,11 @@ struct Server
   struct raft raft;                   /* Raft instance. */
   struct raft_transfer transfer;      /* Transfer leadership request. */
   ServerCloseCb close_cb;             /* Optional close callback. */
+
+  void *batch_buffer;                 /* Buffer for batching requests into a single log. */
+  uint32_t batch_offset;
+  uint32_t buffer_capacity;
+  uint32_t batched_req_count;
 };
 
 static void serverRaftCloseCb(struct raft *raft)
@@ -248,67 +292,118 @@ static void process_buffer(client_t *client);
 
 // Helper function to safely close and free a client's resources
 static void close_and_free_client(client_t *client) {
-    // The on_client_close callback will free the client memory
-    uv_close((uv_handle_t *)&client->handle, on_client_close);
+  // The on_client_close callback will free the client memory
+  uv_close((uv_handle_t *)&client->handle, on_client_close);
 }
 
 // Callback that fires after a client's handle is fully closed
 static void on_client_close(uv_handle_t *handle) {
-    client_t *client = (client_t *)handle->data;
-    // Free all associated memory
-    if (client->buffer) {
-        free(client->buffer);
-    }
-    free(client);
-    //Log(0, "TCP: Client disconnected and cleaned up.");
+  client_t *client = (client_t *)handle->data;
+  // Free all associated memory
+  if (client->buffer) {
+    free(client->buffer);
+  }
+  free(client);
+  //Log(0, "TCP: Client disconnected and cleaned up.");
 }
 
 // Callback for after a write operation (e.g., sending a response) is complete
 static void on_write_complete(uv_write_t *req, int status) {
-    if (status) {
-        fprintf(stderr, "Write error: %s\n", uv_strerror(status));
-    }
-    // You can free write-specific data here if you had any
+  if (status) {
+    fprintf(stderr, "Write error: %s\n", uv_strerror(status));
+  }
+  // You can free write-specific data here if you had any
 }
 
 // Libuv callback to allocate memory for an incoming client read
 static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
-    buf->base = malloc(suggested_size);
-    buf->len = suggested_size;
+  buf->base = malloc(suggested_size);
+  buf->len = suggested_size;
 }
 
 // This function is called every time we receive data from a client
 static void on_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
-    client_t *client = (client_t *)stream->data;
+  client_t *client = (client_t *)stream->data;
 
-    if (nread > 0) {
-        // Append the new data to our client's buffer
-        if (client->buffer_len + nread > client->buffer_cap) {
-            client->buffer_cap = (client->buffer_len + nread) * 2;
-            char *new_buf = realloc(client->buffer, client->buffer_cap);
-            if (!new_buf) {
-                // Out of memory
-                free(buf->base);
-                close_and_free_client(client);
-                return;
-            }
-            client->buffer = new_buf;
-        }
-        memcpy(client->buffer + client->buffer_len, buf->base, nread);
-        client->buffer_len += nread;
-
-        // Try to process one or more complete messages from the buffer
-        process_buffer(client);
-
-    } else if (nread < 0) {
-        if (nread != UV_EOF) {
-            fprintf(stderr, "Read error: %s\n", uv_strerror(nread));
-        }
+  if (nread > 0) {
+    // Append the new data to our client's buffer
+    if (client->buffer_len + nread > client->buffer_cap) {
+      client->buffer_cap = (client->buffer_len + nread) * 2;
+      char *new_buf = realloc(client->buffer, client->buffer_cap);
+      if (!new_buf) {
+        // Out of memory
+        free(buf->base);
         close_and_free_client(client);
+        return;
+      }
+      client->buffer = new_buf;
     }
+    memcpy(client->buffer + client->buffer_len, buf->base, nread);
+    client->buffer_len += nread;
 
-    // Libuv requires us to free the buffer from alloc_cb
-    free(buf->base);
+    // Try to process one or more complete messages from the buffer
+    process_buffer(client);
+
+  } else if (nread < 0) {
+    if (nread != UV_EOF) {
+      fprintf(stderr, "Read error: %s\n", uv_strerror(nread));
+    }
+    close_and_free_client(client);
+  }
+
+  // Libuv requires us to free the buffer from alloc_cb
+  free(buf->base);
+}
+
+static void batch_buffer_flush(struct Server *s) {
+  if (s->batched_req_count == 0) {
+    return;
+  }
+
+  //printf("Flushing batch of size: %d\n", s->batched_req_count);
+  struct raft_buffer raft_buf;
+
+  uint32_t aligned_msg_size = (s->batch_offset + 7) & ~0x07;
+  raft_buf.len = aligned_msg_size;
+  raft_buf.base = raft_malloc(raft_buf.len);
+
+  if (!raft_buf.base) {
+    fprintf(stderr, "Critical: Out of memory in flush_batch\n");
+    exit(1);
+  }
+
+  /* Copy from the reusable batch buffer to the Raft entry buffer */
+  memset(raft_buf.base, 0, raft_buf.len);
+  memcpy(raft_buf.base, s->batch_buffer, s->batch_offset);
+
+  struct raft_apply *req = raft_malloc(sizeof(*req));
+  if (!req) {
+    fprintf(stderr, "Critical: Out of memory for req in flush_batch\n");
+    exit(1);
+  }
+
+  req->data = s;
+
+  /* Apply the batch as ONE log entry */
+  int rv = raft_apply(&s->raft, req, &raft_buf, 1, serverApplyCb);
+
+  /*
+  printf("[BATCH saved] buffer (aligned) size=%lu, payload_len=%u\n",
+      raft_buf.len, s->batch_offset);
+  fflush(stdout);
+  */
+
+
+  if (rv != 0) {
+    Logf(s->id, "raft_apply() failed: %s", raft_errmsg(&s->raft));
+    raft_free(raft_buf.base);
+    raft_free(req);
+  }
+
+  /* Reset Batch State */
+  s->batch_offset = 0;
+  s->batched_req_count = 0;
+  memset(s->batch_buffer, 0, s->buffer_capacity); // Optional: clear buffer for debug
 }
 
 // This function implements the length-prefixed protocol parser
@@ -335,7 +430,7 @@ static void process_buffer(client_t *client) {
     }
 
     /* Extract the payload. */
-    char *payload = client->buffer; 
+    //char *payload = client->buffer; 
 
     //Logf(s->id, "TCP: Received command with size %u", payload_len);
 
@@ -343,6 +438,39 @@ static void process_buffer(client_t *client) {
       Log(s->id, "TCP: Rejecting command, not the leader.");
       // In a real system, you'd send an error response here
     } else {
+      /* Check if we need to FLUSH before adding this new message.
+       * Flush if:
+       *  a) Batch count limit reached
+       *  b) Batch buffer size limit reached (can't fit new message)
+       */
+      bool batch_full_count = (s->batched_req_count >= BATCH_SIZE);
+      bool batch_full_size  = (s->batch_offset + total_msg_len > s->buffer_capacity);
+
+      if (batch_full_count || batch_full_size) {
+        batch_buffer_flush(s);
+      }
+
+      /* Add to Batch */
+      /* Double check it fits now (in case single message > buffer capacity) */
+      if (s->batch_offset + total_msg_len <= s->buffer_capacity) {
+        memcpy((uint8_t*)s->batch_buffer + s->batch_offset, client->buffer, total_msg_len);
+        s->batch_offset += total_msg_len;
+        s->batched_req_count++;
+
+        //printf("[MSG BATCHED] payload_len=%u\n", total_msg_len);
+        //fflush(stdout);
+      } else {
+        Logf(s->id, "Error: Message too large for batch buffer (%u > %u)", 
+            total_msg_len, s->buffer_capacity);
+      }
+
+      /*
+         printf("[PROCESS BUFFER] buffer (aligned) size=%lu, payload_len=%u\n",
+         raft_buf.len, total_msg_len);
+         fflush(stdout);
+         */
+
+      /*
       // Copy the payload into a raft_buffer. We must copy it because
       // raft_apply takes ownership and our client buffer will be reused.
       struct raft_buffer raft_buf;
@@ -351,37 +479,33 @@ static void process_buffer(client_t *client) {
       raft_buf.len = aligned_msg_size; 
       raft_buf.base = raft_malloc(raft_buf.len); 
       if (!raft_buf.base) { 
-        printf("Failed raft_malloc for incoming request in process_buffer\n");
-        exit(1);
+      printf("Failed raft_malloc for incoming request in process_buffer\n");
+      exit(1);
       }
 
       memcpy(raft_buf.base, payload, total_msg_len);
       struct raft_apply *req = raft_malloc(sizeof(*req));
       if (!req) { 
-        printf("Failed raft_malloc for raft_apply request in process_buffer\n");
-        exit(1);
-        //raft_free(raft_buf.base);
+      printf("Failed raft_malloc for raft_apply request in process_buffer\n");
+      exit(1);
+      //raft_free(raft_buf.base);
       }
 
-      /*
-      printf("[PROCESS BUFFER] buffer (aligned) size=%lu, payload_len=%u\n",
-          raft_buf.len, total_msg_len);
-      fflush(stdout);
-      */
 
       req->data = s;
       int rv = raft_apply(&s->raft, req, &raft_buf, 1, serverApplyCb);
 
       if (rv != 0) {
-        Logf(s->id, "raft_apply() failed: %s", raft_errmsg(&s->raft));
-        //raft_free(req);
-        //raft_free(raft_buf.base); 
-        return;
+      Logf(s->id, "raft_apply() failed: %s", raft_errmsg(&s->raft));
+      //raft_free(req);
+      //raft_free(raft_buf.base); 
+      return;
       } else {
-        // Optionally send a success response to the client
-        // uv_buf_t res_buf = ...;
-        // uv_write(&client->write_req, (uv_stream_t*)&client->handle, &res_buf, 1, on_write_complete);
+      // Optionally send a success response to the client
+      // uv_buf_t res_buf = ...;
+      // uv_write(&client->write_req, (uv_stream_t*)&client->handle, &res_buf, 1, on_write_complete);
       }
+      */
     }
 
     // Remove the processed message from the buffer by shifting the remaining data
@@ -394,29 +518,29 @@ static void process_buffer(client_t *client) {
 
 // Libuv callback for when a new client connects to our server
 static void on_new_connection(uv_stream_t *server_handle, int status) {
-    if (status < 0) {
-        fprintf(stderr, "New connection error: %s\n", uv_strerror(status));
-        return;
-    }
+  if (status < 0) {
+    fprintf(stderr, "New connection error: %s\n", uv_strerror(status));
+    return;
+  }
 
-    struct Server *s = (struct Server *)server_handle->data;
-    
-    // Allocate and initialize a new client struct
-    client_t *client = calloc(1, sizeof(client_t));
-    if (!client) { /* handle OOM */ return; }
-    
-    client->server = s;
-    client->handle.data = client; // Important: back-pointer for callbacks
-    client->write_req.data = client;
+  struct Server *s = (struct Server *)server_handle->data;
 
-    uv_tcp_init(s->loop, &client->handle);
+  // Allocate and initialize a new client struct
+  client_t *client = calloc(1, sizeof(client_t));
+  if (!client) { /* handle OOM */ return; }
 
-    if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
-        //Log(s->id, "TCP: New client connected.");
-        uv_read_start((uv_stream_t *)&client->handle, alloc_cb, on_client_read);
-    } else {
-        close_and_free_client(client);
-    }
+  client->server = s;
+  client->handle.data = client; // Important: back-pointer for callbacks
+  client->write_req.data = client;
+
+  uv_tcp_init(s->loop, &client->handle);
+
+  if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
+    //Log(s->id, "TCP: New client connected.");
+    uv_read_start((uv_stream_t *)&client->handle, alloc_cb, on_client_read);
+  } else {
+    close_and_free_client(client);
+  }
 }
 
 // --- END NEW SECTION ---
@@ -476,6 +600,12 @@ static int ServerInit(struct Server *s,
   timespec_get(&now, TIME_UTC);
   srandom((unsigned)(now.tv_nsec ^ now.tv_sec));
 
+  /* Allocate the batch request buffer. */
+  s->batch_buffer = calloc(BATCH_SIZE, sizeof(insert_cmd_t));
+  s->batch_offset = 0;
+  s->batched_req_count = 0;
+  s->buffer_capacity = BATCH_SIZE * sizeof(insert_cmd_t);
+
   s->loop = loop;
 
   /* Add a timer to periodically try to propose a new entry. */
@@ -512,7 +642,7 @@ static int ServerInit(struct Server *s,
   s->id = id;
 
   /* Render the address. */
-  sprintf(s->address, "127.0.0.1:900%d", id);
+  sprintf(s->address, "192.168.1.103:900%d", id);
 
   /* Initialize and start the engine, using the libuv-based I/O backend. */
   rv = raft_init(&s->raft, &s->io, &s->fsm, id, s->address);
@@ -527,7 +657,7 @@ static int ServerInit(struct Server *s,
   if (bootstrap_node != NULL && bootstrap_node->id >= 0) {
     char address[64];
     unsigned server_id = i + 1;
-    sprintf(address, "127.0.0.1:900%d", server_id);
+    sprintf(address, "192.168.1.103:900%d", server_id);
     rv = raft_configuration_add(&configuration, server_id, address,
         RAFT_VOTER);
     if (rv != 0) {
@@ -538,7 +668,7 @@ static int ServerInit(struct Server *s,
   for (i = 0; i < N_SERVERS; i++) {
     char address[64];
     unsigned server_id = i + 1;
-    sprintf(address, "127.0.0.1:900%d", server_id);
+    sprintf(address, "192.168.1.103:900%d", server_id);
     rv = raft_configuration_add(&configuration, server_id, address,
         RAFT_VOTER);
     if (rv != 0) {
