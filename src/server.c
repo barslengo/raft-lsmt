@@ -352,7 +352,7 @@ static void on_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *b
   }
 
   // Libuv requires us to free the buffer from alloc_cb
-  free(buf->base);
+  if (buf->base) free(buf->base);
 }
 
 static void batch_buffer_flush(struct Server *s) {
@@ -507,12 +507,23 @@ static void process_buffer(client_t *client) {
       }
       */
     }
+    /* Remove the processed message from the buffer
+     * Move remaining data to the front. */
+    size_t remaining = client->buffer_len - total_msg_len;
+    if (remaining > 0) {
+      memmove(client->buffer, client->buffer + total_msg_len, remaining);
+    }
+    client->buffer_len = remaining;
 
+
+
+    /*
     // Remove the processed message from the buffer by shifting the remaining data
     if (client->buffer_len > total_msg_len) {
       memmove(client->buffer, client->buffer + total_msg_len, client->buffer_len - total_msg_len);
     }
     client->buffer_len -= total_msg_len;
+    */
   }
 }
 
@@ -537,6 +548,7 @@ static void on_new_connection(uv_stream_t *server_handle, int status) {
 
   if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
     //Log(s->id, "TCP: New client connected.");
+    uv_tcp_keepalive(&client->handle, 1, 60);
     uv_read_start((uv_stream_t *)&client->handle, alloc_cb, on_client_read);
   } else {
     close_and_free_client(client);

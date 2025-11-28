@@ -128,5 +128,5 @@ if __name__ == "__main__":
     parser.add_argument("--requests", type=int, default=10000, help="The total number of requests to send.")
     args = parser.parse_args()
 
-    #benchmark(args.host, args.port, args.requests)
-    benchmark_2(args.host, args.port, args.requests)
+    benchmark(args.host, args.port, args.requests)
+    #benchmark_2(args.host, args.port, args.requests)
