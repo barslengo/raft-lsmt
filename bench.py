@@ -59,67 +59,47 @@ def create_insert_request():
     
     return message_length_prefix + outer_payload
 
-def benchmark_2(host, port, num_requests):
-    """
-    Connects to the server, sends a specified number of valid insert requests,
-    and measures the resulting performance.
-    """
-    print(f"Connecting to server at {host}:{port}...")
-    start_time = time.time()
-    try:
-        for _ in range(num_requests):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((host, port))
-                #print(f"Connection successful. Sending {num_requests} requests...")
-                request_message = create_insert_request()
-                s.sendall(request_message)
-    except ConnectionRefusedError:
-       print(f"\nError: Connection refused. Is the server running on {host}:{port}?")
-    except Exception as e:
-       print(f"\nAn unexpected error occurred: {e}")
-
-    end_time = time.time()
-
-    duration = end_time - start_time
-    rps = num_requests / duration if duration > 0 else float('inf')
-
-    print("\n--- Benchmark Results ---")
-    print(f"Total requests sent: {num_requests}")
-    print(f"Total time taken:    {duration:.2f} seconds")
-    print(f"Requests per second: {rps:.2f} (RPS)")
-
-
 def benchmark(host, port, num_requests):
-    """
-    Connects to the server, sends a specified number of valid insert requests,
-    and measures the resulting performance.
-    """
-    print(f"Connecting to server at {host}:{port}...")
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((host, port))
-            print(f"Connection successful. Sending {num_requests} requests...")
+    print(f"Connecting to {host}:{port}...")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect((host, port))
+        
+        # We can send as fast as possible now. 
+        # The Server's uv_read_stop will cause this loop to slow down automatically.
+        print(f"Sending {num_requests} requests...")
+        start_time = time.time()
 
-            start_time = time.time()
+        for i in range(num_requests):
+            req = create_insert_request()
+            s.sendall(req) # This will BLOCK if server is full
 
-            for _ in range(num_requests):
-                request_message = create_insert_request()
-                s.sendall(request_message)
+        print("Sending complete. Waiting for server to drain buffer...")
+        
+        # REQUIRED: Tell server we are done writing, but keep reading.
+        s.shutdown(socket.SHUT_WR)
 
-            end_time = time.time()
-            
-            duration = end_time - start_time
-            rps = num_requests / duration if duration > 0 else float('inf')
+        # Wait for the server to process the remaining buffered data (up to 10MB).
+        # When server is done, it will close the connection, and recv returns 0.
+        s.settimeout(60.0)
+        while True:
+            try:
+                if not s.recv(4096): break
+            except:
+                break
+                
+        print("Done.")
 
-            print("\n--- Benchmark Results ---")
-            print(f"Total requests sent: {num_requests}")
-            print(f"Total time taken:    {duration:.2f} seconds")
-            print(f"Requests per second: {rps:.2f} (RPS)")
+        end_time = time.time()
+        
+        duration = end_time - start_time
+        rps = num_requests / duration if duration > 0 else float('inf')
 
-    except ConnectionRefusedError:
-        print(f"\nError: Connection refused. Is the server running on {host}:{port}?")
-    except Exception as e:
-        print(f"\nAn unexpected error occurred: {e}")
+
+        print("\n--- Benchmark Results ---")
+        print(f"Total requests sent: {num_requests}")
+        print(f"Total time taken:    {duration:.2f} seconds")
+        print(f"Requests per second: {rps:.2f} (RPS)")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark a distributed database.")

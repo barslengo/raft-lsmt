@@ -24,7 +24,7 @@
   printf("%d: " FORMAT "\n", SERVER_ID, __VA_ARGS__)
 
 
-#define BATCH_SIZE 100
+#define BATCH_SIZE 128
 #define CONTENT_MAX_SIZE 255
 
 const uint8_t CONTENT_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t); 
@@ -55,6 +55,7 @@ static int FsmApply(struct raft_fsm *fsm,
     const struct raft_buffer *buf,
     void **result)
 {
+  static size_t count = 0;
   struct Fsm *f = fsm->data;
 
   /* We treat the buffer as a stream of concatenated commands. 
@@ -76,12 +77,14 @@ static int FsmApply(struct raft_fsm *fsm,
 
     /* Validation: Ensure the declared size fits in the remaining buffer */
     if (msg_size + offset > buf->len) {
+      printf("FAILED\n");
       return RAFT_MALFORMED;
     }
 
     /* Validation: Ensure the message is at least as big as the header */
     /* Header = Size(4) + Key(16) */
     if (msg_size < sizeof(uint32_t) + sizeof(sl_uint128_t)) {
+      printf("FAILED_2\n");
       return RAFT_MALFORMED;
     }
 
@@ -89,6 +92,7 @@ static int FsmApply(struct raft_fsm *fsm,
     const uint32_t record_value_size = msg_size - sizeof(uint32_t) - sizeof(sl_uint128_t);
 
     if (record_value_size > CONTENT_MAX_SIZE) {
+      printf("FAILED_3\n");
       return RAFT_MALFORMED;
     }
 
@@ -125,6 +129,11 @@ static int FsmApply(struct raft_fsm *fsm,
     int e = lsmt_insert(db, f->insert_cmd.record_key,
         f->insert_cmd.record_value, 
         record_value_size);
+
+    if (count % 100000 == 0) {
+      printf("%lu\n", count);
+    }
+    count++;
 
     if (e != 0) {
       return RAFT_INVALID;
@@ -211,6 +220,8 @@ typedef struct {
   char *buffer;
   size_t buffer_len;
   size_t buffer_cap;
+
+  bool paused;
 } client_t;
 
 /********************************************************************
@@ -225,6 +236,7 @@ typedef void (*ServerCloseCb)(struct Server *server);
 
 struct Server
 {
+  int last_state;                // To track state changes (Leader <-> Follower)
   lsmt_t *db;
   uv_tcp_t tcp_server_handle;
   void *data;                         /* User data context. */
@@ -265,6 +277,7 @@ static void serverTransferCb(struct raft_transfer *req)
   raft_leader(&s->raft, &id, &address);
   raft_close(&s->raft, serverRaftCloseCb);
 }
+
 
 /* Final callback in the shutdown sequence, invoked after the timer handle has
  * been closed. */
@@ -315,45 +328,6 @@ static void on_write_complete(uv_write_t *req, int status) {
   // You can free write-specific data here if you had any
 }
 
-// Libuv callback to allocate memory for an incoming client read
-static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
-  buf->base = malloc(suggested_size);
-  buf->len = suggested_size;
-}
-
-// This function is called every time we receive data from a client
-static void on_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
-  client_t *client = (client_t *)stream->data;
-
-  if (nread > 0) {
-    // Append the new data to our client's buffer
-    if (client->buffer_len + nread > client->buffer_cap) {
-      client->buffer_cap = (client->buffer_len + nread) * 2;
-      char *new_buf = realloc(client->buffer, client->buffer_cap);
-      if (!new_buf) {
-        // Out of memory
-        free(buf->base);
-        close_and_free_client(client);
-        return;
-      }
-      client->buffer = new_buf;
-    }
-    memcpy(client->buffer + client->buffer_len, buf->base, nread);
-    client->buffer_len += nread;
-
-    // Try to process one or more complete messages from the buffer
-    process_buffer(client);
-
-  } else if (nread < 0) {
-    if (nread != UV_EOF) {
-      fprintf(stderr, "Read error: %s\n", uv_strerror(nread));
-    }
-    close_and_free_client(client);
-  }
-
-  // Libuv requires us to free the buffer from alloc_cb
-  if (buf->base) free(buf->base);
-}
 
 static void batch_buffer_flush(struct Server *s) {
   if (s->batched_req_count == 0) {
@@ -406,32 +380,116 @@ static void batch_buffer_flush(struct Server *s) {
   memset(s->batch_buffer, 0, s->buffer_capacity); // Optional: clear buffer for debug
 }
 
-// This function implements the length-prefixed protocol parser
+// Libuv callback to allocate memory for an incoming client read
+static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
+  buf->base = malloc(suggested_size);
+  buf->len = suggested_size;
+}
+
+#define HIGH_WATER_MARK (10 * 1024 * 1024) // 10 MB
+
+static void on_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
+  client_t *client = (client_t *)stream->data;
+  struct Server *s = client->server; // Need reference to server for flushing
+
+  static size_t x = 0;
+  if (x % 100000 == 0) {
+    printf("MSG N %lu\n", x);
+  }
+  x++;
+
+  if (nread > 0) {
+    // Resize buffer if necessary
+    if (client->buffer_len + nread > client->buffer_cap) {
+      // Logic to prevent infinite growth or handle OOM could go here
+      size_t new_cap = (client->buffer_len + nread) * 2;
+
+      char *new_buf = realloc(client->buffer, new_cap);
+      if (!new_buf) {
+        fprintf(stderr, "Critical: OOM in buffer realloc\n");
+        free(buf->base);
+        close_and_free_client(client);
+        return;
+      }
+      client->buffer = new_buf;
+      client->buffer_cap = new_cap;
+    }
+
+    // Append new data
+    memcpy(client->buffer + client->buffer_len, buf->base, nread);
+    client->buffer_len += nread;
+
+    // CHECK HIGH WATER MARK
+    // If we have too much pending data, tell libuv to STOP reading.
+    // This forces the client to block via TCP flow control.
+    if (client->buffer_len >= HIGH_WATER_MARK && !client->paused) {
+        printf("High Water Mark reached (%lu bytes). Pausing client.\n", client->buffer_len);
+        uv_read_stop(stream); 
+        client->paused = true;
+    }
+
+    // Process available messages
+    process_buffer(client);
+
+  } else if (nread < 0) {
+
+    // The client sent FIN, but we might still have requests in client->buffer 
+    // that we buffered during flow control.
+    if (client->buffer_len > 0) {
+        printf("EOF received. Processing remaining %lu bytes in buffer.\n", client->buffer_len);
+        process_buffer(client);
+    }
+
+    // Flush any partial Raft batches
+    if (s->batched_req_count > 0) {
+        printf("Flushing final batch of %u items due to client disconnect.\n", s->batched_req_count);
+        batch_buffer_flush(s);
+    }
+
+    // Error or EOF
+    if (nread != UV_EOF) {
+      fprintf(stderr, "Read error: %s\n", uv_strerror(nread));
+    } else {
+      printf("Client disconnected (EOF).\n");
+    }
+
+    printf("CLOSING\n");
+    close_and_free_client(client);
+  }
+
+  if (buf->base) free(buf->base);
+}
+
+#define LOW_WATER_MARK (5 * 1024 * 1024) // 5MB 
+
 static void process_buffer(client_t *client) {
   struct Server *s = client->server;
+  size_t offset = 0;
+
+  static size_t req_count = 0;
+  uint32_t processed_in_this_loop = 0;
 
   // Loop as long as we might have a complete message in the buffer
-  while (1) {
-    // A message needs at least a 4-byte length prefix
-    if (client->buffer_len < sizeof(uint32_t)) {
-      break; // Not enough data for even the length
-    }
+  while (offset + sizeof(uint32_t) <= client->buffer_len) {
 
     // Read the length of the message payload
     uint32_t payload_len;
-    memcpy(&payload_len, client->buffer, sizeof(uint32_t));
+    memcpy(&payload_len, client->buffer + offset, sizeof(uint32_t));
 
     uint32_t total_msg_len = payload_len;
-    //size_t total_msg_len = sizeof(uint32_t) + payload_len;
+
+    // A message needs at least a 4-byte length prefix
+    if (total_msg_len < sizeof(uint32_t)) {
+      close_and_free_client(client);
+      return;
+    }
 
     // Do we have the full message in our buffer?
-    if (client->buffer_len < total_msg_len) {
+    if (offset + total_msg_len > client->buffer_len) {
       break; // Incomplete message, wait for more data
     }
 
-    /* Extract the payload. */
-    //char *payload = client->buffer; 
-
+    void *msg_ptr = client->buffer + offset;
     //Logf(s->id, "TCP: Received command with size %u", payload_len);
 
     if (s->raft.state != RAFT_LEADER) {
@@ -453,77 +511,46 @@ static void process_buffer(client_t *client) {
       /* Add to Batch */
       /* Double check it fits now (in case single message > buffer capacity) */
       if (s->batch_offset + total_msg_len <= s->buffer_capacity) {
-        memcpy((uint8_t*)s->batch_buffer + s->batch_offset, client->buffer, total_msg_len);
+        memcpy((uint8_t*)s->batch_buffer + s->batch_offset, msg_ptr, total_msg_len);
         s->batch_offset += total_msg_len;
         s->batched_req_count++;
 
         //printf("[MSG BATCHED] payload_len=%u\n", total_msg_len);
-        //fflush(stdout);
       } else {
         Logf(s->id, "Error: Message too large for batch buffer (%u > %u)", 
             total_msg_len, s->buffer_capacity);
       }
 
-      /*
-         printf("[PROCESS BUFFER] buffer (aligned) size=%lu, payload_len=%u\n",
-         raft_buf.len, total_msg_len);
-         fflush(stdout);
-         */
-
-      /*
-      // Copy the payload into a raft_buffer. We must copy it because
-      // raft_apply takes ownership and our client buffer will be reused.
-      struct raft_buffer raft_buf;
-      uint32_t aligned_msg_size = (total_msg_len + 7) & ~0x07;
-
-      raft_buf.len = aligned_msg_size; 
-      raft_buf.base = raft_malloc(raft_buf.len); 
-      if (!raft_buf.base) { 
-      printf("Failed raft_malloc for incoming request in process_buffer\n");
-      exit(1);
+      if (req_count % 10000 == 0) {
+        printf("REQ_COUNT = %lu\n", req_count);
       }
+      req_count++;
+      processed_in_this_loop++;
+   }
+    offset += total_msg_len;
+  }
 
-      memcpy(raft_buf.base, payload, total_msg_len);
-      struct raft_apply *req = raft_malloc(sizeof(*req));
-      if (!req) { 
-      printf("Failed raft_malloc for raft_apply request in process_buffer\n");
-      exit(1);
-      //raft_free(raft_buf.base);
+  // Send 1 ACK for the chunk of work we just did.
+  if (processed_in_this_loop > 0) {
+      char ack = 1;
+      uv_buf_t ack_buf = uv_buf_init(&ack, 1);
+      uv_try_write((uv_stream_t*)&client->handle, &ack_buf, 1);
+  }
+
+  // Only move memory after we are done reading everything possible.
+  if (offset > 0) {
+      size_t remaining = client->buffer_len - offset;
+      if (remaining > 0) {
+        memmove(client->buffer, client->buffer + offset, remaining);
       }
+      client->buffer_len = remaining;
+  }
 
-
-      req->data = s;
-      int rv = raft_apply(&s->raft, req, &raft_buf, 1, serverApplyCb);
-
-      if (rv != 0) {
-      Logf(s->id, "raft_apply() failed: %s", raft_errmsg(&s->raft));
-      //raft_free(req);
-      //raft_free(raft_buf.base); 
-      return;
-      } else {
-      // Optionally send a success response to the client
-      // uv_buf_t res_buf = ...;
-      // uv_write(&client->write_req, (uv_stream_t*)&client->handle, &res_buf, 1, on_write_complete);
-      }
-      */
-    }
-    /* Remove the processed message from the buffer
-     * Move remaining data to the front. */
-    size_t remaining = client->buffer_len - total_msg_len;
-    if (remaining > 0) {
-      memmove(client->buffer, client->buffer + total_msg_len, remaining);
-    }
-    client->buffer_len = remaining;
-
-
-
-    /*
-    // Remove the processed message from the buffer by shifting the remaining data
-    if (client->buffer_len > total_msg_len) {
-      memmove(client->buffer, client->buffer + total_msg_len, client->buffer_len - total_msg_len);
-    }
-    client->buffer_len -= total_msg_len;
-    */
+  // RESUME CLIENT (Flow Control)
+  if (client->paused && client->buffer_len < LOW_WATER_MARK) {
+      printf("Low Water Mark reached (%lu bytes). Resuming client.\n", client->buffer_len);
+      uv_read_start((uv_stream_t*)&client->handle, alloc_cb, on_client_read);
+      client->paused = false;
   }
 }
 
@@ -543,6 +570,7 @@ static void on_new_connection(uv_stream_t *server_handle, int status) {
   client->server = s;
   client->handle.data = client; // Important: back-pointer for callbacks
   client->write_req.data = client;
+  client->paused = false;
 
   uv_tcp_init(s->loop, &client->handle);
 
@@ -619,6 +647,7 @@ static int ServerInit(struct Server *s,
   s->buffer_capacity = BATCH_SIZE * sizeof(insert_cmd_t);
 
   s->loop = loop;
+  s->last_state = -1;
 
   /* Add a timer to periodically try to propose a new entry. */
   rv = uv_timer_init(s->loop, &s->timer);
@@ -663,6 +692,7 @@ static int ServerInit(struct Server *s,
     goto err_after_fsm_init;
   }
   s->raft.data = s;
+
 
   /* Bootstrap the initial configuration if needed. */
   raft_configuration_init(&configuration);
@@ -752,6 +782,21 @@ static void serverTimerCb(uv_timer_t *timer)
   struct raft_buffer buf;
   struct raft_apply *req;
   int rv;
+
+  int current_state = s->raft.state; 
+
+  if (current_state != s->last_state) {
+    Logf(s->id, "State Change: %d -> %d", s->last_state, current_state);
+
+    // If we are no longer Leader, clear our pending queues to prevent deadlock
+    if (s->last_state == RAFT_LEADER && current_state != RAFT_LEADER) {
+      s->batch_offset = 0;
+      s->batched_req_count = 0;
+    }
+    s->last_state = current_state;
+  }
+
+  if (!RUN_EXAMPLE) return;
 
   if (s->raft.state != RAFT_LEADER) {
     return;
@@ -844,12 +889,10 @@ static int ServerStart(struct Server *s)
     goto err;
   }
 
-  if (RUN_EXAMPLE) {
-    rv = uv_timer_start(&s->timer, serverTimerCb, 0, APPLY_RATE);
-    if (rv != 0) {
-      Logf(s->id, "uv_timer_start(): %s", uv_strerror(rv));
-      goto err;
-    }
+  rv = uv_timer_start(&s->timer, serverTimerCb, 0, APPLY_RATE);
+  if (rv != 0) {
+    Logf(s->id, "uv_timer_start(): %s", uv_strerror(rv));
+    goto err;
   }
 
   return 0;
@@ -863,7 +906,6 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
 {
   s->close_cb = cb;
   Log(s->id, "stopping");
-  //lsmt_flush(s->db);
   //lsmt_free(s->db);
 
   /* Close the timer asynchronously if it was successfully
@@ -872,6 +914,10 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
     uv_close((struct uv_handle_s *)&s->timer, serverTimerCloseCb);
   } else {
     s->close_cb(s);
+  }
+
+  if (s->db) {
+    lsmt_flush(s->db);
   }
 }
 
