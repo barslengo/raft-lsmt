@@ -7,8 +7,8 @@ RAFT_TAG=v0.22.1
 CC = gcc
 
 # Compiler flags
-CFLAGS_DEBUG = -W -Wall -g -I./include -DDEBUG
-CFLAGS_RELEASE = -W -Wall -O3 -I./include -DRELEASE -DLINUX
+CFLAGS_DEBUG = -W -Wall -g -I./include -I./include/uv -DDEBUG
+CFLAGS_RELEASE = -W -Wall -O3 -I./include -I./include/uv -DRELEASE -DLINUX
 
 ifeq ($(BUILD_TYPE), debug)
 	CFLAGS = $(CFLAGS_DEBUG)
@@ -18,8 +18,8 @@ endif
 
 # Linker flags - Note: -L and -l flags are now used for linking the executable
 LDFLAGS = -L./libs/lsmt -llsmt \
-					-L./libs/raft -lraft \
 					-L./libs/libuv -luv \
+					-L./libs/raft -lraft \
 					-lpthread -lm -llz4
 					#-L./libs/libh2o -lh2o \
 
