@@ -217,9 +217,18 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t records[], uint8_t 
 }
 
 
+typedef struct {
+  char sst_path[256];
+  char idx_path[256];
+} files_to_delete_t;
+
 /* Iterate over all the tiers and compact the sstables
  * whose sum of their size exceed the tier threshold. */
 static int sst_compact(sst_metadata_t *sst_meta, const char *db_path, pthread_mutex_t *mutex) {
+  files_to_delete_t files_to_remove[128];
+  int delete_count = 0;
+  bool must_flush = false;
+
   uint8_t highest_tier = sst_meta->highest_tier;
 
   for (uint8_t tier = 0; tier < highest_tier; tier++) {
@@ -250,18 +259,42 @@ static int sst_compact(sst_metadata_t *sst_meta, const char *db_path, pthread_mu
 
       /* Merge the selected sstables into a new one with incremented tier. 
        * If returns any error, then i must push back the records into the metadata list. (TODO) */
-      //printf("MERGING %d sstables, of total size = %f\n", j, tot_size);
-      //fflush(stdout);
       pthread_mutex_unlock(mutex);
 
       sst_metadata_record_t new_sst = sst_merge(records, j, db_path);
-
       pthread_mutex_lock(mutex);
+
       sst_metadata_add(sst_meta, new_sst); 
+
+      /* Store the files to be deleted later on. */
+      for (int k = 0; k < j; k++) {
+        strncpy(files_to_remove[delete_count].sst_path, records[k].sstable_filename, 255);
+        strncpy(files_to_remove[delete_count].idx_path, records[k].sst_index_filename, 255);
+        delete_count++;
+      }
+
+      must_flush = true;
       pthread_mutex_unlock(mutex);
     }
     else {
       pthread_mutex_unlock(mutex);
+    }
+  }
+
+  if (must_flush == true) {
+    pthread_mutex_lock(mutex);
+
+    if (sst_metadata_flush(sst_meta) != 0) {
+      fprintf(stderr, "Critical Error: Failed to flush metadata. Cannot delete old files.\n");
+      exit(1);
+    }
+
+    pthread_mutex_unlock(mutex);
+
+    /* Delete the merged sstables from disk. */
+    for (int k = 0; k < delete_count; k++) {
+      remove(files_to_remove[k].sst_path);
+      remove(files_to_remove[k].idx_path);
     }
   }
   return 0;

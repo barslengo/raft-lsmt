@@ -2,6 +2,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 #include "utils.h"
 #include "queue.h"
 #include "sst.h"
@@ -134,7 +135,10 @@ int sst_metadata_free(sst_metadata_t *sst_meta) {
 }
 
 int sst_metadata_flush(sst_metadata_t *sst_meta) { 
-  FILE *fp = fopen(sst_meta->disk_path, "w");
+  char temp_path[256];
+  snprintf(temp_path, sizeof(temp_path), "%s.tmp", sst_meta->disk_path);
+
+  FILE *fp = fopen(temp_path, "w");
   if (!fp) {
     perror("FAILED FLUSHING METADATA");
     exit(1);
@@ -155,6 +159,18 @@ int sst_metadata_flush(sst_metadata_t *sst_meta) {
     fwrite(&data.min_key, sizeof(data.min_key), 1, fp);
     fwrite(&data.max_key, sizeof(data.max_key), 1, fp);
     node = node->next;
+  }
+
+  if (fflush(fp) != 0) {
+    perror("Failed to flush buffer");
+    fclose(fp);
+    exit(1);
+  }
+
+  if (fsync(fileno(fp)) != 0) {
+    perror("Failed to sync to disk");
+    fclose(fp);
+    exit(1);
   }
 
   /*
@@ -182,6 +198,11 @@ int sst_metadata_flush(sst_metadata_t *sst_meta) {
   }
   */
   fclose(fp);
+
+  if (rename(temp_path, sst_meta->disk_path) != 0) {
+    perror("Failed to rename the file");
+    exit(1);
+  }
   return 0;
 }
 
