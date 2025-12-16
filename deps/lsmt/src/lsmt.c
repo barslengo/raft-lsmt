@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <pthread.h>
+#include <unistd.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <math.h>
@@ -193,6 +194,23 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t records[], uint8_t 
     max_key = record.key;
   }
 
+  /* If the system crashes after syncing this new sstable to disk and
+   * before updating the metadata file (which stores the list of all sstables)
+   * then this new file will be ignored. This is way the deletion of the sstables
+   * used here is postponed after the metadata file update.
+   * */
+  if (fflush(new_file) != 0) {
+    perror("Failed to flush merged buffer.");
+    fclose(new_file);
+    exit(1);
+  }
+
+  if (fsync(fileno(new_file)) != 0) {
+    perror("Failed to dump to disk the merged sstable.");
+    fclose(new_file);
+    exit(1);
+  }
+
   fclose(new_file);
   //snprintf(sst_path, sizeof(sst_path), "%s/%s", db_path, file_paths.index_file); 
   index_flush(index, file_paths.index_file);
@@ -344,7 +362,20 @@ static void *dump_to_disk(void *arg) {
     node = node->next;
   }
 
+  if (fflush(fp) != 0) {
+    perror("Failed to flush memtable.");
+    fclose(fp);
+    exit(1);
+  }
+
+  if (fsync(fileno(fp)) != 0) {
+    perror("Failed to dump memtable to disk.");
+    fclose(fp);
+    exit(1);
+  }
+
   fclose(fp);
+
   index_flush(index, files.index_file); 
   index_free(index);
   sl_free(memtable);
