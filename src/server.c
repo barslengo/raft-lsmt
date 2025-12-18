@@ -1,6 +1,10 @@
 /*
- *  TODO: Build something for monitoring performances and correctness.
- *
+ *  TODO: Handle data loss on leadership change or leader crash.
+ *  TODO: Implement more robust responses to the tcp clients (e.g. return
+ *  the leader address if the current node is a follower
+ *  and receive a write requests, or tell the client when a
+ *  request has been committed).
+ *  TODO: Reorganize folder structure (Raft logs, sstables, etc..).
  *  TODO: Build something for handling the clusters:
  *    -Creating clusters.
  *    -Adding/Removing/Starting/Stopping nodes from a cluster at runtime. 
@@ -17,7 +21,7 @@
 #include <lsmt/lsmt.h>
 
 #define N_SERVERS 3    /* Number of servers in the example cluster */
-#define APPLY_RATE 125 /* Apply a new entry every 125 milliseconds */
+#define APPLY_RATE 1000 /* Store new statistic entry every second. */
 
 #define Log(SERVER_ID, FORMAT) printf("%d: " FORMAT "\n", SERVER_ID)
 #define Logf(SERVER_ID, FORMAT, ...) \
@@ -30,13 +34,6 @@
 const uint8_t CONTENT_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t); 
 const uint32_t INSERT_CMD_SIZE = CONTENT_HEADER_SIZE + sizeof(uint8_t)*CONTENT_MAX_SIZE; 
 
-#ifdef __RUN_EXAMPLE
-const bool RUN_EXAMPLE = true;
-#else
-const bool RUN_EXAMPLE = false;
-#endif
-
-
 typedef struct insert_cmd {
   uint32_t msg_size;
   sl_uint128_t record_key;
@@ -45,9 +42,71 @@ typedef struct insert_cmd {
 
 lsmt_t *db;
 
+struct Server;
+
 struct Fsm
 {
+  struct Server *server;
   insert_cmd_t insert_cmd;
+};
+
+
+typedef struct {
+  uv_tcp_t handle;
+  struct Server *server;
+  uv_write_t write_req;
+
+  // A dynamic buffer to handle the incoming TCP stream
+  char *buffer;
+  size_t buffer_len;
+  size_t buffer_cap;
+
+  bool paused;
+} client_t;
+
+/********************************************************************
+ *
+ * struct holding a single raft server instance and all its
+ * dependencies.
+ *
+ ********************************************************************/
+
+struct Server;
+typedef void (*ServerCloseCb)(struct Server *server);
+
+struct Server
+{
+  int last_state;                // To track state changes (Leader <-> Follower)
+  lsmt_t *db;
+  uv_tcp_t tcp_server_handle;
+  void *data;                         /* User data context. */
+  struct uv_loop_s *loop;             /* UV loop. */
+  struct uv_timer_s timer;            /* To periodically apply a new entry. */
+  const char *dir;                    /* Data dir of UV I/O backend. */
+  struct raft_uv_transport transport; /* UV I/O backend transport. */
+  struct raft_io io;                  /* UV I/O backend. */
+  struct raft_fsm fsm;                /* Sample application FSM. */
+  unsigned id;                        /* Raft instance ID. */
+  char address[64];                   /* Raft instance address. */
+  struct raft raft;                   /* Raft instance. */
+  struct raft_transfer transfer;      /* Transfer leadership request. */
+  ServerCloseCb close_cb;             /* Optional close callback. */
+
+  void *batch_buffer;                 /* Buffer for batching requests into a single log. */
+  uint32_t batch_offset;
+  uint32_t buffer_capacity;
+  uint32_t batched_req_count;
+
+  struct {
+    FILE *f;
+    uint64_t total_requests;
+    uint64_t total_bytes;
+
+    uint64_t prev_requests;
+    uint64_t prev_bytes;
+
+    uint64_t total_received; /* Total requests received from tcp connections. */
+  } stats;
 };
 
 
@@ -57,10 +116,12 @@ static int FsmApply(struct raft_fsm *fsm,
 {
   static size_t count = 0;
   struct Fsm *f = fsm->data;
+  struct Server *s = f->server;
 
   /* We treat the buffer as a stream of concatenated commands. 
    * We loop until we have consumed the entire buffer length. */
   size_t offset = 0;
+  uint64_t requests_count = 0;
 
   /* Iterate until i don't have enought space even
    * for reading the msg size (4 bytes). */
@@ -138,21 +199,16 @@ static int FsmApply(struct raft_fsm *fsm,
     if (e != 0) {
       return RAFT_INVALID;
     }
-    /* 6. Advance the offset to the next message in the batch */
+    /* Advance the offset to the next message in the batch */
     offset += msg_size;
+
+    requests_count++;
   }
 
+  s->stats.total_requests += requests_count;
+  s->stats.total_bytes += buf->len;
   return 0;
 }
-
-
-
-/* buf struct:
- * 4 bytes: msg_length.
- * 16 bytes: record key.
- * (msg_length-4-16)bytes: record value.
- */
-
 
 static int FsmSnapshot(struct raft_fsm *fsm,
     struct raft_buffer *bufs[],
@@ -184,14 +240,14 @@ static int FsmRestore(struct raft_fsm *fsm, struct raft_buffer *buf)
   return 0;
 }
 
-static int FsmInit(struct raft_fsm *fsm)
+static int FsmInit(struct raft_fsm *fsm, struct Server *s)
 {
   struct Fsm *f = raft_malloc(sizeof *f);
   if (f == NULL) {
     return RAFT_NOMEM;
   }
   memset(f, 0, sizeof(*f));
-  //f->count = 0;
+  f->server = s;
   fsm->version = 2;
   fsm->data = f;
   fsm->apply = FsmApply;
@@ -208,55 +264,6 @@ static void FsmClose(struct raft_fsm *f)
   }
 }
 
-
-
-// --- NEW: Struct to hold the state for each connected client ---
-typedef struct {
-  uv_tcp_t handle;
-  struct Server *server;
-  uv_write_t write_req;
-
-  // A dynamic buffer to handle the incoming TCP stream
-  char *buffer;
-  size_t buffer_len;
-  size_t buffer_cap;
-
-  bool paused;
-} client_t;
-
-/********************************************************************
- *
- * Example struct holding a single raft server instance and all its
- * dependencies.
- *
- ********************************************************************/
-
-struct Server;
-typedef void (*ServerCloseCb)(struct Server *server);
-
-struct Server
-{
-  int last_state;                // To track state changes (Leader <-> Follower)
-  lsmt_t *db;
-  uv_tcp_t tcp_server_handle;
-  void *data;                         /* User data context. */
-  struct uv_loop_s *loop;             /* UV loop. */
-  struct uv_timer_s timer;            /* To periodically apply a new entry. */
-  const char *dir;                    /* Data dir of UV I/O backend. */
-  struct raft_uv_transport transport; /* UV I/O backend transport. */
-  struct raft_io io;                  /* UV I/O backend. */
-  struct raft_fsm fsm;                /* Sample application FSM. */
-  unsigned id;                        /* Raft instance ID. */
-  char address[64];                   /* Raft instance address. */
-  struct raft raft;                   /* Raft instance. */
-  struct raft_transfer transfer;      /* Transfer leadership request. */
-  ServerCloseCb close_cb;             /* Optional close callback. */
-
-  void *batch_buffer;                 /* Buffer for batching requests into a single log. */
-  uint32_t batch_offset;
-  uint32_t buffer_capacity;
-  uint32_t batched_req_count;
-};
 
 static void serverRaftCloseCb(struct raft *raft)
 {
@@ -295,11 +302,9 @@ static void serverTimerCloseCb(struct uv_handle_s *handle)
     raft_close(&s->raft, serverRaftCloseCb);
   }
 }
+
 static void serverApplyCb(struct raft_apply *req, int status, void *result);
 
-// --- NEW SECTION: All custom TCP logic goes here ---
-
-// Forward declarations
 static void on_client_close(uv_handle_t *handle);
 static void process_buffer(client_t *client);
 
@@ -392,12 +397,6 @@ static void on_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *b
   client_t *client = (client_t *)stream->data;
   struct Server *s = client->server; // Need reference to server for flushing
 
-  static size_t x = 0;
-  if (x % 100000 == 0) {
-    printf("MSG N %lu\n", x);
-  }
-  x++;
-
   if (nread > 0) {
     // Resize buffer if necessary
     if (client->buffer_len + nread > client->buffer_cap) {
@@ -466,7 +465,6 @@ static void process_buffer(client_t *client) {
   struct Server *s = client->server;
   size_t offset = 0;
 
-  static size_t req_count = 0;
   uint32_t processed_in_this_loop = 0;
 
   // Loop as long as we might have a complete message in the buffer
@@ -515,42 +513,41 @@ static void process_buffer(client_t *client) {
         s->batch_offset += total_msg_len;
         s->batched_req_count++;
 
+        /* Stats. */
+        s->stats.total_received++;
+
         //printf("[MSG BATCHED] payload_len=%u\n", total_msg_len);
       } else {
         Logf(s->id, "Error: Message too large for batch buffer (%u > %u)", 
             total_msg_len, s->buffer_capacity);
       }
 
-      if (req_count % 10000 == 0) {
-        printf("REQ_COUNT = %lu\n", req_count);
-      }
-      req_count++;
       processed_in_this_loop++;
-   }
+    }
     offset += total_msg_len;
   }
 
   // Send 1 ACK for the chunk of work we just did.
   if (processed_in_this_loop > 0) {
-      char ack = 1;
-      uv_buf_t ack_buf = uv_buf_init(&ack, 1);
-      uv_try_write((uv_stream_t*)&client->handle, &ack_buf, 1);
+    char ack = 1;
+    uv_buf_t ack_buf = uv_buf_init(&ack, 1);
+    uv_try_write((uv_stream_t*)&client->handle, &ack_buf, 1);
   }
 
   // Only move memory after we are done reading everything possible.
   if (offset > 0) {
-      size_t remaining = client->buffer_len - offset;
-      if (remaining > 0) {
-        memmove(client->buffer, client->buffer + offset, remaining);
-      }
-      client->buffer_len = remaining;
+    size_t remaining = client->buffer_len - offset;
+    if (remaining > 0) {
+      memmove(client->buffer, client->buffer + offset, remaining);
+    }
+    client->buffer_len = remaining;
   }
 
   // RESUME CLIENT (Flow Control)
   if (client->paused && client->buffer_len < LOW_WATER_MARK) {
-      printf("Low Water Mark reached (%lu bytes). Resuming client.\n", client->buffer_len);
-      uv_read_start((uv_stream_t*)&client->handle, alloc_cb, on_client_read);
-      client->paused = false;
+    printf("Low Water Mark reached (%lu bytes). Resuming client.\n", client->buffer_len);
+    uv_read_start((uv_stream_t*)&client->handle, alloc_cb, on_client_read);
+    client->paused = false;
   }
 }
 
@@ -583,16 +580,11 @@ static void on_new_connection(uv_stream_t *server_handle, int status) {
   }
 }
 
-// --- END NEW SECTION ---
-
-
-
-
 static int client_uv_init(struct Server *s, int port) {
   Log(s->id, "Setting up custom TCP server");
 
   uv_tcp_init(s->loop, &s->tcp_server_handle);
-  s->tcp_server_handle.data = s; // Back-pointer to the server
+  s->tcp_server_handle.data = s; 
 
   struct sockaddr_in addr;
   // Listen on port 7000 + server_id (e.g., 7001, 7002, 7003)
@@ -673,7 +665,7 @@ static int ServerInit(struct Server *s,
   }
 
   /* Initialize the finite state machine. */
-  rv = FsmInit(&s->fsm);
+  rv = FsmInit(&s->fsm, s);
   if (rv != 0) {
     Logf(s->id, "FsmInit(): %s", raft_strerror(rv));
     goto err_after_uv_init;
@@ -683,7 +675,7 @@ static int ServerInit(struct Server *s,
   s->id = id;
 
   /* Render the address. */
-  sprintf(s->address, "192.168.1.103:900%d", id);
+  sprintf(s->address, "192.168.1.160:900%d", id);
 
   /* Initialize and start the engine, using the libuv-based I/O backend. */
   rv = raft_init(&s->raft, &s->io, &s->fsm, id, s->address);
@@ -699,7 +691,7 @@ static int ServerInit(struct Server *s,
   if (bootstrap_node != NULL && bootstrap_node->id >= 0) {
     char address[64];
     unsigned server_id = i + 1;
-    sprintf(address, "192.168.1.103:900%d", server_id);
+    sprintf(address, "192.168.1.160:900%d", server_id);
     rv = raft_configuration_add(&configuration, server_id, address,
         RAFT_VOTER);
     if (rv != 0) {
@@ -710,7 +702,7 @@ static int ServerInit(struct Server *s,
   for (i = 0; i < N_SERVERS; i++) {
     char address[64];
     unsigned server_id = i + 1;
-    sprintf(address, "192.168.1.103:900%d", server_id);
+    sprintf(address, "192.168.1.160:900%d", server_id);
     rv = raft_configuration_add(&configuration, server_id, address,
         RAFT_VOTER);
     if (rv != 0) {
@@ -739,6 +731,23 @@ static int ServerInit(struct Server *s,
 
   s->db = lsmt_init(dir);
   db = s->db;
+
+  /* Setup statistics collection. */
+  char stats_file_path[128];
+  sprintf(stats_file_path, "%s/stats_%d.csv", dir, s->id);
+  s->stats.f = fopen(stats_file_path, "w");
+  if (s->stats.f == NULL) {
+    perror("Failed to init stats file.");
+    exit(1);
+  } 
+  fprintf(s->stats.f, "Timestamp_ms,Role,OPS,Throughput_MBps,Batch_Size,Pending_Queue,Backlog\n"); 
+  fflush(s->stats.f);
+
+  s->stats.total_requests = 0;
+  s->stats.total_bytes = 0;
+  s->stats.prev_requests = 0;
+  s->stats.prev_bytes = 0;
+  s->stats.total_received = 0;
   return 0;
 
 err_after_configuration_init:
@@ -775,107 +784,58 @@ static void serverApplyCb(struct raft_apply *req, int status, void *result)
      */
 }
 
-/* Called periodically every APPLY_RATE milliseconds. */
-static void serverTimerCb(uv_timer_t *timer)
+static void statsTimerCb(uv_timer_t *timer)
 {
   struct Server *s = timer->data;
-  struct raft_buffer buf;
-  struct raft_apply *req;
-  int rv;
 
-  int current_state = s->raft.state; 
+  uint64_t current_reqs = s->stats.total_requests;
+  uint64_t current_bytes = s->stats.total_bytes;
 
-  if (current_state != s->last_state) {
-    Logf(s->id, "State Change: %d -> %d", s->last_state, current_state);
+  /* TCP received requests - Requests committed to disk. */
+  uint64_t backlog = s->stats.total_received - s->stats.total_requests;
 
-    // If we are no longer Leader, clear our pending queues to prevent deadlock
-    if (s->last_state == RAFT_LEADER && current_state != RAFT_LEADER) {
-      s->batch_offset = 0;
-      s->batched_req_count = 0;
-    }
-    s->last_state = current_state;
+  uint64_t ops_sec = current_reqs - s->stats.prev_requests;
+  double mb_sec = (double)(current_bytes - s->stats.prev_bytes) / (1024.0 * 1024.0);
+
+  // 2. Update Previous values for next tick
+  s->stats.prev_requests = current_reqs;
+  s->stats.prev_bytes = current_bytes;
+
+  // 3. Get Current Role string
+  const char *role_name = "UNKNOWN";
+  int state = s->raft.state;
+  if (state == RAFT_LEADER) role_name = "LEADER";
+  else if (state == RAFT_FOLLOWER) role_name = "FOLLOWER";
+  else if (state == RAFT_CANDIDATE) role_name = "CANDIDATE";
+
+  // 4. Log to Console (for you to see it's alive)
+  /*
+  printf("[Node %d] %s | OPS: %lu | Speed: %.2f MB/s\n", 
+      s->id, role_name, ops_sec, mb_sec);
+  */
+
+  // 5. Log to Disk (CSV)
+  if (s->stats.f) {
+    fprintf(s->stats.f, "%lu,%s,%lu,%.2f,%u,%u,%lu\n",
+        uv_now(s->loop),          // Timestamp
+        role_name,                // Role
+        ops_sec,                  // Operations Per Second
+        mb_sec,                   // Megabytes Per Second
+        s->batched_req_count,     // Current Batch Size
+        s->batch_offset,          // Bytes currently in buffer
+        backlog
+        );
+
+    // Important: Flush occasionally so you don't lose data on Ctrl+C
+    // (Doing this every second is fine for a benchmark)
+    fflush(s->stats.f); 
   }
 
-  if (!RUN_EXAMPLE) return;
-
-  if (s->raft.state != RAFT_LEADER) {
-    return;
-  }
-  uint32_t key_id = (rand() % (100000 << 1)) + 1;
-  sl_uint128_t key = {
-    .id = key_id,
-    .timestamp = get_unix_epoch()
-  };
-
-  uint32_t record_value = key_id;
-
-  /* Construct the value payload according to the format: [type][size][data]. */
-  uint8_t value_payload[CONTENT_MAX_SIZE];
-  uint8_t *p = value_payload; 
-
-  /* Write the record type. */
-  *p = LSMT_TYPE_INT;
-  p += sizeof(uint8_t);
-
-  /* Write the size of the record value. */
-  uint32_t data_size = sizeof(record_value); 
-  memcpy(p, &data_size, sizeof(data_size));
-  p += sizeof(uint32_t);
-
-  /* Write the record value itself. */
-  memcpy(p, &record_value, data_size);
-  p += data_size;
-
-  uint32_t value_len = (uint32_t)(p - value_payload); 
-  uint32_t total_msg_size = sizeof(uint32_t) + sizeof(sl_uint128_t) + value_len; 
-
-  /* Entry buffers for raft_apply must be 8-byte aligned. */
-  /* Every number multiple of 8 ends with three zeros.
-   * With the & ~0x07 i'm erasing the last three bits,
-   * rounding to the floor the number so i need to add +7. */
-  uint32_t aligned_msg_size = (total_msg_size + 7) & ~0x07;
-
-  buf.len = aligned_msg_size;
-  buf.base = raft_malloc(buf.len);
-  if (buf.base == NULL) {
-    Log(s->id, "serverTimerCb(): out of memory");
-    return;
-  }
-
-  printf("raft_apply buffer size=%lu\n", buf.len);
-  fflush(stdout);
-
-  uint8_t* buf_ptr = buf.base;
-
-  /* Serialized the message size. */
-  memcpy(buf_ptr, &total_msg_size, sizeof(uint32_t));
-  buf_ptr += sizeof(uint32_t);
-
-  /* Serialize the key. */
-  memcpy(buf_ptr, &key, sizeof(key));
-  buf_ptr += sizeof(key);
-
-  /* Serialize the record value. */ 
-  memcpy(buf_ptr, &value_payload, value_len); 
-
-  req = raft_malloc(sizeof *req);
-  if (req == NULL) {
-    Log(s->id, "serverTimerCb(): out of memory");
-    raft_free(buf.base);
-    return;
-  }
-
-  req->data = s;
-
-  rv = raft_apply(&s->raft, req, &buf, 1, serverApplyCb);
-  if (rv != 0) {
-    Logf(s->id, "raft_apply(): %s", raft_errmsg(&s->raft));
-    raft_free(buf.base);
-    raft_free(req);
-    return;
-  }
+  /* flush data that's being too long in the buffer. */
+  batch_buffer_flush(s);
 }
 
+/* Called periodically every APPLY_RATE milliseconds. */
 /* Start the example server. */
 static int ServerStart(struct Server *s)
 {
@@ -889,7 +849,7 @@ static int ServerStart(struct Server *s)
     goto err;
   }
 
-  rv = uv_timer_start(&s->timer, serverTimerCb, 0, APPLY_RATE);
+  rv = uv_timer_start(&s->timer, statsTimerCb, 0, APPLY_RATE);
   if (rv != 0) {
     Logf(s->id, "uv_timer_start(): %s", uv_strerror(rv));
     goto err;
@@ -918,6 +878,11 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
 
   if (s->db) {
     lsmt_flush(s->db);
+  }
+
+  if (s->stats.f) {
+    fclose(s->stats.f);
+    s->stats.f = NULL;
   }
 }
 
@@ -953,7 +918,6 @@ int main(int argc, char *argv[])
   unsigned id;
   int rv;
 
-  printf("EXAMPLE=%d\n", RUN_EXAMPLE);
 
   if (argc != 3) {
     printf("usage: example-server <dir> <id>\n");
