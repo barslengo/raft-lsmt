@@ -16,6 +16,7 @@ typedef struct sst_node {
 static int tier_init(sst_metadata_t *sst_meta) {
   for (uint8_t i = 0; i < 64; i++) {
     sst_meta->tier[i] = NULL; 
+    sst_meta->tier_size[i] = 0.0;
   }
   return 0;
 }
