@@ -4,8 +4,9 @@ import time
 import random
 import argparse
 
-# Define constants from the C code for consistency
-LSMT_TYPE_INT = 1 # Corresponds to the C macro
+PIPELINE_DEPTH = 1024 
+
+LSMT_TYPE_INT = 1 
 
 # The format for the outer command struct: key (16 bytes) + content_size (1 byte)
 # <  : Little-endian
@@ -59,47 +60,56 @@ def create_insert_request():
     
     return message_length_prefix + outer_payload
 
+def recv_exact(sock, n_bytes):
+    """
+    Helper to ensure we receive exactly n_bytes. 
+    Socket.recv() might return fewer than requested.
+    """
+    data = b''
+    while len(data) < n_bytes:
+        chunk = sock.recv(n_bytes - len(data))
+        if not chunk:
+            raise ConnectionError("Server closed connection unexpectedly")
+        data += chunk
+    return data
+
 def benchmark(host, port, num_requests):
     print(f"Connecting to {host}:{port}...")
+    
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((host, port))
         
-        # We can send as fast as possible now. 
-        # The Server's uv_read_stop will cause this loop to slow down automatically.
-        print(f"Sending {num_requests} requests...")
+        print(f"Sending {num_requests} requests (Pipeline Depth: {PIPELINE_DEPTH})...")
+        
         start_time = time.time()
+        pending_acks = 0
 
         for i in range(num_requests):
+            # 1. Create and Send Request
             req = create_insert_request()
-            s.sendall(req) # This will BLOCK if server is full
+            s.sendall(req)
+            pending_acks += 1
 
-        print("Sending complete. Waiting for server to drain buffer...")
-        
-        # REQUIRED: Tell server we are done writing, but keep reading.
-        s.shutdown(socket.SHUT_WR)
+            # 2. Flow Control: Wait for ACKs if pipeline is full
+            # This puts the client to sleep until the Server's Raft log is committed.
+            if pending_acks >= PIPELINE_DEPTH:
+                # We expect 1 byte per request
+                recv_exact(s, pending_acks)
+                pending_acks = 0
 
-        # Wait for the server to process the remaining buffered data (up to 10MB).
-        # When server is done, it will close the connection, and recv returns 0.
-        s.settimeout(60.0)
-        while True:
-            try:
-                if not s.recv(4096): break
-            except:
-                break
-                
-        print("Done.")
+        # 3. Drain remaining ACKs (if total requests isn't divisible by 128)
+        if pending_acks > 0:
+            recv_exact(s, pending_acks)
 
         end_time = time.time()
-        
         duration = end_time - start_time
-        rps = num_requests / duration if duration > 0 else float('inf')
-
+        rps = num_requests / duration if duration > 0 else 0
 
         print("\n--- Benchmark Results ---")
         print(f"Total requests sent: {num_requests}")
-        print(f"Total time taken:    {duration:.2f} seconds")
+        print(f"Total time taken:    {duration:.4f} seconds")
         print(f"Requests per second: {rps:.2f} (RPS)")
-
+        print(f"Avg Latency per batch: {(duration / (num_requests/PIPELINE_DEPTH))*1000:.2f} ms")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark a distributed database.")
