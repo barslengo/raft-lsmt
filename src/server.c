@@ -1,8 +1,8 @@
 /*
+ * TODO: FIX Backlogs underflows in stats.
  * TODO: Implement Idempotency on lsmt inserts by logging into an hashmap
  * the pair (client_id, req_id).
- *  TODO: Handle data loss on leadership change or leader crash.
- *  TODO: Reorganize folder structure (Raft logs, sstables, etc..).
+ * TODO: Reorganize folder structure (Raft logs, sstables, etc..).
  */
 
 #include <assert.h>
@@ -23,9 +23,10 @@
   printf("%d: " FORMAT "\n", SERVER_ID, __VA_ARGS__)
 
 
-#define BATCH_SIZE 1024 //128
+#define BATCH_SIZE 4096 //1024 //128
 #define CONTENT_MAX_SIZE 255
 
+static char ACK_BUFFER[BATCH_SIZE];
 const uint8_t CONTENT_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t); 
 const uint32_t INSERT_CMD_SIZE = CONTENT_HEADER_SIZE + sizeof(uint8_t)*CONTENT_MAX_SIZE; 
 
@@ -49,13 +50,20 @@ struct Fsm
 typedef struct {
   uv_tcp_t handle;
   struct Server *server;
-  uv_write_t write_req;
 
   // A dynamic buffer to handle the incoming TCP stream
   char *buffer;
   size_t buffer_len;
   size_t buffer_cap;
+
+  bool closing;
 } client_t;
+
+typedef struct {
+  uv_write_t req;
+  uv_buf_t buf;
+  client_t *client;
+} ack_write_t;
 
 typedef struct {
   struct Server *server;
@@ -309,17 +317,20 @@ static void process_buffer(client_t *client);
 
 // Helper function to safely close and free a client's resources
 static void close_and_free_client(client_t *client) {
-  // The on_client_close callback will free the client memory
+  if (client->closing) return;
+  client->closing = true;
+
   if (client->server->active_client == client) {
     client->server->active_client = NULL;
   }
+
   uv_close((uv_handle_t *)&client->handle, on_client_close);
 }
 
 // Callback that fires after a client's handle is fully closed
 static void on_client_close(uv_handle_t *handle) {
   client_t *client = (client_t *)handle->data;
-  // Free all associated memory
+
   if (client->buffer) {
     free(client->buffer);
   }
@@ -327,6 +338,17 @@ static void on_client_close(uv_handle_t *handle) {
   //Log(0, "TCP: Client disconnected and cleaned up.");
 }
 
+static void on_ack_write_complete(uv_write_t *req, int status) {
+  ack_write_t *wr = (ack_write_t *)req;
+
+  if (status) {
+    close_and_free_client(wr->client);
+  }
+
+  free(wr);
+}
+
+/*
 // Callback for after a write operation (e.g., sending a response) is complete
 static void on_write_complete(uv_write_t *req, int status) {
   if (status) {
@@ -334,6 +356,7 @@ static void on_write_complete(uv_write_t *req, int status) {
   }
   // You can free write-specific data here if you had any
 }
+*/
 
 
 static void batch_buffer_flush(struct Server *s) {
@@ -341,7 +364,6 @@ static void batch_buffer_flush(struct Server *s) {
     return;
   }
 
-  //printf("Flushing batch of size: %d\n", s->batched_req_count);
   struct raft_buffer raft_buf;
 
   uint32_t aligned_msg_size = (s->batch_offset + 7) & ~0x07;
@@ -495,6 +517,7 @@ static void process_buffer(client_t *client) {
     if (s->raft.state != RAFT_LEADER) {
       Log(s->id, "TCP: Rejecting command, not the leader.");
       close_and_free_client(client);
+      return;
     } else {
       /* Add to Batch */
       if (s->batch_offset + total_msg_len <= s->buffer_capacity) {
@@ -553,13 +576,26 @@ static void on_new_connection(uv_stream_t *server_handle, int status) {
 
   struct Server *s = (struct Server *)server_handle->data;
 
+
+  /* This server is designed to handle one client at a time.
+   * So we reject new client connections if one is already active.
+   */
+  if (s->active_client != NULL) {
+    uv_tcp_t tmp;
+    uv_tcp_init(s->loop, &tmp);
+    if (uv_accept(server_handle, (uv_stream_t *)&tmp) == 0) {
+      uv_close((uv_handle_t *)&tmp, NULL);
+    }
+    return;
+  }
+
   // Allocate and initialize a new client struct
   client_t *client = calloc(1, sizeof(client_t));
   if (!client) { /* handle OOM */ return; }
 
   client->server = s;
-  client->handle.data = client; // Important: back-pointer for callbacks
-  client->write_req.data = client;
+  client->handle.data = client; 
+  client->closing = false;
 
   uv_tcp_init(s->loop, &client->handle);
 
@@ -762,15 +798,23 @@ static void serverApplyCb(struct raft_apply *req, int status, void *result)
   apply_ctx_t *ctx = (apply_ctx_t *)req->data;
   struct Server *s = ctx->server;
 
-  if (status == 0 && s->active_client != NULL) {
-    char *acks = malloc(ctx->req_count);
-    if (acks) {
-      memset(acks, 1, ctx->req_count);
-      uv_buf_t ack_buf = uv_buf_init(acks, ctx->req_count);
-      uv_try_write((uv_stream_t *)&s->active_client->handle, &ack_buf, 1);
-      free(acks);
+  if (status == 0 && s->active_client != NULL && !s->active_client->closing) {
+    ack_write_t *wr = malloc(sizeof(ack_write_t));
+    if (wr) {
+      wr->req.data = wr;
+      wr->client = s->active_client;
+
+      int count = ctx->req_count > BATCH_SIZE ? BATCH_SIZE : ctx->req_count;
+      wr->buf = uv_buf_init(ACK_BUFFER, count);
+
+      int r = uv_write(&wr->req, (uv_stream_t*)&s->active_client->handle, &wr->buf, 1, on_ack_write_complete);
+
+      if (r != 0) {
+        free(wr);
+        close_and_free_client(s->active_client);
+      }
     }
-  }
+ }
   if (status != 0) {
     if (status != RAFT_LEADERSHIPLOST) {
       Logf(s->id, "raft_apply() callback: %s (%d)", raft_errmsg(&s->raft),
@@ -909,6 +953,8 @@ static void mainSigintCb(struct uv_signal_s *handle, int signum)
 
 int main(int argc, char *argv[])
 {
+  memset(ACK_BUFFER, 1, BATCH_SIZE);
+
   struct uv_loop_s loop;
   struct uv_signal_s sigint; /* To catch SIGINT and exit. */
   struct Server server;
