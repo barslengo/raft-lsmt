@@ -1,13 +1,8 @@
 /*
+ * TODO: Implement Idempotency on lsmt inserts by logging into an hashmap
+ * the pair (client_id, req_id).
  *  TODO: Handle data loss on leadership change or leader crash.
- *  TODO: Implement more robust responses to the tcp clients (e.g. return
- *  the leader address if the current node is a follower
- *  and receive a write requests, or tell the client when a
- *  request has been committed).
  *  TODO: Reorganize folder structure (Raft logs, sstables, etc..).
- *  TODO: Build something for handling the clusters:
- *    -Creating clusters.
- *    -Adding/Removing/Starting/Stopping nodes from a cluster at runtime. 
  */
 
 #include <assert.h>
@@ -28,7 +23,7 @@
   printf("%d: " FORMAT "\n", SERVER_ID, __VA_ARGS__)
 
 
-#define BATCH_SIZE 128
+#define BATCH_SIZE 1024 //128
 #define CONTENT_MAX_SIZE 255
 
 const uint8_t CONTENT_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t); 
@@ -64,6 +59,11 @@ typedef struct {
   bool paused;
 } client_t;
 
+typedef struct {
+  struct Server *server;
+  int req_count;
+} apply_ctx_t;
+
 /********************************************************************
  *
  * struct holding a single raft server instance and all its
@@ -92,6 +92,7 @@ struct Server
   struct raft_transfer transfer;      /* Transfer leadership request. */
   ServerCloseCb close_cb;             /* Optional close callback. */
 
+  client_t *active_client;
   void *batch_buffer;                 /* Buffer for batching requests into a single log. */
   uint32_t batch_offset;
   uint32_t buffer_capacity;
@@ -311,6 +312,9 @@ static void process_buffer(client_t *client);
 // Helper function to safely close and free a client's resources
 static void close_and_free_client(client_t *client) {
   // The on_client_close callback will free the client memory
+  if (client->server->active_client == client) {
+    client->server->active_client = NULL;
+  }
   uv_close((uv_handle_t *)&client->handle, on_client_close);
 }
 
@@ -361,7 +365,11 @@ static void batch_buffer_flush(struct Server *s) {
     exit(1);
   }
 
-  req->data = s;
+  apply_ctx_t *ctx = malloc(sizeof(apply_ctx_t));
+  ctx->server = s;
+  ctx->req_count = s->batched_req_count;
+
+  req->data = ctx;
 
   /* Apply the batch as ONE log entry */
   int rv = raft_apply(&s->raft, req, &raft_buf, 1, serverApplyCb);
@@ -375,6 +383,7 @@ static void batch_buffer_flush(struct Server *s) {
 
   if (rv != 0) {
     Logf(s->id, "raft_apply() failed: %s", raft_errmsg(&s->raft));
+    free(ctx);
     raft_free(raft_buf.base);
     raft_free(req);
   }
@@ -465,7 +474,6 @@ static void process_buffer(client_t *client) {
   struct Server *s = client->server;
   size_t offset = 0;
 
-  uint32_t processed_in_this_loop = 0;
 
   // Loop as long as we might have a complete message in the buffer
   while (offset + sizeof(uint32_t) <= client->buffer_len) {
@@ -492,22 +500,9 @@ static void process_buffer(client_t *client) {
 
     if (s->raft.state != RAFT_LEADER) {
       Log(s->id, "TCP: Rejecting command, not the leader.");
-      // In a real system, you'd send an error response here
+      close_and_free_client(client);
     } else {
-      /* Check if we need to FLUSH before adding this new message.
-       * Flush if:
-       *  a) Batch count limit reached
-       *  b) Batch buffer size limit reached (can't fit new message)
-       */
-      bool batch_full_count = (s->batched_req_count >= BATCH_SIZE);
-      bool batch_full_size  = (s->batch_offset + total_msg_len > s->buffer_capacity);
-
-      if (batch_full_count || batch_full_size) {
-        batch_buffer_flush(s);
-      }
-
       /* Add to Batch */
-      /* Double check it fits now (in case single message > buffer capacity) */
       if (s->batch_offset + total_msg_len <= s->buffer_capacity) {
         memcpy((uint8_t*)s->batch_buffer + s->batch_offset, msg_ptr, total_msg_len);
         s->batch_offset += total_msg_len;
@@ -521,17 +516,19 @@ static void process_buffer(client_t *client) {
         Logf(s->id, "Error: Message too large for batch buffer (%u > %u)", 
             total_msg_len, s->buffer_capacity);
       }
+      /* Check if we need to FLUSH after adding this new message.
+       * Flush if:
+       *  a) Batch count limit reached
+       *  b) Batch buffer size limit reached (can't fit new message)
+       */
+      bool batch_full_count = (s->batched_req_count >= BATCH_SIZE);
+      bool batch_full_size  = (s->batch_offset >= s->buffer_capacity);
 
-      processed_in_this_loop++;
+      if (batch_full_count || batch_full_size) {
+        batch_buffer_flush(s);
+      }
     }
     offset += total_msg_len;
-  }
-
-  // Send 1 ACK for the chunk of work we just did.
-  if (processed_in_this_loop > 0) {
-    char ack = 1;
-    uv_buf_t ack_buf = uv_buf_init(&ack, 1);
-    uv_try_write((uv_stream_t*)&client->handle, &ack_buf, 1);
   }
 
   // Only move memory after we are done reading everything possible.
@@ -541,6 +538,15 @@ static void process_buffer(client_t *client) {
       memmove(client->buffer, client->buffer + offset, remaining);
     }
     client->buffer_len = remaining;
+  }
+
+  /* 
+   * If we have processed everything in the buffer (buffer_len is 0),
+   * but we have pending items in the batch, 
+   * we MUST flush now. The client is waiting for these ACKs.
+   */
+  if (client->buffer_len == 0 && s->batched_req_count > 0) {
+      batch_buffer_flush(s);
   }
 
   // RESUME CLIENT (Flow Control)
@@ -573,6 +579,7 @@ static void on_new_connection(uv_stream_t *server_handle, int status) {
 
   if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
     //Log(s->id, "TCP: New client connected.");
+    s->active_client = client;
     uv_tcp_keepalive(&client->handle, 1, 60);
     uv_read_start((uv_stream_t *)&client->handle, alloc_cb, on_client_read);
   } else {
@@ -766,22 +773,27 @@ err:
  * completed. */
 static void serverApplyCb(struct raft_apply *req, int status, void *result)
 {
-  struct Server *s = req->data;
-  //int count;
-  raft_free(req);
+  apply_ctx_t *ctx = (apply_ctx_t *)req->data;
+  struct Server *s = ctx->server;
+
+  if (status == 0 && s->active_client != NULL) {
+    char *acks = malloc(ctx->req_count);
+    if (acks) {
+      memset(acks, 1, ctx->req_count);
+      uv_buf_t ack_buf = uv_buf_init(acks, ctx->req_count);
+      uv_try_write((uv_stream_t *)&s->active_client->handle, &ack_buf, 1);
+      free(acks);
+    }
+  }
   if (status != 0) {
     if (status != RAFT_LEADERSHIPLOST) {
       Logf(s->id, "raft_apply() callback: %s (%d)", raft_errmsg(&s->raft),
           status);
     }
-    return;
   }
-  /*
-     count = *(int *)result;
-     if (count % 100 == 0) {
-     Logf(s->id, "count %d", count);
-     }
-     */
+
+  free(ctx);
+  raft_free(req); 
 }
 
 static void statsTimerCb(uv_timer_t *timer)
