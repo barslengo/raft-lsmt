@@ -55,8 +55,6 @@ typedef struct {
   char *buffer;
   size_t buffer_len;
   size_t buffer_cap;
-
-  bool paused;
 } client_t;
 
 typedef struct {
@@ -400,8 +398,8 @@ static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) 
   buf->len = suggested_size;
 }
 
-#define HIGH_WATER_MARK (10 * 1024 * 1024) // 10 MB
 
+#define MAX_CLIENT_BUF_SIZE (16 * 1024 * 1024) // 16 MB
 static void on_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
   client_t *client = (client_t *)stream->data;
   struct Server *s = client->server; // Need reference to server for flushing
@@ -427,13 +425,11 @@ static void on_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *b
     memcpy(client->buffer + client->buffer_len, buf->base, nread);
     client->buffer_len += nread;
 
-    // CHECK HIGH WATER MARK
-    // If we have too much pending data, tell libuv to STOP reading.
-    // This forces the client to block via TCP flow control.
-    if (client->buffer_len >= HIGH_WATER_MARK && !client->paused) {
-        printf("High Water Mark reached (%lu bytes). Pausing client.\n", client->buffer_len);
-        uv_read_stop(stream); 
-        client->paused = true;
+    if (client->buffer_len > MAX_CLIENT_BUF_SIZE) {
+      fprintf(stderr, "Client exeeded memory limit. Disconnecting.\n");
+      close_and_free_client(client);
+      free(buf->base);
+      return;
     }
 
     // Process available messages
@@ -467,8 +463,6 @@ static void on_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *b
 
   if (buf->base) free(buf->base);
 }
-
-#define LOW_WATER_MARK (5 * 1024 * 1024) // 5MB 
 
 static void process_buffer(client_t *client) {
   struct Server *s = client->server;
@@ -548,13 +542,6 @@ static void process_buffer(client_t *client) {
   if (client->buffer_len == 0 && s->batched_req_count > 0) {
       batch_buffer_flush(s);
   }
-
-  // RESUME CLIENT (Flow Control)
-  if (client->paused && client->buffer_len < LOW_WATER_MARK) {
-    printf("Low Water Mark reached (%lu bytes). Resuming client.\n", client->buffer_len);
-    uv_read_start((uv_stream_t*)&client->handle, alloc_cb, on_client_read);
-    client->paused = false;
-  }
 }
 
 // Libuv callback for when a new client connects to our server
@@ -573,7 +560,6 @@ static void on_new_connection(uv_stream_t *server_handle, int status) {
   client->server = s;
   client->handle.data = client; // Important: back-pointer for callbacks
   client->write_req.data = client;
-  client->paused = false;
 
   uv_tcp_init(s->loop, &client->handle);
 
