@@ -1,16 +1,6 @@
 /*
  * TODO: FIX Backlogs underflows in stats.
- * TODO: Implement Idempotency on lsmt inserts by logging into an hashmap
- * the pair (client_id, req_id).
  * TODO: Reorganize folder structure (Raft logs, sstables, etc..).
- * TODO: Implement a protocol for data migration where
- *  one dedicated tcp socket accept two commands:
- *    -Load in memory all the records requested then dump them 
- *      into a new temporary lsmt-db (creating sstables populated only
- *    by the requested records). Evenutally zip the temporary db send
- *    send it back to the client.
- *    -Recieve a zipped db and attach its sstables it into the active lsmt db.
- *
  */
 
 #include <assert.h>
@@ -37,6 +27,65 @@
 static char ACK_BUFFER[BATCH_SIZE];
 const uint8_t CONTENT_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t); 
 const uint32_t INSERT_CMD_SIZE = CONTENT_HEADER_SIZE + sizeof(uint8_t)*CONTENT_MAX_SIZE; 
+
+
+/* ========== CLUST CONFIG SECTION START ========== */
+typedef struct {
+  int id;
+  char raft_address[64]; // e.g., "127.0.0.1:9001"
+  int client_port;       // e.g., 7001
+} node_config_t;
+
+typedef struct {
+  node_config_t *nodes;
+  int count;
+} cluster_config_t;
+
+int load_cluster_config(const char *filename, cluster_config_t *out_conf) {
+  FILE *f = fopen(filename, "r");
+  if (!f) return -1;
+
+  // Count lines to allocate memory
+  int lines = 0;
+  char ch;
+  while(!feof(f)) {
+    ch = fgetc(f);
+    if(ch == '\n') lines++;
+  }
+  // Handle case where last line has no newline
+  lines++; 
+  rewind(f);
+
+  out_conf->nodes = calloc(lines, sizeof(node_config_t));
+  out_conf->count = 0;
+
+  // 2. Parse lines
+  char line[256];
+  int i = 0;
+  while (fgets(line, sizeof(line), f)) {
+    // Skip empty lines or comments
+    if (strlen(line) < 5 || line[0] == '#') continue;
+
+    node_config_t *node = &out_conf->nodes[i];
+
+    // Format: ID RAFT_ADDR CLIENT_PORT
+    int n = sscanf(line, "%d %63s %d", 
+        &node->id, 
+        node->raft_address, 
+        &node->client_port);
+
+    if (n == 3) {
+      i++;
+    }
+  }
+
+  out_conf->count = i;
+  fclose(f);
+  return 0;
+}
+
+/* ========== CLUST CONFIG SECTION END ========== */
+
 
 typedef struct insert_cmd {
   uint32_t msg_size;
@@ -616,6 +665,7 @@ static void on_new_connection(uv_stream_t *server_handle, int status) {
     //Log(s->id, "TCP: New client connected.");
     s->active_client = client;
     uv_tcp_keepalive(&client->handle, 1, 60);
+    uv_tcp_nodelay(&client->handle, 1); 
     uv_read_start((uv_stream_t *)&client->handle, alloc_cb, on_client_read);
   } else {
     close_and_free_client(client);
@@ -660,13 +710,27 @@ typedef struct bootstrap_node {
 static int ServerInit(struct Server *s,
     struct uv_loop_s *loop,
     const char *dir,
-    bootstrap_node_t *bootstrap_node,
+    cluster_config_t *cluster_conf,
     unsigned id)
 {
   struct raft_configuration configuration;
   struct timespec now;
   unsigned i;
   int rv;
+
+  /* The configuration for the current node. */
+  node_config_t *node_config = NULL;
+
+  for (int i = 0; i < cluster_conf->count; i++) {
+    if (cluster_conf->nodes[i].id == id) {
+      node_config = &cluster_conf->nodes[i];
+      break;
+    }
+  }
+  if (!node_config) {
+    fprintf(stderr, "Error: ID %u not found in configuration file.\n", id);
+    exit(1);
+  }
 
   memset(s, 0, sizeof *s);
 
@@ -717,7 +781,7 @@ static int ServerInit(struct Server *s,
   s->id = id;
 
   /* Render the address. */
-  sprintf(s->address, "192.168.1.160:900%d", id);
+  strcpy(s->address, node_config->raft_address);
 
   /* Initialize and start the engine, using the libuv-based I/O backend. */
   rv = raft_init(&s->raft, &s->io, &s->fsm, id, s->address);
@@ -730,28 +794,17 @@ static int ServerInit(struct Server *s,
 
   /* Bootstrap the initial configuration if needed. */
   raft_configuration_init(&configuration);
-  if (bootstrap_node != NULL && bootstrap_node->id >= 0) {
-    char address[64];
-    unsigned server_id = i + 1;
-    sprintf(address, "192.168.1.160:900%d", server_id);
-    rv = raft_configuration_add(&configuration, server_id, address,
-        RAFT_VOTER);
+
+  for (int i = 0; i < cluster_conf->count; i++) {
+    node_config_t *node = &cluster_conf->nodes[i];
+    rv = raft_configuration_add(&configuration, node->id, node->raft_address,
+        RAFT_VOTER); 
     if (rv != 0) {
       Logf(s->id, "raft_configuration_add(): %s", raft_strerror(rv));
       goto err_after_configuration_init;
     }
   }
-  for (i = 0; i < N_SERVERS; i++) {
-    char address[64];
-    unsigned server_id = i + 1;
-    sprintf(address, "192.168.1.160:900%d", server_id);
-    rv = raft_configuration_add(&configuration, server_id, address,
-        RAFT_VOTER);
-    if (rv != 0) {
-      Logf(s->id, "raft_configuration_add(): %s", raft_strerror(rv));
-      goto err_after_configuration_init;
-    }
-  }
+
   rv = raft_bootstrap(&s->raft, &configuration);
   if (rv != 0 && rv != RAFT_CANTBOOTSTRAP) {
     goto err_after_configuration_init;
@@ -765,7 +818,7 @@ static int ServerInit(struct Server *s,
   s->transfer.data = s;
 
   /* Setup tcp connection for handling incoming requests. */
-  rv = client_uv_init(s, 7000 + id);
+  rv = client_uv_init(s, node_config->client_port);
   if (rv != 0) {
     exit(1);
     //goto err;
@@ -1015,16 +1068,25 @@ int main(int argc, char *argv[])
   struct uv_signal_s sigint; /* To catch SIGINT and exit. */
   struct Server server;
   const char *dir;
+  const char *conf_path;
   unsigned id;
   int rv;
 
 
-  if (argc != 3) {
-    printf("usage: example-server <dir> <id>\n");
+  if (argc != 4) {
+    printf("usage: server <data_dir> <id> <cluster.conf>\n");
     return 1;
   }
+
   dir = argv[1];
   id = (unsigned)atoi(argv[2]);
+  conf_path = argv[3];
+  cluster_config_t cluster_conf = {0};
+
+  if (load_cluster_config(conf_path, &cluster_conf) != 0) {
+    fprintf(stderr, "Failed to laod the cluster config from %s\n", conf_path);
+    return 1;
+  }
 
   /* Ignore SIGPIPE, see https://github.com/joyent/libuv/issues/1254 */
   signal(SIGPIPE, SIG_IGN);
@@ -1037,7 +1099,7 @@ int main(int argc, char *argv[])
   }
 
   /* Initialize the example server. */
-  rv = ServerInit(&server, &loop, dir, NULL, id);
+  rv = ServerInit(&server, &loop, dir, &cluster_conf, id);
   if (rv != 0) {
     goto err_after_server_init;
   }
