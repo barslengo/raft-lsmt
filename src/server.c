@@ -3,6 +3,14 @@
  * TODO: Implement Idempotency on lsmt inserts by logging into an hashmap
  * the pair (client_id, req_id).
  * TODO: Reorganize folder structure (Raft logs, sstables, etc..).
+ * TODO: Implement a protocol for data migration where
+ *  one dedicated tcp socket accept two commands:
+ *    -Load in memory all the records requested then dump them 
+ *      into a new temporary lsmt-db (creating sstables populated only
+ *    by the requested records). Evenutally zip the temporary db send
+ *    send it back to the client.
+ *    -Recieve a zipped db and attach its sstables it into the active lsmt db.
+ *
  */
 
 #include <assert.h>
@@ -16,7 +24,7 @@
 #include <lsmt/lsmt.h>
 
 #define N_SERVERS 3    /* Number of servers in the example cluster */
-#define APPLY_RATE 1000 /* Store new statistic entry every second. */
+#define APPLY_RATE 100 /* Store new statistic entry every 100 ms. */
 
 #define Log(SERVER_ID, FORMAT) printf("%d: " FORMAT "\n", SERVER_ID)
 #define Logf(SERVER_ID, FORMAT, ...) \
@@ -68,6 +76,7 @@ typedef struct {
 typedef struct {
   struct Server *server;
   int req_count;
+  uint64_t start_time;
 } apply_ctx_t;
 
 /********************************************************************
@@ -113,6 +122,9 @@ struct Server
     uint64_t prev_bytes;
 
     uint64_t total_received; /* Total requests received from tcp connections. */
+    uint64_t last_run_time; 
+    uint64_t period_latency_sum; /* Sum of ms taken by all batches in this tick */
+    uint64_t period_batches_count; /* How many batches finished in this tick */
   } stats;
 };
 
@@ -388,6 +400,7 @@ static void batch_buffer_flush(struct Server *s) {
   apply_ctx_t *ctx = malloc(sizeof(apply_ctx_t));
   ctx->server = s;
   ctx->req_count = s->batched_req_count;
+  ctx->start_time = uv_now(s->loop); 
 
   req->data = ctx;
 
@@ -769,7 +782,9 @@ static int ServerInit(struct Server *s,
     perror("Failed to init stats file.");
     exit(1);
   } 
-  fprintf(s->stats.f, "Timestamp_ms,Role,OPS,Throughput_MBps,Batch_Size,Pending_Queue,Backlog\n"); 
+    
+  fprintf(s->stats.f, "Timestamp_ms,Role,OPS,Throughput_MBps,Batch_Size,Pending_Queue,Backlog,Avg_Latency_ms\n"); 
+  //fprintf(s->stats.f, "Timestamp_ms,Role,OPS,Throughput_MBps,Batch_Size,Pending_Queue,Backlog\n"); 
   fflush(s->stats.f);
 
   s->stats.total_requests = 0;
@@ -797,6 +812,14 @@ static void serverApplyCb(struct raft_apply *req, int status, void *result)
 {
   apply_ctx_t *ctx = (apply_ctx_t *)req->data;
   struct Server *s = ctx->server;
+
+  /* Calculate Latency */
+  uint64_t now = uv_now(s->loop);
+  uint64_t latency = now - ctx->start_time;
+
+  /* Update Stats Accumulators */
+  s->stats.period_latency_sum += latency;
+  s->stats.period_batches_count++;
 
   if (status == 0 && s->active_client != NULL && !s->active_client->closing) {
     ack_write_t *wr = malloc(sizeof(ack_write_t));
@@ -829,50 +852,83 @@ static void serverApplyCb(struct raft_apply *req, int status, void *result)
 static void statsTimerCb(uv_timer_t *timer)
 {
   struct Server *s = timer->data;
+  uint64_t now = uv_now(s->loop);
+  int current_state = s->raft.state;
 
+  /* -----------------------------------------------------------------------
+   * Calculate Time Delta 
+   * ----------------------------------------------------------------------- */
+  if (s->stats.last_run_time == 0) {
+      s->stats.last_run_time = now - APPLY_RATE; 
+  }
+
+  uint64_t dt = now - s->stats.last_run_time;
+  if (dt == 0) dt = 1;
+
+  /* -----------------------------------------------------------------------
+   * Calculate Rates (OPS & MB/s)
+   * ----------------------------------------------------------------------- */
   uint64_t current_reqs = s->stats.total_requests;
   uint64_t current_bytes = s->stats.total_bytes;
 
-  /* TCP received requests - Requests committed to disk. */
-  uint64_t backlog = s->stats.total_received - s->stats.total_requests;
+  uint64_t delta_reqs = current_reqs - s->stats.prev_requests;
+  uint64_t delta_bytes = current_bytes - s->stats.prev_bytes;
 
-  uint64_t ops_sec = current_reqs - s->stats.prev_requests;
-  double mb_sec = (double)(current_bytes - s->stats.prev_bytes) / (1024.0 * 1024.0);
+  /* Normalize to Seconds */
+  uint64_t ops_sec = (delta_reqs * 1000) / dt;
+  double mb_sec = ((double)delta_bytes / (1024.0 * 1024.0)) * (1000.0 / dt);
 
-  // 2. Update Previous values for next tick
-  s->stats.prev_requests = current_reqs;
-  s->stats.prev_bytes = current_bytes;
+  /* -----------------------------------------------------------------------
+   * Calculate Average Latency (From previous step)
+   * ----------------------------------------------------------------------- */
+  double avg_latency_ms = 0.0;
+  if (s->stats.period_batches_count > 0) {
+      avg_latency_ms = (double)s->stats.period_latency_sum / (double)s->stats.period_batches_count;
+  }
+  
+  /* Reset latency accumulators */
+  s->stats.period_latency_sum = 0;
+  s->stats.period_batches_count = 0;
 
-  // 3. Get Current Role string
-  const char *role_name = "UNKNOWN";
-  int state = s->raft.state;
-  if (state == RAFT_LEADER) role_name = "LEADER";
-  else if (state == RAFT_FOLLOWER) role_name = "FOLLOWER";
-  else if (state == RAFT_CANDIDATE) role_name = "CANDIDATE";
-
-  // 4. Log to Console (for you to see it's alive)
-  /*
-  printf("[Node %d] %s | OPS: %lu | Speed: %.2f MB/s\n", 
-      s->id, role_name, ops_sec, mb_sec);
-  */
-
-  // 5. Log to Disk (CSV)
-  if (s->stats.f) {
-    fprintf(s->stats.f, "%lu,%s,%lu,%.2f,%u,%u,%lu\n",
-        uv_now(s->loop),          // Timestamp
-        role_name,                // Role
-        ops_sec,                  // Operations Per Second
-        mb_sec,                   // Megabytes Per Second
-        s->batched_req_count,     // Current Batch Size
-        s->batch_offset,          // Bytes currently in buffer
-        backlog
-        );
-
-    // Important: Flush occasionally so you don't lose data on Ctrl+C
-    // (Doing this every second is fine for a benchmark)
-    fflush(s->stats.f); 
+  /* -----------------------------------------------------------------------
+   * Calculate Backlog 
+   * ----------------------------------------------------------------------- */
+  uint64_t backlog = 0;
+  
+  /* 
+   * Simple Logic: Input - Output.
+   * Safety Check: Ensure we don't underflow if Output > Input 
+   * (which happens if we processed logs as a Follower).
+   */
+  if (s->stats.total_received > s->stats.total_requests) {
+      backlog = s->stats.total_received - s->stats.total_requests;
   }
 
+  /* -----------------------------------------------------------------------
+   * Update State & Log
+   * ----------------------------------------------------------------------- */
+  s->stats.prev_requests = current_reqs;
+  s->stats.prev_bytes = current_bytes;
+  s->stats.last_run_time = now;
+  const char *role_name = "UNKNOWN";
+  if (current_state == RAFT_LEADER) role_name = "LEADER";
+  else if (current_state == RAFT_FOLLOWER) role_name = "FOLLOWER";
+  else if (current_state == RAFT_CANDIDATE) role_name = "CANDIDATE";
+
+  if (s->stats.f) {
+    fprintf(s->stats.f, "%lu,%s,%lu,%.2f,%u,%u,%lu,%.2f\n",
+        now, 
+        role_name, 
+        ops_sec, 
+        mb_sec,
+        s->batched_req_count, 
+        s->batch_offset, 
+        backlog,
+        avg_latency_ms
+    );
+    // fflush(s->stats.f); 
+  }
+ 
   /* flush data that's being too long in the buffer. */
   batch_buffer_flush(s);
 }
