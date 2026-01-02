@@ -121,25 +121,35 @@ def consumer_thread(q, cluster_conf):
             print(f"[Consumer] Critical Loop Error: {e}")
             time.sleep(1)
 
-def monitor_thread(stop_event, total_target):
+def monitor_thread(stop_event, total_target, queue_obj):
     """
-    Prints throughput stats every second.
+    Prints throughput stats every 100ms.
     """
     last_count = 0
     start_time = time.time()
     
-    while not stop_event.is_set():
-        time.sleep(1.0)
-        with stats_lock:
-            current = total_committed
-        
-        diff = current - last_count
-        last_count = current
-        
-        print(f"Status: {current}/{total_target} committed | Speed: {diff} RPS")
-        
-        if current >= total_target:
-            break
+    with open("client_stats.csv", "w") as f:
+        f.write("Time_Sec,Committed_Total,Pending_Reqs\n")
+
+        while not stop_event.is_set():
+            time.sleep(0.1)
+            #time.sleep(1.0)
+            with stats_lock:
+                current = total_committed
+
+            elapsed = time.time() - start_time
+            pending_reqs = queue_obj.qsize()
+
+            f.write(f"{elapsed:.2f},{current},{pending_reqs}\n")
+            f.flush()
+            
+            diff = current - last_count
+            last_count = current
+            
+            #print(f"Status: {current}/{total_target} committed | Speed: {diff} RPS")
+            
+            if current >= total_target:
+                break
 
 def main():
     parser = argparse.ArgumentParser(description="Distributed DB Benchmark Client")
@@ -182,7 +192,8 @@ def main():
 
     prod = threading.Thread(target=producer_thread, args=(request_queue, args.requests))
     cons = threading.Thread(target=consumer_thread, args=(request_queue, cluster_conf))
-    mon = threading.Thread(target=monitor_thread, args=(stop_event, args.requests))
+    mon = threading.Thread(target=monitor_thread, args=(stop_event, args.requests,
+                                                        request_queue))
 
     prod.start()
     cons.start()
