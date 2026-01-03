@@ -30,7 +30,7 @@ const uint32_t INSERT_CMD_SIZE = CONTENT_HEADER_SIZE + sizeof(uint8_t)*CONTENT_M
 
 /* ========== CLUST CONFIG SECTION START ========== */
 typedef struct {
-  int id;
+  uint32_t id;
   char raft_address[64]; // e.g., "127.0.0.1:9001"
   int client_port;       // e.g., 7001
 } node_config_t;
@@ -68,7 +68,7 @@ int load_cluster_config(const char *filename, cluster_config_t *out_conf) {
     node_config_t *node = &out_conf->nodes[i];
 
     // Format: ID RAFT_ADDR CLIENT_PORT
-    int n = sscanf(line, "%d %63s %d", 
+    int n = sscanf(line, "%u %63s %d", 
         &node->id, 
         node->raft_address, 
         &node->client_port);
@@ -748,11 +748,10 @@ static int ServerInit(struct Server *s,
     struct uv_loop_s *loop,
     const char *dir,
     cluster_config_t *cluster_conf,
-    unsigned id)
+    uint32_t id)
 {
   struct raft_configuration configuration;
   struct timespec now;
-  unsigned i;
   int rv;
 
   /* The configuration for the current node. */
@@ -852,6 +851,13 @@ static int ServerInit(struct Server *s,
   raft_set_snapshot_threshold(&s->raft, UINT32_MAX); //64);
   raft_set_snapshot_trailing(&s->raft, 16);
   raft_set_pre_vote(&s->raft, true);
+ 
+  raft_set_election_timeout(&s->raft, 5000);   // 5 Seconds
+  raft_set_heartbeat_timeout(&s->raft, 500);   // 0.5 Seconds
+
+  /* Allow more data in flight to fill. 
+   * With 4KB batches, 256 entries = 1MB of in-flight data. */
+  raft_set_max_inflight_entries(&s->raft, 256);
 
   s->transfer.data = s;
 
@@ -1121,7 +1127,7 @@ int main(int argc, char *argv[])
   struct Server server;
   const char *dir;
   const char *conf_path;
-  unsigned id;
+  uint32_t id;
   int rv;
 
 
@@ -1131,7 +1137,7 @@ int main(int argc, char *argv[])
   }
 
   dir = argv[1];
-  id = (unsigned)atoi(argv[2]);
+  id = (uint32_t)atoi(argv[2]);
   conf_path = argv[3];
   cluster_config_t cluster_conf = {0};
 
