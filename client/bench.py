@@ -5,6 +5,7 @@ import argparse
 import threading
 import queue
 import json
+import socket
 from client import RaftClient
 
 # --- Configuration ---
@@ -17,6 +18,9 @@ PIPELINE_DEPTH = 4096
 # Global stats for monitoring
 stats_lock = threading.Lock()
 total_committed = 0
+
+committed_history = []
+history_lock = threading.Lock()
 
 def create_insert_request(seq_id):
     """
@@ -34,11 +38,11 @@ def create_insert_request(seq_id):
     # This is the buffer that lsmt_insert() will receive.
     # Format: [content_type (1 byte)] [size_of_real_content (4 bytes)] [real_content (N bytes)]
     inner_payload = struct.pack(
-        "<BIQ",  # B=uint8_t, I=uint32_t, Q=uint64_t
-        LSMT_TYPE_INT,
-        real_content_size,
-        real_content
-    )
+            "<BIQ",  # B=uint8_t, I=uint32_t, Q=uint64_t
+            LSMT_TYPE_INT,
+            real_content_size,
+            real_content
+            )
     # The total size of this inner payload. This will become the `content_size` in the outer command.
     inner_payload_size = len(inner_payload) # This will be 1 + 4 + 8 = 13 bytes
 
@@ -51,30 +55,37 @@ def create_insert_request(seq_id):
     # The format string for the full command payload.
     # The 's' format specifier takes a byte string.
     outer_payload_format = f"{INSERT_CMD_FORMAT_PREFIX}{inner_payload_size}s"
-    
+
     outer_payload = struct.pack(
-        outer_payload_format,
-        key_id,
-        key_timestamp,
-        #inner_payload_size, # This is the value for the `content_size` field.
-        inner_payload       # This is the value for the `encoded_data` field.
-    )
+            outer_payload_format,
+            key_id,
+            key_timestamp,
+            #inner_payload_size, # This is the value for the `content_size` field.
+            inner_payload       # This is the value for the `encoded_data` field.
+            )
 
     # --- Step 4: Prepend the entire message with its 4-byte network length ---
     message_length_prefix = struct.pack("<I", 4 + len(outer_payload))
-    
-    return message_length_prefix + outer_payload
+
+    binary_packet = message_length_prefix + outer_payload
+    metadata = {
+            'id': key_id,
+            'ts': key_timestamp,
+            'val': real_content
+            }
+
+    return binary_packet, metadata 
 
 def producer_thread(q, num_requests):
     """
     Generates requests and pushes them to the queue.
     """
     print(f"[Producer] Starting to generate {num_requests} requests...")
-    
+
     for i in range(num_requests):
-        req = create_insert_request(i)
-        q.put(req)
-        
+        packet, meta = create_insert_request(i)
+        q.put((packet, meta))
+
         # Optional: throttling if queue gets too big to save RAM
         if q.qsize() > PIPELINE_DEPTH * 10:
             time.sleep(0.01)
@@ -89,8 +100,9 @@ def consumer_thread(q, cluster_conf):
     """
     # Instantiate with the dictionary
     client = RaftClient(cluster_conf)
-    
+
     current_batch = []
+    batch_metas = []
     global total_committed
 
     while True:
@@ -104,21 +116,29 @@ def consumer_thread(q, cluster_conf):
                         if current_batch:
                             client.send_batch_reliable(current_batch)
                             with stats_lock: total_committed += len(current_batch)
+                            with history_lock: committed_history.extend(batch_metas)
                         return
-                    current_batch.append(item)
+                    pkt, meta = item
+                    current_batch.append(pkt)
+                    batch_metas.append(meta)
                 except queue.Empty:
                     break
 
             # 2. Send Batch (Handles Failover internally)
             if current_batch:
                 client.send_batch_reliable(current_batch)
-                
+
                 with stats_lock:
                     total_committed += len(current_batch)
                 current_batch = [] 
 
+                with history_lock:
+                    committed_history.extend(batch_metas)
+                batch_metas = []
+
         except Exception as e:
             print(f"[Consumer] Critical Loop Error: {e}")
+            batch_metas = []
             time.sleep(1)
 
 def monitor_thread(stop_event, total_target, queue_obj):
@@ -127,7 +147,7 @@ def monitor_thread(stop_event, total_target, queue_obj):
     """
     last_count = 0
     start_time = time.time()
-    
+
     with open("client_stats.csv", "w") as f:
         f.write("Time_Sec,Committed_Total,Pending_Reqs\n")
 
@@ -142,14 +162,123 @@ def monitor_thread(stop_event, total_target, queue_obj):
 
             f.write(f"{elapsed:.2f},{current},{pending_reqs}\n")
             f.flush()
-            
+
             diff = current - last_count
             last_count = current
-            
+
             #print(f"Status: {current}/{total_target} committed | Speed: {diff} RPS")
-            
+
             if current >= total_target:
                 break
+
+
+
+# --- NEW: Verification Logic ---
+def read_exact(sock, n, timeout=20.0):
+    """
+    Reads exactly n bytes from the socket.
+    Reads in chunks to avoid OS buffer issues with large requests.
+    """
+    sock.settimeout(timeout)
+    data = bytearray() # Use bytearray for mutable appending (faster)
+
+    # Read in 64KB chunks
+    CHUNK_SIZE = 65536 
+
+    while len(data) < n:
+        remaining = n - len(data)
+        to_read = min(remaining, CHUNK_SIZE)
+
+        try:
+            chunk = sock.recv(to_read)
+
+            if not chunk:
+                raise Exception(f"Socket closed unexpectedly. Received {len(data)}/{n} bytes.")
+
+            data.extend(chunk)
+            print(f"Received {len(data)}/{n} bytes.")
+
+        except socket.timeout:
+            raise Exception(f"Socket timed out. Progress: {len(data)}/{n} bytes read.")
+
+    return bytes(data)
+
+def run_verification(cluster_conf):
+    print("\n--- Starting Verification Phase ---")
+
+    # 1. Pick a node (Leader or Follower) and connect to READ port
+    # Note: Assuming node 1 is available or just picking first from config
+    node_id = list(cluster_conf.keys())[0]
+    host, base_port = cluster_conf[node_id]
+    read_port = base_port + 4000 
+
+    print(f"[Verifier] Connecting to {host}:{read_port}...")
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((host, read_port))
+
+        # 2. Construct Range Query
+        # We want everything.
+        # Start Key: {0, 0}
+        # End Key:   {Max, Max}
+
+        start_key = struct.pack("<QQ", 0, 0)
+        end_key   = struct.pack("<QQ", 2**64 - 1, 2**64 - 1)
+
+        # Request Format: [StartKey(16)] [EndKey(16)]
+        request = start_key + end_key
+        s.sendall(request)
+
+        print("[Verifier] Request sent. Waiting for response stream...")
+
+        received_count = 0
+        # Read Total Payload Size
+        header_data = read_exact(s, 4)
+
+        payload_size = struct.unpack("<I", header_data)[0]
+
+        print(f"recieved payload_size = {payload_size}")
+        # Read the rest of the payload
+        payload = read_exact(s, payload_size-4, 20)
+
+        # Parse Count inside payload
+        count = struct.unpack("<I", payload[0:4])[0]
+        offset = 4
+
+        # print(f"[Verifier] Received chunk with {count} records (Size: {payload_size})")
+
+        for _ in range(count):
+            # Parse Key (16B)
+            k_id, k_ts = struct.unpack("<QQ", payload[offset:offset+16])
+            offset += 16
+
+            # Parse Type (1B)
+            d_type = payload[offset]
+            offset += 1
+
+            # Parse Data Len (4B)
+            d_len = struct.unpack("<I", payload[offset:offset+4])[0]
+            offset += 4
+
+            # Parse Data
+            # data_content = payload[offset:offset+d_len]
+            offset += d_len
+
+            received_count += 1
+
+        print(f"[Verifier] Total Records Received: {received_count}")
+        print(f"[Verifier] Total Records Expected: {len(committed_history)}")
+
+        if received_count == len(committed_history):
+            print(">>> SUCCESS: Data integrity verified.")
+        else:
+            print(f">>> FAILURE: Data mismatch. Missing {len(committed_history) - received_count} records.")
+
+        s.close()
+
+    except Exception as e:
+        print(f"[Verifier] Error: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Distributed DB Benchmark Client")
@@ -161,7 +290,7 @@ def main():
     try:
         with open(args.config, 'r') as f:
             config_data = json.load(f)
-        
+
         cluster_conf = {}
         # Parse JSON list into Dict {id: (host, port)}
         for node in config_data:
@@ -169,9 +298,9 @@ def main():
             host = node['host']
             port = int(node['port'])
             cluster_conf[node_id] = (host, port)
-            
+
         print(f"Loaded Cluster Config: {cluster_conf}")
-        
+
         if not cluster_conf:
             print("Error: Config file is empty or invalid.")
             return
@@ -207,6 +336,10 @@ def main():
 
     duration = time.time() - start_time
     print(f"\nBenchmark Complete. Avg RPS: {args.requests/duration:.2f}")
+
+    # --- Trigger Verification ---
+    time.sleep(2) 
+    run_verification(cluster_conf)
 
 if __name__ == "__main__":
     main()
