@@ -31,8 +31,8 @@ const uint32_t INSERT_CMD_SIZE = CONTENT_HEADER_SIZE + sizeof(uint8_t)*CONTENT_M
 /* ========== CLUST CONFIG SECTION START ========== */
 typedef struct {
   uint32_t id;
-  char raft_address[64]; // e.g., "127.0.0.1:9001"
-  int client_port;       // e.g., 7001
+  char raft_address[64];
+  int client_port;
 } node_config_t;
 
 typedef struct {
@@ -103,7 +103,13 @@ struct Fsm
 };
 
 
+typedef enum {
+  CLIENT_TYPE_INSERT,
+  CLIENT_TYPE_QUERY
+} client_type_t;
+
 typedef struct client_t {
+  client_type_t type;
   uv_tcp_t handle;
   struct Server *server;
 
@@ -154,7 +160,8 @@ struct Server
 {
   int last_state;                // To track state changes (Leader <-> Follower)
   lsmt_t *db;
-  uv_tcp_t tcp_server_handle;
+  uv_tcp_t tcp_write_handle;
+  uv_tcp_t tcp_read_handle;
   void *data;                         /* User data context. */
   struct uv_loop_s *loop;             /* UV loop. */
   struct uv_timer_s timer;            /* To periodically apply a new entry. */
@@ -168,7 +175,8 @@ struct Server
   struct raft_transfer transfer;      /* Transfer leadership request. */
   ServerCloseCb close_cb;             /* Optional close callback. */
 
-  struct client_t *clients_head;
+  struct client_t *insert_clients_head;
+  struct client_t *query_clients_head;
   struct {
     FILE *f;
     uint64_t total_requests;
@@ -186,38 +194,51 @@ struct Server
 
 
 void client_retain(client_t *c) {
-    c->ref_count++;
+  c->ref_count++;
 }
 
 void client_release(client_t *c) {
-    c->ref_count--;
-    if (c->ref_count == 0) {
-        if (c->buffer) free(c->buffer);
-        if (c->batch_buffer) free(c->batch_buffer); 
-        free(c);
-    }
+  c->ref_count--;
+  if (c->ref_count == 0) {
+    if (c->buffer) free(c->buffer);
+    if (c->batch_buffer) free(c->batch_buffer); 
+    free(c);
+  }
 }
 
 /* Add to head of list */
-static void add_client(struct Server *s, client_t *c) {
-    c->next = s->clients_head;
-    c->prev = NULL;
-    if (s->clients_head) {
-        s->clients_head->prev = c;
-    }
-    s->clients_head = c;
+static void add_client(struct Server *s, client_t *c, client_type_t type) {
+  c->type = type;  
+  client_t **head_ptr = (type == CLIENT_TYPE_INSERT) 
+    ? &s->insert_clients_head 
+    : &s->query_clients_head;
+
+  c->next = *head_ptr;
+  c->prev = NULL;
+  if (*head_ptr) {
+    (*head_ptr)->prev = c;
+  }
+  *head_ptr = c;
 }
 
 /* Remove from list */
 static void remove_client(struct Server *s, client_t *c) {
-    if (c->prev) {
-        c->prev->next = c->next;
-    } else {
-        s->clients_head = c->next;
-    }
-    if (c->next) {
-        c->next->prev = c->prev;
-    }
+  client_t **head_ptr = (c->type == CLIENT_TYPE_INSERT) 
+    ? &s->insert_clients_head 
+    : &s->query_clients_head;
+
+
+  if (c->prev) {
+    c->prev->next = c->next;
+  } else {
+    *head_ptr = c->next;
+  }
+  if (c->next) {
+    c->next->prev = c->prev;
+  }
+
+  c->next = NULL;
+  c->prev = NULL;
 }
 
 
@@ -283,21 +304,21 @@ static int FsmApply(struct raft_fsm *fsm,
         record_value_size);
 
     /*
-    uint32_t value_size = *((uint32_t *)(f->insert_cmd.record_value + sizeof(uint8_t)));
-    printf("insert: key=%lu %lu, record_length=%u, value_type=%u, value_size=%u, value_content: \n[",
-        f->insert_cmd.record_key.id,
-        f->insert_cmd.record_key.timestamp,
-        record_value_size,
-        f->insert_cmd.record_value[0],
-        value_size);
+       uint32_t value_size = *((uint32_t *)(f->insert_cmd.record_value + sizeof(uint8_t)));
+       printf("insert: key=%lu %lu, record_length=%u, value_type=%u, value_size=%u, value_content: \n[",
+       f->insert_cmd.record_key.id,
+       f->insert_cmd.record_key.timestamp,
+       record_value_size,
+       f->insert_cmd.record_value[0],
+       value_size);
 
-    uint32_t value_offset = record_value_size - value_size;
-    for (uint32_t i = record_value_size-1; i >= value_offset; i--) {
-      printf(" %02x", f->insert_cmd.record_value[i]);
-    }
-    printf("]\n\n");
-    fflush(stdout);
-    */
+       uint32_t value_offset = record_value_size - value_size;
+       for (uint32_t i = record_value_size-1; i >= value_offset; i--) {
+       printf(" %02x", f->insert_cmd.record_value[i]);
+       }
+       printf("]\n\n");
+       fflush(stdout);
+       */
 
     int e = lsmt_insert(db, f->insert_cmd.record_key,
         f->insert_cmd.record_value, 
@@ -418,7 +439,7 @@ static void serverTimerCloseCb(struct uv_handle_s *handle)
 static void serverApplyCb(struct raft_apply *req, int status, void *result);
 
 static void on_client_close(uv_handle_t *handle);
-static bool process_buffer(client_t *client);
+static bool process_insert_buffer(client_t *client);
 
 // Helper function to safely close and free a client's resources
 static void close_and_free_client(client_t *client) {
@@ -435,9 +456,9 @@ static void on_client_close(uv_handle_t *handle) {
   client_release(client);
 }
 
-static void on_ack_write_complete(uv_write_t *req, int status) {
+static void on_query_resp_complete(uv_write_t *req, int status) {
   ack_write_t *wr = (ack_write_t *)req;
-
+  printf("Write sent\n");
   if (status) {
     close_and_free_client(wr->client);
   }
@@ -446,16 +467,15 @@ static void on_ack_write_complete(uv_write_t *req, int status) {
   free(wr);
 }
 
-/*
-// Callback for after a write operation (e.g., sending a response) is complete
-static void on_write_complete(uv_write_t *req, int status) {
+static void on_ack_write_complete(uv_write_t *req, int status) {
+  ack_write_t *wr = (ack_write_t *)req;
   if (status) {
-    fprintf(stderr, "Write error: %s\n", uv_strerror(status));
+    close_and_free_client(wr->client);
   }
-  // You can free write-specific data here if you had any
-}
-*/
 
+  client_release(wr->client);
+  free(wr);
+}
 
 static void batch_buffer_flush(struct Server *s, client_t *c) {
   if (c->batched_req_count <= 0) {
@@ -494,11 +514,11 @@ static void batch_buffer_flush(struct Server *s, client_t *c) {
 
   /* Apply the batch as ONE log entry */
   int rv = raft_apply(&s->raft, req, &raft_buf, 1, serverApplyCb);
-    /*
-  printf("[BATCH saved] buffer (aligned) size=%lu, payload_len=%u\n",
-      raft_buf.len, s->batch_offset);
-  fflush(stdout);
-  */
+  /*
+     printf("[BATCH saved] buffer (aligned) size=%lu, payload_len=%u\n",
+     raft_buf.len, s->batch_offset);
+     fflush(stdout);
+     */
 
 
   if (rv != 0) {
@@ -557,20 +577,20 @@ static void on_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *b
     }
 
     // Process available messages
-    process_buffer(client);
+    process_insert_buffer(client);
 
   } else if (nread < 0) {
     // The client sent FIN, but we might still have requests in client->buffer 
     // that we buffered during flow control.
     if (client->buffer_len > 0) {
-        printf("EOF received. Processing remaining %lu bytes in buffer.\n", client->buffer_len);
-        process_buffer(client);
+      printf("EOF received. Processing remaining %lu bytes in buffer.\n", client->buffer_len);
+      process_insert_buffer(client);
     }
 
     // Flush any partial Raft batches
     if (client->batched_req_count > 0) {
-        printf("Flushing final batch of %u items due to client disconnect.\n", client->batched_req_count);
-        batch_buffer_flush(s, client);
+      printf("Flushing final batch of %u items due to client disconnect.\n", client->batched_req_count);
+      batch_buffer_flush(s, client);
     }
 
     // Error or EOF
@@ -588,7 +608,7 @@ static void on_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *b
 }
 
 // Returns true if client is still active, false if closed/freed.
-static bool process_buffer(client_t *client) {
+static bool process_insert_buffer(client_t *client) {
   struct Server *s = client->server;
   size_t offset = 0;
 
@@ -668,12 +688,12 @@ static bool process_buffer(client_t *client) {
    * we MUST flush now. The client is waiting for these ACKs.
    */
   if (client->buffer_len == 0 && client->batched_req_count > 0) {
-      batch_buffer_flush(s, client);
+    batch_buffer_flush(s, client);
   }
   return true;
 }
 // Libuv callback for when a new client connects to our server
-static void on_new_connection(uv_stream_t *server_handle, int status) {
+static void on_insert_connection(uv_stream_t *server_handle, int status) {
   if (status < 0) {
     fprintf(stderr, "New connection error: %s\n", uv_strerror(status));
     return;
@@ -699,7 +719,7 @@ static void on_new_connection(uv_stream_t *server_handle, int status) {
 
   if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
     Log(s->id, "TCP: New client connected.");
-    add_client(s, client);
+    add_client(s, client, CLIENT_TYPE_INSERT);
 
     uv_tcp_keepalive(&client->handle, 1, 60);
     uv_tcp_nodelay(&client->handle, 1); 
@@ -709,17 +729,215 @@ static void on_new_connection(uv_stream_t *server_handle, int status) {
   }
 }
 
-static int client_uv_init(struct Server *s, int port) {
-  Log(s->id, "Setting up custom TCP server");
+/* Serialize the kv_record_t array into the result array.
+ * The input array is also freed. */
+static uint32_t serialize_records(kv_record_t *records, uint32_t len, uint8_t **result) {
+  size_t payload_size = sizeof(uint32_t) + sizeof(uint32_t);
 
-  uv_tcp_init(s->loop, &s->tcp_server_handle);
-  s->tcp_server_handle.data = s; 
+  const size_t key_size = sizeof(sl_uint128_t);
+  const size_t data_type_size = sizeof(uint8_t);
+  const size_t len_field_size = sizeof(uint32_t);
+  const int fixed_size =  key_size + len_field_size + data_type_size;
 
+  for (uint32_t i = 0; i < len; i++) {
+    payload_size += fixed_size;
+    payload_size += records[i].data_len;
+  }
+
+  uint8_t *out = malloc(payload_size);
+  if (!out) {
+    printf("OOM on serializing data\n");
+    exit(1);
+  }
+
+  uint32_t offset = 0;
+
+  /* Payload Header. */
+  memcpy(out, &payload_size, sizeof(uint32_t));
+  offset += sizeof(uint32_t);
+  memcpy(out + offset, &len, sizeof(uint32_t));
+  offset += sizeof(uint32_t);
+
+  /* Payload body.
+   * Each record is serialized in the following order:
+   * [Key|DataType|DataLen|Data]. */
+  for (uint32_t i = 0; i < len; i++) {
+    memcpy(out + offset, &records[i].key, key_size); 
+    offset += key_size;
+
+    memcpy(out + offset, &records[i].data_type, data_type_size);
+    offset += data_type_size;
+
+    memcpy(out + offset, &records[i].data_len, len_field_size); 
+    offset += len_field_size; 
+
+    memcpy(out + offset, records[i].data, records[i].data_len);
+    offset += records[i].data_len;
+
+    free(records[i].data);
+  }
+  free(records);
+
+  *result = out;
+  return payload_size;
+}
+
+static void send_records(client_t *c, uint8_t *data, uint32_t payload_size) {
+  ack_write_t *wr = malloc(sizeof(ack_write_t));
+  if (!wr) {
+    free(data); 
+    exit(1);
+    return;
+  }
+
+  wr->req.data = wr;
+  wr->client = c;
+
+  // Retain client so it isn't freed while write is pending
+  client_retain(c);
+
+  // Cast to char* required by libuv
+  wr->buf = uv_buf_init((char*)data, (unsigned int)payload_size);
+
+  printf("Writing back %u bytes.\n", payload_size);
+  int r = uv_write(&wr->req, (uv_stream_t*)&c->handle, &wr->buf, 1, on_query_resp_complete);
+
+  if (r != 0) {
+    // Write failed immediately (didn't queue).
+    // We must manually perform the cleanup that the callback would have done.
+    free(data); 
+    client_release(c);
+    free(wr);
+    close_and_free_client(c);
+  }
+}
+
+static void process_query_buffer(client_t *client) {
+  size_t expected_size = sizeof(sl_uint128_t) * 2; 
+  size_t offset = 0;
+  size_t remaining = client->buffer_len;
+
+  while (remaining >= expected_size) {
+    printf("Processing query\n");
+    fflush(stdout);
+    sl_uint128_t start_key;
+    sl_uint128_t end_key;
+
+    memcpy(&start_key, client->buffer + offset, sizeof(sl_uint128_t)); 
+    offset += sizeof(sl_uint128_t);
+    memcpy(&end_key, client->buffer + offset, sizeof(sl_uint128_t)); 
+    offset += sizeof(sl_uint128_t);
+
+    kv_record_t *records = NULL; // array of records of size 'records_count'.
+    uint32_t records_count = lsmt_get(db, start_key, end_key, &records);
+    printf("Loaded %u records\n", records_count);
+    fflush(stdout);
+
+    uint8_t *payload = NULL;
+    uint32_t payload_size = serialize_records(records, records_count, &payload);
+    printf("serialized data into a payload of size %u\n", payload_size);
+    fflush(stdout);
+    send_records(client, payload, payload_size);
+    remaining -= expected_size;
+  }
+
+  // Only move memory after we are done reading everything possible.
+  if (offset > 0) {
+    if (remaining > 0) {
+      memmove(client->buffer, client->buffer + offset, remaining);
+    }
+    client->buffer_len = remaining;
+  }
+}
+
+/* Payload format: [Start_Key (16B)|End_Key (16B)]
+ * Response format: [Len (32B) | Records]
+ */
+static void on_client_query(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
+  client_t *client = (client_t *)stream->data;
+
+  if (nread > 0) {
+    if (client->buffer_len + nread > client->buffer_cap) {
+      // Logic to prevent infinite growth or handle OOM could go here
+      size_t new_cap = (client->buffer_len + nread) * 2;
+      char *new_buf = realloc(client->buffer, new_cap);
+      if (!new_buf) {
+        fprintf(stderr, "Critical: OOM in buffer realloc\n");
+        free(buf->base);
+        close_and_free_client(client);
+        return;
+      }
+      client->buffer = new_buf;
+      client->buffer_cap = new_cap;
+    }
+
+    memcpy(client->buffer + client->buffer_len, buf->base, nread);
+    client->buffer_len += nread;
+    process_query_buffer(client);
+  }
+  else if (nread < 0) {
+    // Error or EOF
+    if (nread != UV_EOF) {
+      fprintf(stderr, "Read error: %s\n", uv_strerror(nread));
+    } else {
+      printf("Client disconnected (EOF).\n");
+    }
+
+    printf("CLOSING\n");
+    close_and_free_client(client);
+  }
+  if (buf->base) free(buf->base);
+}
+
+static void on_read_connection(uv_stream_t *server_handle, int status) {
+  if (status < 0) {
+    fprintf(stderr, "New connection error: %s\n", uv_strerror(status));
+    return;
+  }
+
+  struct Server *s = (struct Server *)server_handle->data;
+
+  // Allocate and initialize a new client struct
+  client_t *client = calloc(1, sizeof(client_t));
+  if (!client) { /* handle OOM */ return; }
+
+  client->server = s;
+  client->handle.data = client; 
+  client->closing = false;
+  client_retain(client);
+
+  //client->batch_buffer = calloc(BATCH_SIZE, sizeof(insert_cmd_t));
+  //client->batch_offset = 0;
+  //client->batched_req_count = 0;
+  //client->buffer_capacity = BATCH_SIZE * sizeof(insert_cmd_t);
+
+  uv_tcp_init(s->loop, &client->handle);
+
+  if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
+    Log(s->id, "TCP: New client connected.");
+    add_client(s, client, CLIENT_TYPE_QUERY);
+
+    uv_tcp_keepalive(&client->handle, 1, 60);
+    uv_tcp_nodelay(&client->handle, 1); 
+    uv_read_start((uv_stream_t *)&client->handle, alloc_cb, on_client_query);
+  } else {
+    close_and_free_client(client);
+  }
+}
+
+static int client_uv_init(struct Server *s, uv_tcp_t *tcp_handle,
+    int port, uv_connection_cb on_connection) {
+  int rv;
   struct sockaddr_in addr;
+
+  Log(s->id, "Setting up TCP connection.");
+  uv_tcp_init(s->loop, tcp_handle);
+  tcp_handle->data = s; 
+
   // Listen on port 7000 + server_id (e.g., 7001, 7002, 7003)
   uv_ip4_addr("0.0.0.0", port, &addr); 
 
-  int rv = uv_tcp_bind(&s->tcp_server_handle, (const struct sockaddr*)&addr, 0);
+  rv = uv_tcp_bind(tcp_handle, (const struct sockaddr*)&addr, 0);
   if (rv != 0) {
     Logf(s->id, "uv_tcp_bind(): %s", uv_strerror(rv));
     // Add proper cleanup here if other handles were init'd
@@ -727,14 +945,24 @@ static int client_uv_init(struct Server *s, int port) {
     //goto err;
   }
 
-  rv = uv_listen((uv_stream_t*)&s->tcp_server_handle, 128, on_new_connection);
+  rv = uv_listen((uv_stream_t*)tcp_handle, 128, on_connection);
   if (rv != 0) {
     Logf(s->id, "uv_listen(): %s", uv_strerror(rv));
     return -2;
     //goto err;
   }
-  Logf(s->id, "Custom TCP server listening on port %d", port);
+  Logf(s->id, "TCP server listening on port %d", port);
   return 0;
+}
+
+static int tcp_setup(struct Server *s, int port) {
+  int rv;
+
+  rv = client_uv_init(s, &s->tcp_write_handle, port, on_insert_connection);
+  if (rv != 0) return rv;
+
+  rv = client_uv_init(s, &s->tcp_read_handle, port + 4000, on_read_connection);
+  return rv;
 }
 
 typedef struct bootstrap_node {
@@ -776,11 +1004,11 @@ static int ServerInit(struct Server *s,
 
   /* Allocate the batch request buffer. */
   /*
-  s->batch_buffer = calloc(BATCH_SIZE, sizeof(insert_cmd_t));
-  s->batch_offset = 0;
-  s->batched_req_count = 0;
-  s->buffer_capacity = BATCH_SIZE * sizeof(insert_cmd_t);
-  */
+     s->batch_buffer = calloc(BATCH_SIZE, sizeof(insert_cmd_t));
+     s->batch_offset = 0;
+     s->batched_req_count = 0;
+     s->buffer_capacity = BATCH_SIZE * sizeof(insert_cmd_t);
+     */
   s->loop = loop;
   s->last_state = -1;
 
@@ -851,9 +1079,9 @@ static int ServerInit(struct Server *s,
   raft_set_snapshot_threshold(&s->raft, UINT32_MAX); //64);
   raft_set_snapshot_trailing(&s->raft, 16);
   raft_set_pre_vote(&s->raft, true);
- 
-  raft_set_election_timeout(&s->raft, 5000);   // 5 Seconds
-  raft_set_heartbeat_timeout(&s->raft, 500);   // 0.5 Seconds
+
+  //raft_set_election_timeout(&s->raft, 5000);   // 5 Seconds
+  //raft_set_heartbeat_timeout(&s->raft, 500);   // 0.5 Seconds
 
   /* Allow more data in flight to fill. 
    * With 4KB batches, 256 entries = 1MB of in-flight data. */
@@ -862,10 +1090,9 @@ static int ServerInit(struct Server *s,
   s->transfer.data = s;
 
   /* Setup tcp connection for handling incoming requests. */
-  rv = client_uv_init(s, node_config->client_port);
+  rv = tcp_setup(s, node_config->client_port);
   if (rv != 0) {
     exit(1);
-    //goto err;
   }
 
   s->db = lsmt_init(dir);
@@ -879,7 +1106,7 @@ static int ServerInit(struct Server *s,
     perror("Failed to init stats file.");
     exit(1);
   } 
-    
+
   fprintf(s->stats.f, "Timestamp_ms,Role,OPS,Throughput_MBps,Batch_Size,Pending_Queue,Backlog,Avg_Latency_ms\n"); 
   //fprintf(s->stats.f, "Timestamp_ms,Role,OPS,Throughput_MBps,Batch_Size,Pending_Queue,Backlog\n"); 
   fflush(s->stats.f);
@@ -960,7 +1187,7 @@ static void statsTimerCb(uv_timer_t *timer)
    * Calculate Time Delta 
    * ----------------------------------------------------------------------- */
   if (s->stats.last_run_time == 0) {
-      s->stats.last_run_time = now - APPLY_RATE; 
+    s->stats.last_run_time = now - APPLY_RATE; 
   }
 
   uint64_t dt = now - s->stats.last_run_time;
@@ -984,9 +1211,9 @@ static void statsTimerCb(uv_timer_t *timer)
    * ----------------------------------------------------------------------- */
   double avg_latency_ms = 0.0;
   if (s->stats.period_batches_count > 0) {
-      avg_latency_ms = (double)s->stats.period_latency_sum / (double)s->stats.period_batches_count;
+    avg_latency_ms = (double)s->stats.period_latency_sum / (double)s->stats.period_batches_count;
   }
-  
+
   /* Reset latency accumulators */
   s->stats.period_latency_sum = 0;
   s->stats.period_batches_count = 0;
@@ -995,20 +1222,20 @@ static void statsTimerCb(uv_timer_t *timer)
    * Calculate Backlog 
    * ----------------------------------------------------------------------- */
   uint64_t backlog = 0;
-  
+
   /* 
    * Simple Logic: Input - Output.
    * Safety Check: Ensure we don't underflow if Output > Input 
    * (which happens if we processed logs as a Follower).
    */
   if (s->stats.total_received > s->stats.total_requests) {
-      backlog = s->stats.total_received - s->stats.total_requests;
+    backlog = s->stats.total_received - s->stats.total_requests;
   }
 
   uint64_t total_pending_reqs = 0;
   uint64_t total_pending_bytes = 0;
 
-  client_t *c = s->clients_head;
+  client_t *c = s->insert_clients_head;
   while (c != NULL) {
     client_t *next = c->next;
     total_pending_reqs += c->batched_req_count;
@@ -1039,7 +1266,7 @@ static void statsTimerCb(uv_timer_t *timer)
         total_pending_bytes, 
         backlog,
         avg_latency_ms
-    );
+        );
     // fflush(s->stats.f); 
   }
 }
