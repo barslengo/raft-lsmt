@@ -24,7 +24,7 @@ typedef struct kv_record {
   sl_uint128_t key;
   uint8_t *data;
   uint8_t data_type;
-  size_t data_len;
+  uint32_t data_len;
 } kv_record_t;
 
 

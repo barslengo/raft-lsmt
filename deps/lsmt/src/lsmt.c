@@ -478,7 +478,6 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
 
   if (lsmt->memtable->size > SIZE_THRESHOLD) {
     pthread_mutex_lock(&lsmt->memtable_lock);
-
     //dump content to disk in a new thread.
     dump_task_t *task_args = malloc(sizeof(dump_task_t));
     task_args->lsmt = lsmt;
@@ -501,8 +500,8 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
     lsmt->memtable = sl_init();
     pthread_mutex_unlock(&lsmt->memtable_lock);
   }
-
-  return sl_insert(lsmt->memtable, key, content, size);
+  int rv = sl_insert(lsmt->memtable, key, content, size);
+  return rv;
 }
 
 uint32_t fetch_sst(sst_metadata_record_t *sst, sl_uint128_t start_key, 
@@ -600,6 +599,8 @@ uint32_t lsmt_get(lsmt_t *lsmt, sl_uint128_t start_key,
 
   /* First check for data in current memtable. */
   pthread_mutex_lock(&lsmt->memtable_lock);
+  //printf("Fetching memtable ..\n");
+
   if (lsmt->memtable) {
     memtable = lsmt->memtable;
     sl_retain(memtable);
@@ -608,6 +609,10 @@ uint32_t lsmt_get(lsmt_t *lsmt, sl_uint128_t start_key,
     uint32_t count = sl_get_range(memtable, start_key, end_key, &records);
     if (count > 0) {
       kv_record_t *r = malloc(sizeof(kv_record_t) * count);
+      if (!r) {
+        printf("OOM lsmt_get..\n");
+        exit(1);
+      }
       for (uint32_t i = 0; i < count; i++) {
         uint8_t *buf = records[i].content;  
         r[i].key = records[i].key;
@@ -618,6 +623,10 @@ uint32_t lsmt_get(lsmt_t *lsmt, sl_uint128_t start_key,
         buf += sizeof(uint32_t);
 
         r[i].data = malloc(r[i].data_len);
+        if (!r[i].data) {
+          printf("OOM lsmt_get memtable record data of size %u..\n", r[i].data_len);
+          exit(1);
+        }
         memcpy(r[i].data, buf, r[i].data_len);
       }
       free(records);
@@ -632,7 +641,7 @@ uint32_t lsmt_get(lsmt_t *lsmt, sl_uint128_t start_key,
 
   /* Then check in sstables from disk. */
   pthread_mutex_lock(&lsmt->metadata_lock); 
-
+  //printf("Fetching sstables..\n");
   sst_node_t *list = lsmt->metadata->list;
   while (list != NULL && sst_idx < 2048) {
     int record_count = fetch_sst(list->content, start_key, end_key, &sst_results[sst_idx]);
