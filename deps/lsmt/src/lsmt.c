@@ -376,7 +376,8 @@ static void *dump_to_disk(void *arg) {
 
   index_flush(index, files.index_file); 
   index_free(index);
-  sl_free(memtable);
+  //sl_free(memtable);
+  sl_release(memtable);
 
   sst_metadata_record_t metadata = create_sst_metadata(lsmt->sstable_id++, 0, offset, min_key, max_key, files.sst_file, files.index_file);
   free(files.sst_file);
@@ -456,6 +457,7 @@ void lsmt_flush(lsmt_t *lsmt) {
   dump_task_t *task_args = malloc(sizeof(dump_task_t));
   task_args->lsmt = lsmt;
   task_args->memtable = lsmt->memtable;
+  //sl_retain(task_args->memtable);
 
   dump_to_disk(task_args);
   lsmt->memtable = sl_init();
@@ -472,19 +474,18 @@ void lsmt_free(lsmt_t *lsmt) {
 }
 
 int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size) {
-  static size_t count = 0;
   if (lsmt == NULL || lsmt->memtable == NULL) return -1;
 
-  /*
-  if (count % 256 == 0) {
-    printf("inserted %lu items.\n", count);
-  }
-  */
   if (lsmt->memtable->size > SIZE_THRESHOLD) {
+    pthread_mutex_lock(&lsmt->memtable_lock);
+
     //dump content to disk in a new thread.
     dump_task_t *task_args = malloc(sizeof(dump_task_t));
     task_args->lsmt = lsmt;
+
+    /* Transfering ownership. */
     task_args->memtable = lsmt->memtable;
+    
 
     if (thread_idx < POOL_SIZE) {
       pthread_create(&thread_pool[thread_idx++], NULL, dump_to_disk, task_args);
@@ -497,12 +498,10 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
       pthread_create(&thread_pool[thread_idx++], NULL, dump_to_disk, task_args);
     }
 
-    count = 0;
     lsmt->memtable = sl_init();
+    pthread_mutex_unlock(&lsmt->memtable_lock);
   }
-  count++;
 
-  //TODO: write ahead log
   return sl_insert(lsmt->memtable, key, content, size);
 }
 
@@ -590,21 +589,49 @@ uint32_t fetch_sst(sst_metadata_record_t *sst, sl_uint128_t start_key,
 uint32_t lsmt_get(lsmt_t *lsmt, sl_uint128_t start_key,
   sl_uint128_t end_key, kv_record_t **result) {
   if (lsmt == NULL) return 0;
-  /*
-   * TODO: fetch also from memtable.
-   *
-   if (lsmt->memtable) {
-   content = sl_get(lsmt->memtable, key);
-   }
-   if (content != NULL) return content;
-   */
-  pthread_mutex_lock(&lsmt->metadata_lock); 
+
 
   /*Ideally this must have as size the total sst tables stored on disk. */
   kv_record_t *sst_results[2048];
   uint32_t sst_counts[2048];
   int sst_idx = 0;
   uint32_t total_count = 0;
+  sl_t *memtable = NULL;
+
+  /* First check for data in current memtable. */
+  pthread_mutex_lock(&lsmt->memtable_lock);
+  if (lsmt->memtable) {
+    memtable = lsmt->memtable;
+    sl_retain(memtable);
+
+    sl_kv_t *records = NULL;
+    uint32_t count = sl_get_range(memtable, start_key, end_key, &records);
+    if (count > 0) {
+      kv_record_t *r = malloc(sizeof(kv_record_t) * count);
+      for (uint32_t i = 0; i < count; i++) {
+        uint8_t *buf = records[i].content;  
+        r[i].key = records[i].key;
+        memcpy(&r[i].data_type, buf, sizeof(uint8_t));
+        buf += sizeof(uint8_t);
+
+        memcpy(&r[i].data_len, buf, sizeof(uint32_t));
+        buf += sizeof(uint32_t);
+
+        r[i].data = malloc(r[i].data_len);
+        memcpy(r[i].data, buf, r[i].data_len);
+      }
+      free(records);
+      sst_results[sst_idx] = r;
+      sst_counts[sst_idx] = count;
+      total_count += count;
+      sst_idx++;
+    }
+   sl_release(memtable);
+  }
+  pthread_mutex_unlock(&lsmt->memtable_lock);
+
+  /* Then check in sstables from disk. */
+  pthread_mutex_lock(&lsmt->metadata_lock); 
 
   sst_node_t *list = lsmt->metadata->list;
   while (list != NULL && sst_idx < 2048) {

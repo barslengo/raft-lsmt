@@ -17,6 +17,7 @@ typedef struct lsmt {
   char *db_path;
 
   pthread_mutex_t metadata_lock;
+  pthread_mutex_t memtable_lock; //used when swapping memtable.
 } lsmt_t;
 
 typedef struct kv_record {

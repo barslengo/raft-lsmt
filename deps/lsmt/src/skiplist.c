@@ -25,6 +25,48 @@ int key_compare(sl_uint128_t x, sl_uint128_t y) {
   return 0;
 }
 
+static void node_free(node_t *node) {
+  if (node == NULL) return;
+  if (node->lower_level == NULL && node->content != NULL) free(node->content);
+  free(node);
+  node = NULL;
+}
+
+static void sl_free(sl_t *skiplist) {
+  node_t *lvl_head = skiplist->top_level;
+
+  while (lvl_head != NULL) {
+    node_t *current = lvl_head->next;
+    while (current != NULL) {
+      node_t *tmp = current->next;
+      node_free(current);
+      current = tmp;
+    }
+    lvl_head = lvl_head->lower_level;
+  }
+
+  while (skiplist->top_level != NULL ) {
+    node_t *tmp = skiplist->top_level->lower_level;
+    node_free(skiplist->top_level);
+    skiplist->top_level = tmp;
+  }
+
+  free(skiplist);
+  skiplist = NULL;
+}
+
+void sl_retain(sl_t *skiplist) {
+  if (skiplist) atomic_fetch_add(&skiplist->refcount, 1);
+}
+
+void sl_release(sl_t *skiplist) {
+  if (!skiplist) return;
+
+  if (atomic_fetch_sub(&skiplist->refcount, 1) > 1) return;
+
+  sl_free(skiplist);
+}
+
 static node_t *new_node(sl_uint128_t key, void *content) {
   node_t *node = malloc(sizeof(node_t));
   if (node == NULL) {
@@ -71,39 +113,90 @@ sl_t* sl_init() {
   skiplist->levels = 1;
   skiplist->top_level = head;
   skiplist->bottom_level = head;
+  atomic_init(&skiplist->refcount, 1);
 
   return skiplist;
 }
 
-static void node_free(node_t *node) {
-  if (node == NULL) return;
-  if (node->lower_level == NULL && node->content != NULL) free(node->content);
-  free(node);
-  node = NULL;
-}
-
-void sl_free(sl_t *skiplist) {
-  node_t *lvl_head = skiplist->top_level;
-
-  while (lvl_head != NULL) {
-    node_t *current = lvl_head->next;
-    while (current != NULL) {
-      node_t *tmp = current->next;
-      node_free(current);
-      current = tmp;
+/*
+ * Retrieves all key/value pairs in the range [start_key, end_key] (inclusive).
+ * 
+ * @param skiplist   Pointer to the skiplist instance.
+ * @param start_key  The lower bound of the range.
+ * @param end_key    The upper bound of the range.
+ * @param result     A pointer to a (sl_kv_t*) pointer. This function will allocate 
+ *                   memory for the array of results and set this pointer. 
+ *                   The caller is responsible for freeing this memory.
+ * 
+ * @return uint32_t  The number of records found.
+ */
+uint32_t sl_get_range(sl_t *skiplist, sl_uint128_t start_key, sl_uint128_t end_key, sl_kv_t **result) {
+    if (skiplist == NULL || result == NULL) {
+        return 0;
     }
-    lvl_head = lvl_head->lower_level;
-  }
 
-  while (skiplist->top_level != NULL ) {
-    node_t *tmp = skiplist->top_level->lower_level;
-    node_free(skiplist->top_level);
-    skiplist->top_level = tmp;
-  }
+    node_t *current = skiplist->top_level;
 
-  free(skiplist);
-  skiplist = NULL;
+    /* Traverse down to the bottom level to find the node strictly before start_key */
+    while (current != NULL) {
+        /* Move right while the next key is strictly less than start_key */
+        while (current->next != NULL && key_compare(current->next->key, start_key) < 0) {
+            current = current->next;
+        }
+
+        /* Drop down a level, or stop if we are at the bottom */
+        if (current->lower_level != NULL) {
+            current = current->lower_level;
+        } else {
+            break; 
+        }
+    }
+
+    /* current is now the predecessor (or sentinel). Move to the first potential candidate. */
+    if (current != NULL) {
+        current = current->next;
+    }
+
+    /* Initialize Result Array */
+    size_t capacity = 16;
+    size_t count = 0;
+    sl_kv_t *arr = malloc(capacity * sizeof(sl_kv_t));
+    if (arr == NULL) {
+        return 0; 
+    }
+
+    /* Iterate forward at the bottom level */
+    while (current != NULL) {
+        /* If current key is greater than end_key, we are done */
+        if (key_compare(current->key, end_key) > 0) {
+            break;
+        }
+
+        /* Resize array if necessary */
+        if (count >= capacity) {
+            capacity *= 2;
+            sl_kv_t *tmp = realloc(arr, capacity * sizeof(sl_kv_t));
+            if (tmp == NULL) {
+                free(arr); 
+                *result = NULL;
+                return 0;
+            }
+            arr = tmp;
+        }
+
+        /* Add record to result */
+        arr[count].key = current->key;
+        arr[count].content = current->content;
+        count++;
+
+        current = current->next;
+    }
+
+    /* Assign the allocated array to the output parameter */
+    *result = arr;
+    return (uint32_t)count;
 }
+
 
 void* sl_get(sl_t *skiplist, sl_uint128_t key) {
   if (skiplist == NULL) return NULL;
