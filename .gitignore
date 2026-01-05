@@ -62,6 +62,7 @@ deps/raft/
 deps/h2o/
 include/uv/
 include/h2o/
+include/lsmt/
 
 #Python stuff
 # Byte-compiled / optimized / DLL files
