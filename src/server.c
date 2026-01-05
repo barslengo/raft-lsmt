@@ -458,9 +458,13 @@ static void on_client_close(uv_handle_t *handle) {
 
 static void on_query_resp_complete(uv_write_t *req, int status) {
   ack_write_t *wr = (ack_write_t *)req;
-  printf("Write sent\n");
+  //printf("Write sent\n");
   if (status) {
     close_and_free_client(wr->client);
+  }
+
+  if (wr->buf.base) {
+    free(wr->buf.base);
   }
 
   client_release(wr->client);
@@ -799,7 +803,7 @@ static void send_records(client_t *c, uint8_t *data, uint32_t payload_size) {
   // Cast to char* required by libuv
   wr->buf = uv_buf_init((char*)data, (unsigned int)payload_size);
 
-  printf("Writing back %u bytes.\n", payload_size);
+  //printf("Writing back %u bytes.\n", payload_size);
   int r = uv_write(&wr->req, (uv_stream_t*)&c->handle, &wr->buf, 1, on_query_resp_complete);
 
   if (r != 0) {
@@ -818,8 +822,7 @@ static void process_query_buffer(client_t *client) {
   size_t remaining = client->buffer_len;
 
   while (remaining >= expected_size) {
-    printf("Processing query\n");
-    fflush(stdout);
+    //printf("Processing query\n");
     sl_uint128_t start_key;
     sl_uint128_t end_key;
 
@@ -829,14 +832,13 @@ static void process_query_buffer(client_t *client) {
     offset += sizeof(sl_uint128_t);
 
     kv_record_t *records = NULL; // array of records of size 'records_count'.
+    //printf("Loading records..\n");
     uint32_t records_count = lsmt_get(db, start_key, end_key, &records);
-    printf("Loaded %u records\n", records_count);
-    fflush(stdout);
+    //printf("Loaded %u records\n", records_count);
 
     uint8_t *payload = NULL;
     uint32_t payload_size = serialize_records(records, records_count, &payload);
-    printf("serialized data into a payload of size %u\n", payload_size);
-    fflush(stdout);
+    //printf("serialized data into a payload of size %u\n", payload_size);
     send_records(client, payload, payload_size);
     remaining -= expected_size;
   }
