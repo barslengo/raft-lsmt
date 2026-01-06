@@ -752,7 +752,6 @@ static void on_insert_connection(uv_stream_t *server_handle, int status) {
   client->server = s;
   client->handle.data = client; 
   client->closing = false;
-  client_retain(client);
 
   client->ctx.insert.batch_buffer = calloc(BATCH_SIZE, sizeof(insert_cmd_t));
   client->ctx.insert.batch_offset = 0;
@@ -762,13 +761,23 @@ static void on_insert_connection(uv_stream_t *server_handle, int status) {
   uv_tcp_init(s->loop, &client->handle);
 
   if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
-    Log(s->id, "TCP: New client connected.");
+
+    if (s->raft.state != RAFT_LEADER) {
+      Log(s->id, "TCP: Rejecting insert client (Not Leader).");
+      client_retain(client);
+      uv_close((uv_handle_t *)&client->handle, on_client_close);
+      return;
+    }
+
+    Log(s->id, "TCP: New insert client connected.");
+    client_retain(client);
     add_client(s, client, CLIENT_TYPE_INSERT);
 
     uv_tcp_keepalive(&client->handle, 1, 60);
     uv_tcp_nodelay(&client->handle, 1); 
     uv_read_start((uv_stream_t *)&client->handle, alloc_cb, on_client_read);
-  } else {
+  }
+  else {
     close_and_free_client(client);
   }
 }
@@ -826,12 +835,11 @@ static uint32_t serialize_records(kv_record_t *records, uint32_t len, uint8_t **
   return payload_size;
 }
 
-static void send_records(client_t *c, uint8_t *data, uint32_t payload_size) {
+static int send_records(client_t *c, uint8_t *data, uint32_t payload_size) {
   ack_write_t *wr = malloc(sizeof(ack_write_t));
   if (!wr) {
     free(data); 
     exit(1);
-    return;
   }
 
   wr->req.data = wr;
@@ -853,10 +861,12 @@ static void send_records(client_t *c, uint8_t *data, uint32_t payload_size) {
     client_release(c);
     free(wr);
     close_and_free_client(c);
+    return -1;
   }
+  return 0;
 }
 
-static void process_query_buffer(client_t *client) {
+static bool process_query_buffer(client_t *client) {
   size_t expected_size = sizeof(sl_uint128_t) * 2; 
   size_t offset = 0;
   size_t remaining = client->buffer_len;
@@ -879,7 +889,9 @@ static void process_query_buffer(client_t *client) {
     uint8_t *payload = NULL;
     uint32_t payload_size = serialize_records(records, records_count, &payload);
     //printf("serialized data into a payload of size %u\n", payload_size);
-    send_records(client, payload, payload_size);
+    if (send_records(client, payload, payload_size) != 0) {
+      return false;
+    }
     remaining -= expected_size;
   }
 
@@ -890,6 +902,7 @@ static void process_query_buffer(client_t *client) {
     }
     client->buffer_len = remaining;
   }
+  return true;
 }
 
 /* Payload format: [Start_Key (16B)|End_Key (16B)]
@@ -953,7 +966,7 @@ static void on_read_connection(uv_stream_t *server_handle, int status) {
   uv_tcp_init(s->loop, &client->handle);
 
   if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
-    Log(s->id, "TCP: New client connected.");
+    Log(s->id, "TCP: New query client connected.");
     add_client(s, client, CLIENT_TYPE_QUERY);
 
     uv_tcp_keepalive(&client->handle, 1, 60);
@@ -1395,6 +1408,7 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
     s->close_cb(s);
   }
 
+  /* Flush metrics to disk. */
   if (s->stats.f) {
     fclose(s->stats.f);
     s->stats.f = NULL;
@@ -1406,9 +1420,30 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
     s->batch_log_file = NULL;
   }
 
+  /* Close TCP Listening Sockets */
+  if (s->loop) {
+    if (!uv_is_closing((uv_handle_t*)&s->tcp_write_handle)) {
+      uv_close((uv_handle_t*)&s->tcp_write_handle, NULL);
+    }
+    if (!uv_is_closing((uv_handle_t*)&s->tcp_read_handle)) {
+      uv_close((uv_handle_t*)&s->tcp_read_handle, NULL);
+    }
+  }
+
+  /* Close All Active Insert Clients */
+  while (s->insert_clients_head != NULL) {
+      close_and_free_client(s->insert_clients_head);
+  }
+
+  /* Close All Active Query Clients */
+  while (s->query_clients_head != NULL) {
+      close_and_free_client(s->query_clients_head);
+  }
+
   if (s->db) {
     lsmt_flush(s->db);
   }
+  Log(s->id, "Shutted down.");
 }
 
 /********************************************************************
