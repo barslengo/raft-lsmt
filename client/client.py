@@ -5,7 +5,7 @@ import itertools
 TIMEOUT_SECONDS = 2.0  # Timeout for socket operations
 
 class RaftClient:
-    def __init__(self, cluster_nodes):
+    def __init__(self, cluster_nodes, leader_id=None):
         """
         cluster_nodes: Dict { node_id: (host, port) }
         """
@@ -14,10 +14,10 @@ class RaftClient:
         # Cycle iterator to implement Round-Robin
         self.node_cycle = itertools.cycle(self.node_ids)
 
+        self.priority_node = leader_id
         self.current_node_id = None
         self.sock = None
 
-        # Initial connect
         self.connect_next_available()
 
     def _recv_exact(self, sock, n_bytes):
@@ -47,7 +47,12 @@ class RaftClient:
 
         # Try to connect indefinitely until we find a responsive node
         while True:
-            next_id = next(self.node_cycle)
+            if self.priority_node is not None:
+                next_id = self.priority_node
+                self.priority_node = None
+            else:
+                next_id = next(self.node_cycle)
+
             host, port = self.nodes[next_id]
 
             try:
