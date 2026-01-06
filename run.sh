@@ -47,6 +47,11 @@ echo "------------------------------------------------"
 
 # Ensure the required directories exist.
 mkdir -p "$SERVER_DIR"
+#Fresh start removing old sstables.
+echo "Cleaning up old database files from $SERVER_DIR..."
+rm -f "$SERVER_DIR"/*.sbrolf
+rm -f "$SERVER_DIR"/*.prot
+rm -f "$SERVER_DIR"/.lsmt_metadata
 
 # 6. Execution
 echo "Executing: $SERVER_EXECUTABLE $SERVER_DIR $SERVER_ID $CLUSTER_CONF"
