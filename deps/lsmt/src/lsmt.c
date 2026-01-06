@@ -322,15 +322,22 @@ static void *dump_to_disk(void *arg) {
   sl_t *memtable = task_args->memtable;
   free(task_args);
 
-  sst_file_paths_t files = new_sstable_filename(lsmt->db_path);
+  if (!memtable) return NULL;
 
+  node_t *node = memtable->bottom_level->next;
+  if (node == NULL) {
+    // memtable is empty 
+    sl_release(memtable);
+    return NULL;
+  }
+
+  sst_file_paths_t files = new_sstable_filename(lsmt->db_path);
   FILE *fp = fopen(files.sst_file, "wb");
   if (!fp) {
     perror("Failed to open db file!");
     exit(1);
   }
 
-  node_t *node = memtable->bottom_level->next;
   index_t *index = NULL;
   uint64_t offset = 0;
   sl_uint128_t min_key = node->key; 
@@ -379,11 +386,12 @@ static void *dump_to_disk(void *arg) {
   //sl_free(memtable);
   sl_release(memtable);
 
-  sst_metadata_record_t metadata = create_sst_metadata(lsmt->sstable_id++, 0, offset, min_key, max_key, files.sst_file, files.index_file);
+  sst_metadata_record_t metadata = create_sst_metadata(0, 0, offset, min_key, max_key, files.sst_file, files.index_file);
   free(files.sst_file);
   free(files.index_file);
  
   pthread_mutex_lock(&lsmt->metadata_lock);
+  metadata.id = lsmt->sstable_id++;
 
   sst_metadata_add(lsmt->metadata, metadata);
   sst_metadata_flush(lsmt->metadata);
@@ -450,17 +458,19 @@ lsmt_t *lsmt_init(const char *db_path) {
 }
 
 void lsmt_flush(lsmt_t *lsmt) {
+  pthread_mutex_lock(&lsmt->memtable_lock);
   for(size_t i = 0; i < thread_idx; i++) {
     pthread_join(thread_pool[i], NULL);
   }
+  thread_idx = 0;
 
   dump_task_t *task_args = malloc(sizeof(dump_task_t));
   task_args->lsmt = lsmt;
   task_args->memtable = lsmt->memtable;
-  //sl_retain(task_args->memtable);
 
   dump_to_disk(task_args);
   lsmt->memtable = sl_init();
+  pthread_mutex_unlock(&lsmt->memtable_lock);
 }
 
 void lsmt_free(lsmt_t *lsmt) {
