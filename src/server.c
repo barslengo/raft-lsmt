@@ -27,6 +27,14 @@ static char ACK_BUFFER[BATCH_SIZE];
 const uint8_t CONTENT_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t); 
 const uint32_t INSERT_CMD_SIZE = CONTENT_HEADER_SIZE + sizeof(uint8_t)*CONTENT_MAX_SIZE; 
 
+typedef struct __attribute__((packed)) {
+    uint64_t timestamp;
+    uint32_t batch_size;
+    uint32_t bytes;
+    uint64_t t_accumulate;
+    uint64_t t_consensus;
+    uint64_t t_total;
+} batch_log_t;
 
 /* ========== CLUST CONFIG SECTION START ========== */
 typedef struct {
@@ -103,6 +111,21 @@ struct Fsm
 };
 
 
+/* Context specific to INSERT clients */
+typedef struct {
+  void *batch_buffer;          /* The buffer for Raft batching */
+  uint32_t batch_offset;       /* Current write position in batch_buffer */
+  uint32_t buffer_capacity;     /* Total size of batch_buffer */
+  uint32_t batched_req_count;  /* Number of items currently in batch */
+  uint64_t batch_start_ts;     /* Timestamp (ms) when first item arrived */
+} client_insert_ctx_t;
+
+/* Context specific to QUERY clients */
+typedef struct {
+  uint64_t active_query_start_ts; /* Timestamp (ms) of current processing query */
+  uint64_t total_queries;         /* Total queries processed by this client */
+} client_query_ctx_t;
+
 typedef enum {
   CLIENT_TYPE_INSERT,
   CLIENT_TYPE_QUERY
@@ -118,15 +141,13 @@ typedef struct client_t {
   size_t buffer_len;
   size_t buffer_cap;
 
-  /* Batch buffer assigned to the client. */
-  void *batch_buffer;                 /* Buffer for batching requests into a single log. */
-  uint32_t batch_offset;
-  uint32_t buffer_capacity;
-  uint32_t batched_req_count;
-
-
   bool closing;
   int ref_count;
+
+  union {
+    client_insert_ctx_t insert;
+    client_query_ctx_t query;
+  } ctx; 
 
   /* Linked List. */
   struct client_t *prev;
@@ -143,7 +164,10 @@ typedef struct {
   struct Server *server;
   client_t *client;
   int req_count;
-  uint64_t start_time;
+
+  uint32_t batch_size_bytes;
+  uint64_t batch_creation_ts; //milliseconds
+  uint64_t raft_apply_ts; //milliseconds
 } apply_ctx_t;
 
 /********************************************************************
@@ -177,6 +201,7 @@ struct Server
 
   struct client_t *insert_clients_head;
   struct client_t *query_clients_head;
+  FILE *batch_log_file;
   struct {
     FILE *f;
     uint64_t total_requests;
@@ -185,7 +210,7 @@ struct Server
     uint64_t prev_requests;
     uint64_t prev_bytes;
 
-    uint64_t total_received; /* Total requests received from tcp connections. */
+    //uint64_t total_received; /* Total requests received from tcp connections. */
     uint64_t last_run_time; 
     uint64_t period_latency_sum; /* Sum of ms taken by all batches in this tick */
     uint64_t period_batches_count; /* How many batches finished in this tick */
@@ -201,7 +226,11 @@ void client_release(client_t *c) {
   c->ref_count--;
   if (c->ref_count == 0) {
     if (c->buffer) free(c->buffer);
-    if (c->batch_buffer) free(c->batch_buffer); 
+
+    if (c->type == CLIENT_TYPE_INSERT) {
+      if (c->ctx.insert.batch_buffer) free(c->ctx.insert.batch_buffer); 
+    }
+
     free(c);
   }
 }
@@ -482,13 +511,14 @@ static void on_ack_write_complete(uv_write_t *req, int status) {
 }
 
 static void batch_buffer_flush(struct Server *s, client_t *c) {
-  if (c->batched_req_count <= 0) {
+  client_insert_ctx_t *ins_ctx = &c->ctx.insert;
+  if (ins_ctx->batched_req_count <= 0) {
     return;
   }
 
   struct raft_buffer raft_buf;
 
-  uint32_t aligned_msg_size = (c->batch_offset + 7) & ~0x07;
+  uint32_t aligned_msg_size = (ins_ctx->batch_offset + 7) & ~0x07;
   raft_buf.len = aligned_msg_size;
   raft_buf.base = raft_malloc(raft_buf.len);
 
@@ -499,7 +529,7 @@ static void batch_buffer_flush(struct Server *s, client_t *c) {
 
   /* Copy from the reusable batch buffer to the Raft entry buffer */
   memset(raft_buf.base, 0, raft_buf.len);
-  memcpy(raft_buf.base, c->batch_buffer, c->batch_offset);
+  memcpy(raft_buf.base, ins_ctx->batch_buffer, ins_ctx->batch_offset);
 
   struct raft_apply *req = raft_malloc(sizeof(*req));
   if (!req) {
@@ -511,8 +541,11 @@ static void batch_buffer_flush(struct Server *s, client_t *c) {
   ctx->server = s;
   ctx->client = c;
   client_retain(c);
-  ctx->req_count = c->batched_req_count;
-  ctx->start_time = uv_now(s->loop); 
+  ctx->req_count = ins_ctx->batched_req_count;
+
+  ctx->batch_size_bytes = ins_ctx->batch_offset;
+  ctx->batch_creation_ts = ins_ctx->batch_start_ts;
+  ctx->raft_apply_ts = uv_now(s->loop);
 
   req->data = ctx;
 
@@ -535,9 +568,9 @@ static void batch_buffer_flush(struct Server *s, client_t *c) {
   }
 
   /* Reset Batch State */
-  c->batch_offset = 0;
-  c->batched_req_count = 0;
-  memset(c->batch_buffer, 0, c->buffer_capacity); // Optional: clear buffer for debug
+  ins_ctx->batch_offset = 0;
+  ins_ctx->batched_req_count = 0;
+  memset(ins_ctx->batch_buffer, 0, ins_ctx->buffer_capacity); // Optional: clear buffer for debug
 }
 
 // Libuv callback to allocate memory for an incoming client read
@@ -592,8 +625,8 @@ static void on_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *b
     }
 
     // Flush any partial Raft batches
-    if (client->batched_req_count > 0) {
-      printf("Flushing final batch of %u items due to client disconnect.\n", client->batched_req_count);
+    if (client->ctx.insert.batched_req_count > 0) {
+      printf("Flushing final batch of %u items due to client disconnect.\n", client->ctx.insert.batched_req_count);
       batch_buffer_flush(s, client);
     }
 
@@ -615,7 +648,7 @@ static void on_client_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *b
 static bool process_insert_buffer(client_t *client) {
   struct Server *s = client->server;
   size_t offset = 0;
-
+  client_insert_ctx_t *ins_ctx = &client->ctx.insert;
 
   // Loop as long as we might have a complete message in the buffer
   while (offset + sizeof(uint32_t) <= client->buffer_len) {
@@ -645,20 +678,26 @@ static bool process_insert_buffer(client_t *client) {
       close_and_free_client(client);
       return false;
     } else {
+
+      /* Just for metrics. */
+      if (ins_ctx->batched_req_count == 0) {
+        ins_ctx->batch_start_ts = uv_now(s->loop);
+      }
+
       /* Add to Batch */
-      if (client->batch_offset + total_msg_len <= client->buffer_capacity) {
-        memcpy((uint8_t*)client->batch_buffer + client->batch_offset, msg_ptr,
+      if (ins_ctx->batch_offset + total_msg_len <= ins_ctx->buffer_capacity) {
+        memcpy((uint8_t*)ins_ctx->batch_buffer + ins_ctx->batch_offset, msg_ptr,
             total_msg_len);
-        client->batch_offset += total_msg_len;
-        client->batched_req_count++;
+        ins_ctx->batch_offset += total_msg_len;
+        ins_ctx->batched_req_count++;
 
         /* Stats. */
-        s->stats.total_received++;
+        //s->stats.total_received++;
 
         //printf("[MSG BATCHED] payload_len=%u\n", total_msg_len);
       } else {
         Logf(s->id, "Error: Message too large for batch buffer (%u > %u)", 
-            total_msg_len, client->buffer_capacity);
+            total_msg_len, ins_ctx->buffer_capacity);
         close_and_free_client(client);
         return false;
       }
@@ -667,8 +706,8 @@ static bool process_insert_buffer(client_t *client) {
        *  a) Batch count limit reached
        *  b) Batch buffer size limit reached (can't fit new message)
        */
-      bool batch_full_count = (client->batched_req_count >= BATCH_SIZE);
-      bool batch_full_size  = (client->batch_offset >= client->buffer_capacity);
+      bool batch_full_count = (ins_ctx->batched_req_count >= BATCH_SIZE);
+      bool batch_full_size  = (ins_ctx->batch_offset >= ins_ctx->buffer_capacity);
 
       if (batch_full_count || batch_full_size) {
         batch_buffer_flush(s, client);
@@ -691,7 +730,7 @@ static bool process_insert_buffer(client_t *client) {
    * but we have pending items in the batch, 
    * we MUST flush now. The client is waiting for these ACKs.
    */
-  if (client->buffer_len == 0 && client->batched_req_count > 0) {
+  if (client->buffer_len == 0 && ins_ctx->batched_req_count > 0) {
     batch_buffer_flush(s, client);
   }
   return true;
@@ -708,16 +747,17 @@ static void on_insert_connection(uv_stream_t *server_handle, int status) {
   // Allocate and initialize a new client struct
   client_t *client = calloc(1, sizeof(client_t));
   if (!client) { /* handle OOM */ return; }
+  client->type = CLIENT_TYPE_INSERT;
 
   client->server = s;
   client->handle.data = client; 
   client->closing = false;
   client_retain(client);
 
-  client->batch_buffer = calloc(BATCH_SIZE, sizeof(insert_cmd_t));
-  client->batch_offset = 0;
-  client->batched_req_count = 0;
-  client->buffer_capacity = BATCH_SIZE * sizeof(insert_cmd_t);
+  client->ctx.insert.batch_buffer = calloc(BATCH_SIZE, sizeof(insert_cmd_t));
+  client->ctx.insert.batch_offset = 0;
+  client->ctx.insert.batched_req_count = 0;
+  client->ctx.insert.buffer_capacity = BATCH_SIZE * sizeof(insert_cmd_t);
 
   uv_tcp_init(s->loop, &client->handle);
 
@@ -902,17 +942,14 @@ static void on_read_connection(uv_stream_t *server_handle, int status) {
   // Allocate and initialize a new client struct
   client_t *client = calloc(1, sizeof(client_t));
   if (!client) { /* handle OOM */ return; }
-
+  client->type = CLIENT_TYPE_QUERY;
   client->server = s;
   client->handle.data = client; 
   client->closing = false;
   client_retain(client);
 
-  //client->batch_buffer = calloc(BATCH_SIZE, sizeof(insert_cmd_t));
-  //client->batch_offset = 0;
-  //client->batched_req_count = 0;
-  //client->buffer_capacity = BATCH_SIZE * sizeof(insert_cmd_t);
-
+  client->ctx.query.total_queries = 0;
+  client->ctx.query.active_query_start_ts = 0;
   uv_tcp_init(s->loop, &client->handle);
 
   if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
@@ -972,6 +1009,35 @@ typedef struct bootstrap_node {
   int id;
   int port;
 } bootstrap_node_t;
+
+
+static void setup_high_level_stats(struct Server * s, const char *path) {
+  s->stats.f = fopen(path, "w");
+  if (s->stats.f == NULL) {
+    perror("Failed to init stats file.");
+    exit(1);
+  } 
+
+  fprintf(s->stats.f, "Timestamp_ms,Role,OPS,Throughput_MBps,PendingRequests,PendingBytes,Backlog,Avg_Latency_ms,Raft_Idx_Local,Raft_Idx_Applied,Raft_Idx_Commit\n"); 
+  fflush(s->stats.f);
+
+  s->stats.total_requests = 0;
+  s->stats.total_bytes = 0;
+  s->stats.prev_requests = 0;
+  s->stats.prev_bytes = 0;
+  //s->stats.total_received = 0;
+  s->stats.last_run_time = 0;
+  s->stats.period_latency_sum = 0;
+  s->stats.period_batches_count = 0; 
+}
+
+static void setup_batch_level_stats(struct Server *s, const char *path) {
+  s->batch_log_file = fopen(path, "wb");
+  if (!s->batch_log_file) {
+    printf("Failed to open file %s\n", path);
+    exit(1);
+  }
+}
 
 /* Initialize the example server struct, without starting it yet. */
 static int ServerInit(struct Server *s,
@@ -1101,23 +1167,13 @@ static int ServerInit(struct Server *s,
   db = s->db;
 
   /* Setup statistics collection. */
-  char stats_file_path[128];
-  sprintf(stats_file_path, "%s/stats_%d.csv", dir, s->id);
-  s->stats.f = fopen(stats_file_path, "w");
-  if (s->stats.f == NULL) {
-    perror("Failed to init stats file.");
-    exit(1);
-  } 
+  uint64_t file_ts = uv_now(s->loop);
+  char stats_file_path[256];
+  sprintf(stats_file_path, "%s/stats_%d_%lu.csv", dir, s->id, file_ts); 
+  setup_high_level_stats(s, stats_file_path);
 
-  fprintf(s->stats.f, "Timestamp_ms,Role,OPS,Throughput_MBps,Batch_Size,Pending_Queue,Backlog,Avg_Latency_ms\n"); 
-  //fprintf(s->stats.f, "Timestamp_ms,Role,OPS,Throughput_MBps,Batch_Size,Pending_Queue,Backlog\n"); 
-  fflush(s->stats.f);
-
-  s->stats.total_requests = 0;
-  s->stats.total_bytes = 0;
-  s->stats.prev_requests = 0;
-  s->stats.prev_bytes = 0;
-  s->stats.total_received = 0;
+  sprintf(stats_file_path, "%s/stats_batch_%d_%lu.bin", dir, s->id, file_ts);  
+  setup_batch_level_stats(s, stats_file_path);
   return 0;
 
 err_after_configuration_init:
@@ -1132,6 +1188,33 @@ err:
   return rv;
 }
 
+static void update_batch_metrics(struct Server *s, apply_ctx_t *ctx) {
+  /* Calculate Latency */
+  uint64_t now = uv_now(s->loop);
+
+  uint64_t consensus_time = now - ctx->raft_apply_ts;
+  uint64_t buffering_time = 0;
+  if (ctx->raft_apply_ts > ctx->batch_creation_ts) {
+    buffering_time = ctx->raft_apply_ts - ctx->batch_creation_ts;
+  }
+
+  uint64_t batch_time = now - ctx->batch_creation_ts;
+
+  if (s->batch_log_file) {
+    batch_log_t entry;
+    entry.timestamp = now;
+    entry.batch_size = ctx->req_count;
+    entry.bytes = ctx->batch_size_bytes;
+    entry.t_accumulate = buffering_time;
+    entry.t_consensus = consensus_time;
+    entry.t_total = batch_time;
+    fwrite(&entry, sizeof(batch_log_t), 1, s->batch_log_file);
+  }
+
+  s->stats.period_latency_sum += batch_time;
+  s->stats.period_batches_count++;
+}
+
 /* Called after a request to apply a new command to the FSM has been
  * completed. */
 static void serverApplyCb(struct raft_apply *req, int status, void *result)
@@ -1140,15 +1223,12 @@ static void serverApplyCb(struct raft_apply *req, int status, void *result)
   struct Server *s = ctx->server;
   client_t *c = ctx->client;
 
-  /* Calculate Latency */
-  uint64_t now = uv_now(s->loop);
-  uint64_t latency = now - ctx->start_time;
-
-  /* Update Stats Accumulators */
-  s->stats.period_latency_sum += latency;
-  s->stats.period_batches_count++;
+  if (status == 0) {
+    update_batch_metrics(s, ctx);
+  }
 
   if (status == 0 && c != NULL && ! c->closing) {
+
     ack_write_t *wr = malloc(sizeof(ack_write_t));
     if (wr) {
       wr->req.data = wr;
@@ -1216,61 +1296,62 @@ static void statsTimerCb(uv_timer_t *timer)
     avg_latency_ms = (double)s->stats.period_latency_sum / (double)s->stats.period_batches_count;
   }
 
-  /* Reset latency accumulators */
-  s->stats.period_latency_sum = 0;
-  s->stats.period_batches_count = 0;
+  raft_index idx_current = raft_last_index(&s->raft);
+  raft_index idx_commit  = raft_commit_index(&s->raft);
+  raft_index idx_applied = raft_last_applied(&s->raft);
 
   /* -----------------------------------------------------------------------
    * Calculate Backlog 
    * ----------------------------------------------------------------------- */
-  uint64_t backlog = 0;
-
-  /* 
-   * Simple Logic: Input - Output.
-   * Safety Check: Ensure we don't underflow if Output > Input 
-   * (which happens if we processed logs as a Follower).
-   */
-  if (s->stats.total_received > s->stats.total_requests) {
-    backlog = s->stats.total_received - s->stats.total_requests;
-  }
-
-  uint64_t total_pending_reqs = 0;
+  uint64_t pending_client_reqs = 0;
   uint64_t total_pending_bytes = 0;
-
   client_t *c = s->insert_clients_head;
   while (c != NULL) {
     client_t *next = c->next;
-    total_pending_reqs += c->batched_req_count;
-    total_pending_bytes += c->batch_offset;
+    pending_client_reqs += c->ctx.insert.batched_req_count;
+    total_pending_bytes += c->ctx.insert.batch_offset;
 
-    /* flush data that's being too long in the buffer. */
+    // Also flush stale data here
     batch_buffer_flush(s, c);
     c = next;
   }
+
+  /* 
+   * Raft Lag: Entries that are committed by consensus but not yet applied 
+   * to your LSM Tree. This indicates disk I/O bottlenecks in lsmt_insert.
+   */
+  uint64_t raft_lag = (idx_commit > idx_applied) ? (idx_commit - idx_applied) : 0;
+  uint64_t backlog = pending_client_reqs + raft_lag;
+
   /* -----------------------------------------------------------------------
    * Update State & Log
    * ----------------------------------------------------------------------- */
-  s->stats.prev_requests = current_reqs;
-  s->stats.prev_bytes = current_bytes;
-  s->stats.last_run_time = now;
   const char *role_name = "UNKNOWN";
   if (current_state == RAFT_LEADER) role_name = "LEADER";
   else if (current_state == RAFT_FOLLOWER) role_name = "FOLLOWER";
   else if (current_state == RAFT_CANDIDATE) role_name = "CANDIDATE";
 
   if (s->stats.f) {
-    fprintf(s->stats.f, "%lu,%s,%lu,%.2f,%lu,%lu,%lu,%.2f\n",
+    fprintf(s->stats.f, "%lu,%s,%lu,%.2f,%lu,%lu,%lu,%.2f,%llu,%llu,%llu\n",
         now, 
         role_name, 
         ops_sec, 
         mb_sec,
-        total_pending_reqs, 
+        pending_client_reqs, 
         total_pending_bytes, 
         backlog,
-        avg_latency_ms
+        avg_latency_ms,
+        idx_current,
+        idx_applied,
+        idx_commit
         );
-    // fflush(s->stats.f); 
   }
+  // Reset Counters
+  s->stats.prev_requests = s->stats.total_requests;
+  s->stats.prev_bytes = s->stats.total_bytes;
+  s->stats.period_latency_sum = 0;
+  s->stats.period_batches_count = 0;
+  s->stats.last_run_time = now;
 }
 
 /* Called periodically every APPLY_RATE milliseconds. */
@@ -1314,13 +1395,19 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
     s->close_cb(s);
   }
 
-  if (s->db) {
-    lsmt_flush(s->db);
-  }
-
   if (s->stats.f) {
     fclose(s->stats.f);
     s->stats.f = NULL;
+  }
+
+  if (s->batch_log_file) {
+    fflush(s->batch_log_file);
+    fclose(s->batch_log_file);
+    s->batch_log_file = NULL;
+  }
+
+  if (s->db) {
+    lsmt_flush(s->db);
   }
 }
 
