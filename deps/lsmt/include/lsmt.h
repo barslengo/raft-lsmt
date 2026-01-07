@@ -25,7 +25,28 @@ typedef struct kv_record {
   uint8_t *data;
   uint8_t data_type;
   uint32_t data_len;
+  uint64_t record_size;
 } kv_record_t;
+
+typedef struct sst_iterator {
+  bool active;
+  FILE *fp;
+  sl_uint128_t start_key;
+  sl_uint128_t end_key;
+} sst_iterator_t;
+
+
+typedef struct lsmt_iterator {
+  bool active;
+  sl_uint128_t start_key;
+  sl_uint128_t end_key;
+
+  lsmt_t *lsmt;
+  sst_node_t *sst_list;
+  sl_iterator_t memtable_it;
+  sst_iterator_t sst_it;
+} lsmt_iterator_t;
+
 
 
 /*
@@ -37,6 +58,10 @@ lsmt_t *lsmt_init(const char *db_path);
 void lsmt_flush(lsmt_t *lsmt);
 void lsmt_free(lsmt_t *lsmt);
 int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size);
-uint32_t lsmt_get(lsmt_t *lsmt, sl_uint128_t start_key, sl_uint128_t end_key, kv_record_t **result);
+
+lsmt_iterator_t lsmt_iterator_create(lsmt_t *lsmt, sl_uint128_t start_key, sl_uint128_t end_key);
+void lsmt_iterator_close(lsmt_iterator_t *it);
+kv_record_t lsmt_iterator_next(lsmt_iterator_t *it);
+
 
 #endif

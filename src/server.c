@@ -22,6 +22,7 @@
 
 #define BATCH_SIZE 4096 //1024 //128
 #define CONTENT_MAX_SIZE 255
+#define QUERY_BYTES_LIMIT 8192 //8 KB 
 
 static char ACK_BUFFER[BATCH_SIZE];
 const uint8_t CONTENT_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t); 
@@ -867,7 +868,7 @@ static int send_records(client_t *c, uint8_t *data, uint32_t payload_size) {
 }
 
 static bool process_query_buffer(client_t *client) {
-  size_t expected_size = sizeof(sl_uint128_t) * 2; 
+  size_t expected_size = sizeof(sl_uint128_t) * 2;
   size_t offset = 0;
   size_t remaining = client->buffer_len;
 
@@ -881,9 +882,47 @@ static bool process_query_buffer(client_t *client) {
     memcpy(&end_key, client->buffer + offset, sizeof(sl_uint128_t)); 
     offset += sizeof(sl_uint128_t);
 
-    kv_record_t *records = NULL; // array of records of size 'records_count'.
+    size_t records_capacity = 2048;
+    size_t records_count = 0;
+    size_t records_bytes = 0;
+    kv_record_t *records = malloc(sizeof(kv_record_t) * records_capacity); 
+    if (!records) {
+      fprintf(stderr, "OOM allocating records\n");
+      exit(1);
+    }
+
     //printf("Loading records..\n");
-    uint32_t records_count = lsmt_get(db, start_key, end_key, &records);
+    lsmt_iterator_t it = lsmt_iterator_create(db, start_key, end_key);
+    while (it.active) {
+      kv_record_t record = lsmt_iterator_next(&it);
+      if (!it.active) break;
+
+      records_bytes += record.record_size;
+      if (records_bytes > QUERY_BYTES_LIMIT) {
+        /*Bytes limit reached, i need to ignore the current record
+         * and free its content.
+         */
+        free(record.data);
+        break;
+      }
+
+      if (records_count >= records_capacity) { 
+        size_t new_capacity = records_capacity * 2;
+
+        // If realloc fails, it returns NULL but the original memory is still valid.
+        kv_record_t *tmp = realloc(records, new_capacity * sizeof(kv_record_t));
+
+        if (tmp == NULL) {
+          fprintf(stderr, "Critical: Out of memory during realloc\n");
+          exit(1); 
+        }
+
+        records = tmp;
+        records_capacity = new_capacity;
+      }
+      records[records_count++] = record;
+    }
+    lsmt_iterator_close(&it);
     //printf("Loaded %u records\n", records_count);
 
     uint8_t *payload = NULL;

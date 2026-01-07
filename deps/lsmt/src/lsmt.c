@@ -514,14 +514,41 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
   return rv;
 }
 
-uint32_t fetch_sst(sst_metadata_record_t *sst, sl_uint128_t start_key, 
-    sl_uint128_t end_key, kv_record_t **out_records) {
+
+static kv_record_t raw_data_to_record(sl_kv_t raw) {
+  kv_record_t record = {0};
+
+  uint8_t *buf = raw.content;  
+  record.key = raw.key;
+  memcpy(&record.data_type, buf, sizeof(uint8_t));
+  buf += sizeof(uint8_t);
+
+  memcpy(&record.data_len, buf, sizeof(uint32_t));
+  buf += sizeof(uint32_t);
+
+  record.data = malloc(record.data_len);
+  if (!record.data) {
+    printf("OOM cant allocate kv_record_t of size %u..\n", record.data_len);
+    exit(1);
+  }
+  memcpy(record.data, buf, record.data_len);
+
+  record.record_size = sizeof(sl_uint128_t) + sizeof(uint8_t) +
+        sizeof(uint32_t) + record.data_len;
+
+  return record;
+}
+
+static sst_iterator_t sst_iterator_create(sst_metadata_record_t *sst,
+    sl_uint128_t start_key, sl_uint128_t end_key) {
   sst_metadata_record_t sst_info = *sst;
+
+  sst_iterator_t it = {0};
+  it.active = false;
 
   if (key_compare(sst_info.max_key, start_key) < 0 || 
       key_compare(sst_info.min_key, end_key) > 0) {
-    *out_records = NULL;
-    return 0;
+    return it;
   }
 
   /* Get the key offset reading the index file. */
@@ -532,52 +559,60 @@ uint32_t fetch_sst(sst_metadata_record_t *sst, sl_uint128_t start_key,
   /* Open the sstable file starting from the key offset. */
   FILE *fp = fopen(sst_info.sstable_filename, "rb");
   if (!fp) {
-    *out_records = NULL;
-    return 0;
+    return it;
   }
 
   fseek(fp, offset, SEEK_SET);
+
+  it.active = true;
+  it.fp = fp;
+  it.start_key = start_key;
+  it.end_key = end_key;
+  return it;
+}
+
+static void sst_iterator_close(sst_iterator_t *it) {
+  if (it && it->active && it->fp) {
+    fclose(it->fp);
+    it->fp = NULL;
+    it->active = false;
+  }
+}
+
+static kv_record_t sst_iterator_next(sst_iterator_t *it) {
+  kv_record_t record = {0};
+  if (!it || !it->active || !it->fp) {
+      return record; 
+  }
+
+  FILE *fp = it->fp;
 
   sl_uint128_t fetched_key; 
   uint8_t type;
   uint32_t length;
 
-  /* Setup records buffer. */
-  uint32_t count = 0;
-  uint32_t capacity = 32;
-  kv_record_t *results = malloc(sizeof(kv_record_t) * capacity);
-
   /* Fetch the key from the sstable. */
   while (read_record_header(fp, &fetched_key, &type, &length)) { 
-    if (key_compare(fetched_key, end_key) > 0) {
+    if (key_compare(fetched_key, it->end_key) > 0) {
       break;
     }
 
-    if (key_compare(fetched_key, start_key) >= 0) {
+    if (key_compare(fetched_key, it->start_key) >= 0) {
+      uint32_t record_size = sizeof(sl_uint128_t) + sizeof(uint8_t) +
+        sizeof(uint32_t) + length;
 
-      // Resize array if full
-      if (count >= capacity) {
-        capacity *= 2;
-        kv_record_t *tmp = realloc(results, sizeof(kv_record_t) * capacity);
-        if (!tmp) {
-          printf("OOM\n");
-          exit(1);
-          break; 
-        }
-        results = tmp;
-      }
+      record.key = fetched_key;
+      record.data_type = type;
+      record.data_len = length;
+      record.data = malloc(record.data_len);
 
-      kv_record_t *record = &results[count];
-      record->key = fetched_key;
-      record->data_type = type;
-      record->data_len = length; 
-
-      record->data = malloc(record->data_len);
-      if(record->data) {
-        if (fread(record->data, 1, record->data_len, fp) == record->data_len) {
-          count++;
+      if(record.data) {
+        if (fread(record.data, 1, record.data_len, fp) == record.data_len) {
+          record.record_size = record_size;
+          return record;
         } else {
-          free(record->data); 
+          free(record.data); 
+          record.data = NULL;
           break;
         }
       }
@@ -590,96 +625,84 @@ uint32_t fetch_sst(sst_metadata_record_t *sst, sl_uint128_t start_key,
       fseek(fp, length, SEEK_CUR);
     }
   }
-  fclose(fp);
-  *out_records = results;
-  return count;
+  sst_iterator_close(it);
+
+  /* Reached EOF or key upper bound. */
+  memset(&record, 0, sizeof(kv_record_t));
+  return record;
 }
 
-uint32_t lsmt_get(lsmt_t *lsmt, sl_uint128_t start_key,
-  sl_uint128_t end_key, kv_record_t **result) {
-  if (lsmt == NULL) return 0;
+/* The iterator blocks all inserts and merges until its closed. */
+lsmt_iterator_t lsmt_iterator_create(lsmt_t *lsmt, sl_uint128_t start_key,
+    sl_uint128_t end_key) {
 
+  lsmt_iterator_t it = {0};
+  it.start_key = start_key;
+  it.end_key = end_key;
 
-  /*Ideally this must have as size the total sst tables stored on disk. */
-  kv_record_t *sst_results[2048];
-  uint32_t sst_counts[2048];
-  int sst_idx = 0;
-  uint32_t total_count = 0;
-  sl_t *memtable = NULL;
+  it.lsmt = lsmt;
+  it.sst_list = NULL;
 
-  /* First check for data in current memtable. */
+  it.active = true;
+  it.sst_it.active = false;
+  it.memtable_it.active = false;
+
   pthread_mutex_lock(&lsmt->memtable_lock);
-  //printf("Fetching memtable ..\n");
-
   if (lsmt->memtable) {
-    memtable = lsmt->memtable;
-    sl_retain(memtable);
-
-    sl_kv_t *records = NULL;
-    uint32_t count = sl_get_range(memtable, start_key, end_key, &records);
-    if (count > 0) {
-      kv_record_t *r = malloc(sizeof(kv_record_t) * count);
-      if (!r) {
-        printf("OOM lsmt_get..\n");
-        exit(1);
-      }
-      for (uint32_t i = 0; i < count; i++) {
-        uint8_t *buf = records[i].content;  
-        r[i].key = records[i].key;
-        memcpy(&r[i].data_type, buf, sizeof(uint8_t));
-        buf += sizeof(uint8_t);
-
-        memcpy(&r[i].data_len, buf, sizeof(uint32_t));
-        buf += sizeof(uint32_t);
-
-        r[i].data = malloc(r[i].data_len);
-        if (!r[i].data) {
-          printf("OOM lsmt_get memtable record data of size %u..\n", r[i].data_len);
-          exit(1);
-        }
-        memcpy(r[i].data, buf, r[i].data_len);
-      }
-      free(records);
-      sst_results[sst_idx] = r;
-      sst_counts[sst_idx] = count;
-      total_count += count;
-      sst_idx++;
-    }
-   sl_release(memtable);
+    it.memtable_it = sl_iterator_create(lsmt->memtable, start_key, end_key); 
+  }
+  else {
+    pthread_mutex_lock(&lsmt->metadata_lock);
   }
   pthread_mutex_unlock(&lsmt->memtable_lock);
+  return it;
+}
 
-  /* Then check in sstables from disk. */
-  pthread_mutex_lock(&lsmt->metadata_lock); 
-  //printf("Fetching sstables..\n");
-  sst_node_t *list = lsmt->metadata->list;
-  while (list != NULL && sst_idx < 2048) {
-    int record_count = fetch_sst(list->content, start_key, end_key, &sst_results[sst_idx]);
-    if (record_count > 0) {
-      sst_counts[sst_idx] = record_count;
-      total_count += record_count;
-      sst_idx++;
+void lsmt_iterator_close(lsmt_iterator_t *it) {
+  if (it && it->active) {
+
+    /* Close memtable iterator if exists. */
+    sl_iterator_close(&it->memtable_it);
+
+    /* Close sstable iterator. */
+    sst_iterator_close(&it->sst_it);
+
+    pthread_mutex_unlock(&it->lsmt->metadata_lock);
+    it->active = false;
+  }
+}
+
+kv_record_t lsmt_iterator_next(lsmt_iterator_t *it) {
+  kv_record_t result = {0};
+  if (!it->active) return result;
+
+  /* Fetch from memtable. */
+  if (it->memtable_it.active) {
+    sl_kv_t sl_record = sl_iterator_next(&it->memtable_it); 
+    if (it->memtable_it.active) return raw_data_to_record(sl_record);
+    sl_iterator_close(&it->memtable_it);
+
+    /* Start fetching from the sstables. */
+    pthread_mutex_lock(&it->lsmt->metadata_lock);
+    it->sst_list = it->lsmt->metadata->list;
+  }
+
+  /* Fetch from sstables. */
+  while (it->sst_list != NULL) {
+    if (!it->sst_it.active) {
+      it->sst_it = sst_iterator_create(it->sst_list->content, it->start_key,
+          it->end_key);
     }
-    list = list->next;
-  }
-  pthread_mutex_unlock(&lsmt->metadata_lock);
 
-  if (total_count == 0) {
-    *result = NULL;
-    return 0;
-  }
+    if (it->sst_it.active) {
+      kv_record_t record = sst_iterator_next(&it->sst_it);
+      if (it->sst_it.active) return record;
+    }
 
-  kv_record_t *tmp = malloc(sizeof(kv_record_t) * total_count);
-  uint32_t offset = 0;
-
-  for (int i = 0; i < sst_idx; i++) {
-      size_t batch_size_bytes = sizeof(kv_record_t) * sst_counts[i];
-      memcpy(tmp + offset, sst_results[i], batch_size_bytes);
-      
-      offset += sst_counts[i]; 
-      free(sst_results[i]);
+    sst_iterator_close(&it->sst_it);
+    it->sst_list = it->sst_list->next;
   }
 
-  *result = tmp;
-  return total_count;
+  lsmt_iterator_close(it);
+  return result;
 }

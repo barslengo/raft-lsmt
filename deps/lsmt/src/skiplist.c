@@ -118,83 +118,77 @@ sl_t* sl_init() {
   return skiplist;
 }
 
-/*
- * Retrieves all key/value pairs in the range [start_key, end_key] (inclusive).
- * 
- * @param skiplist   Pointer to the skiplist instance.
- * @param start_key  The lower bound of the range.
- * @param end_key    The upper bound of the range.
- * @param result     A pointer to a (sl_kv_t*) pointer. This function will allocate 
- *                   memory for the array of results and set this pointer. 
- *                   The caller is responsible for freeing this memory.
- * 
- * @return uint32_t  The number of records found.
+/* Create the iterator for the skiplist. It also moves to the
+ * first key greater-equal than 'start_key'.
  */
-uint32_t sl_get_range(sl_t *skiplist, sl_uint128_t start_key, sl_uint128_t end_key, sl_kv_t **result) {
-    if (skiplist == NULL || result == NULL) {
-        return 0;
+sl_iterator_t sl_iterator_create(sl_t *skiplist, sl_uint128_t start_key, sl_uint128_t end_key) {
+  sl_iterator_t it = {0};
+  it.sl = skiplist;
+  sl_retain(it.sl);
+
+  it.active = true;
+  it.start_key = start_key;
+  it.end_key = end_key;
+
+  if (skiplist == NULL) {
+    sl_iterator_close(&it);
+    return it;
+  }
+
+  /* Traverse down to the bottom level to find the node strictly before start_key */
+  node_t *current = skiplist->top_level;
+  while (current != NULL) {
+    /* Move right while the next key is strictly less than start_key */
+    while (current->next != NULL && key_compare(current->next->key, it.start_key) < 0) {
+      current = current->next;
     }
 
-    node_t *current = skiplist->top_level;
-
-    /* Traverse down to the bottom level to find the node strictly before start_key */
-    while (current != NULL) {
-        /* Move right while the next key is strictly less than start_key */
-        while (current->next != NULL && key_compare(current->next->key, start_key) < 0) {
-            current = current->next;
-        }
-
-        /* Drop down a level, or stop if we are at the bottom */
-        if (current->lower_level != NULL) {
-            current = current->lower_level;
-        } else {
-            break; 
-        }
+    /* Drop down a level, or stop if we are at the bottom */
+    if (current->lower_level != NULL) {
+      current = current->lower_level;
+    } else {
+      break; 
     }
+  }
 
-    /* current is now the predecessor (or sentinel). Move to the first potential candidate. */
-    if (current != NULL) {
-        current = current->next;
-    }
+  /* current is now the predecessor (or sentinel). Move to the first potential candidate. */
+  if (current != NULL) {
+    current = current->next;
+  }
 
-    /* Initialize Result Array */
-    size_t capacity = 16;
-    size_t count = 0;
-    sl_kv_t *arr = malloc(capacity * sizeof(sl_kv_t));
-    if (arr == NULL) {
-        return 0; 
-    }
+  it.current_node = current;
+  return it;
+}
 
-    /* Iterate forward at the bottom level */
-    while (current != NULL) {
-        /* If current key is greater than end_key, we are done */
-        if (key_compare(current->key, end_key) > 0) {
-            break;
-        }
+void sl_iterator_close(sl_iterator_t *it) {
+  if (it && it->active) {
+    it->active = false;
+    sl_release(it->sl);
+    it->sl = NULL;
+  }
+}
 
-        /* Resize array if necessary */
-        if (count >= capacity) {
-            capacity *= 2;
-            sl_kv_t *tmp = realloc(arr, capacity * sizeof(sl_kv_t));
-            if (tmp == NULL) {
-                free(arr); 
-                *result = NULL;
-                return 0;
-            }
-            arr = tmp;
-        }
+/* Iterates until the current key is greater than the 'end_key'
+ * provided by the iterator.
+ * The ownership of the returned record 'content' is still of the skiplist.
+ */
+sl_kv_t sl_iterator_next(sl_iterator_t *it) {
+  sl_kv_t record = {0};
 
-        /* Add record to result */
-        arr[count].key = current->key;
-        arr[count].content = current->content;
-        count++;
+  if (!it || !it->active) return record;
 
-        current = current->next;
-    }
+  if (it->current_node == NULL || 
+      key_compare(it->current_node->key, it->end_key) > 0) {
+    sl_iterator_close(it);
+    return record;
+  }
 
-    /* Assign the allocated array to the output parameter */
-    *result = arr;
-    return (uint32_t)count;
+
+  record.key = it->current_node->key;
+  record.content = it->current_node->content;
+  it->current_node = it->current_node->next;
+
+  return record;
 }
 
 
