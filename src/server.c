@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 
 #include <raft/raft.h>
 #include <raft/raft/uv.h>
@@ -22,7 +23,7 @@
 
 #define BATCH_SIZE 4096 //1024 //128
 #define CONTENT_MAX_SIZE 255
-#define QUERY_BYTES_LIMIT 8192 //8 KB 
+#define QUERY_BYTES_LIMIT (512 * 1024) //512 KB 
 
 static char ACK_BUFFER[BATCH_SIZE];
 const uint8_t CONTENT_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t); 
@@ -36,6 +37,15 @@ typedef struct __attribute__((packed)) {
     uint64_t t_consensus;
     uint64_t t_total;
 } batch_log_t;
+
+typedef struct query_response {
+  bool limit_reached;
+  uint64_t req_id;
+  uint64_t records_count;
+  kv_record_t *records;
+  sl_uint128_t min_key;
+  sl_uint128_t max_key;
+} query_response_t;
 
 /* ========== CLUST CONFIG SECTION START ========== */
 typedef struct {
@@ -783,39 +793,68 @@ static void on_insert_connection(uv_stream_t *server_handle, int status) {
   }
 }
 
-/* Serialize the kv_record_t array into the result array.
- * The input array is also freed. */
-static uint32_t serialize_records(kv_record_t *records, uint32_t len, uint8_t **result) {
-  size_t payload_size = sizeof(uint32_t) + sizeof(uint32_t);
+
+
+/* response format: 
+ * Header: [TOTAL_MSG_SIZE (8 Bytes) | REQ_ID (8 Bytes) | LIMIT (1 Byte) | MIN_KEY (16 bytes) | MAX_KEY (16 bytes)]
+ * Body: [PAYLOAD_SIZE (8 Bytes) | RECORDS_COUNT (4 Bytes) | RECORDS]
+ *
+ * This function consumes and free the records pointed by the response obj.
+ */
+static uint64_t serialize_response(query_response_t response, uint8_t **result) {
+  const uint32_t header_size = sizeof(uint64_t) + //total msg size
+                               sizeof(response.req_id) +
+                               sizeof(response.limit_reached) + 
+                               sizeof(response.min_key) +
+                               sizeof(response.max_key);
+
+  uint64_t body_size = sizeof(uint64_t) + //body size.
+                       sizeof(response.records_count); //total records.
 
   const size_t key_size = sizeof(sl_uint128_t);
   const size_t data_type_size = sizeof(uint8_t);
   const size_t len_field_size = sizeof(uint32_t);
   const int fixed_size =  key_size + len_field_size + data_type_size;
 
-  for (uint32_t i = 0; i < len; i++) {
-    payload_size += fixed_size;
-    payload_size += records[i].data_len;
+  kv_record_t *records = response.records;
+  for (uint32_t i = 0; i < response.records_count; i++) {
+    body_size += fixed_size;
+    body_size += records[i].data_len;
   }
-
-  uint8_t *out = malloc(payload_size);
+ 
+  const uint64_t total_msg_size = header_size + body_size;
+  uint8_t *out = malloc(total_msg_size);
   if (!out) {
     printf("OOM on serializing data\n");
     exit(1);
   }
+  uint64_t offset = 0;
+  // Header Serialization
+  memcpy(out, &total_msg_size, sizeof(total_msg_size));
+  offset += sizeof(total_msg_size);
 
-  uint32_t offset = 0;
+  memcpy(out + offset, &response.req_id, sizeof(response.req_id));
+  offset += sizeof(response.req_id);
 
-  /* Payload Header. */
-  memcpy(out, &payload_size, sizeof(uint32_t));
-  offset += sizeof(uint32_t);
-  memcpy(out + offset, &len, sizeof(uint32_t));
-  offset += sizeof(uint32_t);
+  memcpy(out + offset, &response.limit_reached, sizeof(response.limit_reached));
+  offset += sizeof(response.limit_reached);
 
-  /* Payload body.
+  memcpy(out + offset, &response.min_key, sizeof(response.min_key));
+  offset += sizeof(response.min_key);
+  memcpy(out + offset, &response.max_key, sizeof(response.max_key));
+  offset += sizeof(response.max_key);
+
+  // Body Serialization
+  /* Body header. */
+  memcpy(out, &body_size, sizeof(body_size));
+  offset += sizeof(body_size);
+  memcpy(out + offset, &response.records_count, sizeof(response.records_count));
+  offset += sizeof(response.records_count);
+
+  /* Body payload.
    * Each record is serialized in the following order:
    * [Key|DataType|DataLen|Data]. */
-  for (uint32_t i = 0; i < len; i++) {
+  for (uint32_t i = 0; i < response.records_count; i++) {
     memcpy(out + offset, &records[i].key, key_size); 
     offset += key_size;
 
@@ -833,10 +872,10 @@ static uint32_t serialize_records(kv_record_t *records, uint32_t len, uint8_t **
   free(records);
 
   *result = out;
-  return payload_size;
+  return total_msg_size;
 }
 
-static int send_records(client_t *c, uint8_t *data, uint32_t payload_size) {
+static int send_response(client_t *c, uint8_t *data, uint64_t payload_size) {
   ack_write_t *wr = malloc(sizeof(ack_write_t));
   if (!wr) {
     free(data); 
@@ -867,16 +906,30 @@ static int send_records(client_t *c, uint8_t *data, uint32_t payload_size) {
   return 0;
 }
 
+/* Query request format:
+ * [REQ_ID (8 Bytes) | START_KEY (16 Bytes) | END_KEY (16 bytes)]
+ * For the response format consult the 'serialize_response' function.
+ *
+ * For each query request:
+ * Lookup into the lsmt database for the key range provided, the lookup
+ * is bounded to a fixed amount of bytes. The response returns the fetched
+ * records, a flag indicating whether the byte limit has been reached
+ * and the interval of the fetched keys.
+ *
+ */
 static bool process_query_buffer(client_t *client) {
-  size_t expected_size = sizeof(sl_uint128_t) * 2;
+  size_t expected_size = sizeof(uint64_t) + (sizeof(sl_uint128_t) * 2);
   size_t offset = 0;
   size_t remaining = client->buffer_len;
 
   while (remaining >= expected_size) {
     //printf("Processing query\n");
+    uint64_t req_id;
     sl_uint128_t start_key;
     sl_uint128_t end_key;
 
+    memcpy(&req_id, client->buffer + offset, sizeof(uint64_t)); 
+    offset += sizeof(uint64_t);
     memcpy(&start_key, client->buffer + offset, sizeof(sl_uint128_t)); 
     offset += sizeof(sl_uint128_t);
     memcpy(&end_key, client->buffer + offset, sizeof(sl_uint128_t)); 
@@ -890,6 +943,22 @@ static bool process_query_buffer(client_t *client) {
       fprintf(stderr, "OOM allocating records\n");
       exit(1);
     }
+
+    /* Since the lsmt iterator order over sstables isnt defined and this protocol
+     * has a byte limit for lookup, i manually need to keep track for the key range
+     * i've retrieved.
+     *
+     * For instance, suppose i want to query keys from 1024 to 2048 and they are
+     * splitted in different sstables. The iterator can perform the first
+     * lookup on the sstable that contains only two keys: 1000 and 1128. At this
+     * point if the byte limits is reached, i must return the buffered records and 
+     * inform the client that his query has only performed the lookup for the
+     * key range [1000, 1128]. 
+     */
+    sl_uint128_t min_key = {0};
+    sl_uint128_t max_key;
+    max_key.id = UINT64_MAX; 
+    max_key.timestamp = UINT64_MAX;
 
     //printf("Loading records..\n");
     lsmt_iterator_t it = lsmt_iterator_create(db, start_key, end_key);
@@ -921,14 +990,25 @@ static bool process_query_buffer(client_t *client) {
         records_capacity = new_capacity;
       }
       records[records_count++] = record;
+      if (key_compare(record.key, max_key) > 0) max_key = record.key;
+      if (key_compare(record.key, min_key) < 0) min_key = record.key;
     }
     lsmt_iterator_close(&it);
     //printf("Loaded %u records\n", records_count);
 
-    uint8_t *payload = NULL;
-    uint32_t payload_size = serialize_records(records, records_count, &payload);
-    //printf("serialized data into a payload of size %u\n", payload_size);
-    if (send_records(client, payload, payload_size) != 0) {
+    query_response_t response = {0};
+    response.req_id = req_id;
+    response.records_count = records_count;
+    response.limit_reached = records_bytes > QUERY_BYTES_LIMIT ? true : false;
+    response.min_key = min_key;
+    response.max_key = max_key;
+    response.records = records;
+
+    uint8_t *res_buf = NULL;
+    uint64_t len = serialize_response(response, &res_buf);
+ ;
+    //printf("serialized data into a payload of size %u\n", len);
+    if (send_response(client, res_buf, len) != 0) {
       return false;
     }
     remaining -= expected_size;
@@ -944,9 +1024,6 @@ static bool process_query_buffer(client_t *client) {
   return true;
 }
 
-/* Payload format: [Start_Key (16B)|End_Key (16B)]
- * Response format: [Len (32B) | Records]
- */
 static void on_client_query(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
   client_t *client = (client_t *)stream->data;
 
