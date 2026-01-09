@@ -539,6 +539,7 @@ static kv_record_t raw_data_to_record(sl_kv_t raw) {
   return record;
 }
 
+
 static sst_iterator_t sst_iterator_create(sst_metadata_record_t *sst,
     sl_uint128_t start_key, sl_uint128_t end_key) {
   sst_metadata_record_t sst_info = *sst;
@@ -562,6 +563,10 @@ static sst_iterator_t sst_iterator_create(sst_metadata_record_t *sst,
     return it;
   }
 
+  /* Set the read buffer to 64KB to improve sequential reads. */
+  char *io_buf = malloc(65536);
+  setvbuf(fp, io_buf, _IOFBF, 65536);
+
   fseek(fp, offset, SEEK_SET);
 
   it.active = true;
@@ -574,7 +579,10 @@ static sst_iterator_t sst_iterator_create(sst_metadata_record_t *sst,
 static void sst_iterator_close(sst_iterator_t *it) {
   if (it && it->active && it->fp) {
     fclose(it->fp);
+    if (it->io_buff) free(it->io_buff);
+
     it->fp = NULL;
+    it->io_buff = NULL;
     it->active = false;
   }
 }
@@ -632,77 +640,170 @@ static kv_record_t sst_iterator_next(sst_iterator_t *it) {
   return record;
 }
 
-/* The iterator blocks all inserts and merges until its closed. */
+
+/* Helper to get next record from a specific source, buffering it. */
+static void source_ensure_buffered(merge_source_t *src) {
+  if (!src->active || src->has_buffered) return;
+
+  if (src->type == 0) { // Memtable
+    if (src->iter.mem_it.active) {
+      sl_kv_t raw = sl_iterator_next(&src->iter.mem_it);
+      if (src->iter.mem_it.active) {
+        src->buffered_record = raw_data_to_record(raw);
+        src->has_buffered = true;
+      } else {
+        src->active = false;
+      }
+    } else {
+      src->active = false;
+    }
+  } else { // SSTable
+    if (src->iter.sst_it.active) {
+      kv_record_t rec = sst_iterator_next(&src->iter.sst_it);
+      if (src->iter.sst_it.active) {
+        src->buffered_record = rec;
+        src->has_buffered = true;
+      } else {
+        src->active = false;
+      }
+    } else {
+      src->active = false;
+    }
+  }
+}
+
 lsmt_iterator_t lsmt_iterator_create(lsmt_t *lsmt, sl_uint128_t start_key,
     sl_uint128_t end_key) {
-
   lsmt_iterator_t it = {0};
   it.start_key = start_key;
   it.end_key = end_key;
-
   it.lsmt = lsmt;
-  it.sst_list = NULL;
-
   it.active = true;
-  it.sst_it.active = false;
-  it.memtable_it.active = false;
 
+  pthread_mutex_lock(&lsmt->metadata_lock);
+
+  /* ---------------------------------------------------------
+   * Count only SSTables that overlap with the query range
+   * --------------------------------------------------------- */
+  size_t valid_sst_count = 0;
+  sst_node_t *node = lsmt->metadata->list;
+
+  while(node) {
+    sst_metadata_record_t *meta = node->content;
+    bool is_left_of_query  = key_compare(meta->max_key, start_key) < 0;
+    bool is_right_of_query = key_compare(meta->min_key, end_key) > 0;
+
+    if (!is_left_of_query && !is_right_of_query) {
+      valid_sst_count++;
+    }
+
+    node = node->next;
+  }
+
+  /* Allocate sources: 1 Memtable + N *Valid* SSTables */
+  it.source_count = 1 + valid_sst_count;
+  it.sources = calloc(it.source_count, sizeof(merge_source_t));
+  if (!it.sources) {
+    perror("Failed to allocate iterator sources");
+    pthread_mutex_unlock(&lsmt->metadata_lock);
+    exit(1);
+  }
+
+  /* ---------------------------------------------------------
+   * INIT SOURCE 0: Memtable
+   * --------------------------------------------------------- */
   pthread_mutex_lock(&lsmt->memtable_lock);
-  if (lsmt->memtable) {
-    it.memtable_it = sl_iterator_create(lsmt->memtable, start_key, end_key); 
-  }
-  else {
-    pthread_mutex_lock(&lsmt->metadata_lock);
-  }
+  it.sources[0].type = 0;
+  it.sources[0].iter.mem_it = sl_iterator_create(lsmt->memtable, start_key, end_key);
+  it.sources[0].active = it.sources[0].iter.mem_it.active;
   pthread_mutex_unlock(&lsmt->memtable_lock);
+
+  /* ---------------------------------------------------------
+   * Initialize only the valid SSTables
+   * --------------------------------------------------------- */
+  node = lsmt->metadata->list;
+  size_t idx = 1;
+
+  while(node) {
+    sst_metadata_record_t *meta = node->content;
+
+    bool is_left_of_query  = key_compare(meta->max_key, start_key) < 0;
+    bool is_right_of_query = key_compare(meta->min_key, end_key) > 0;
+
+    if (!is_left_of_query && !is_right_of_query) {
+      it.sources[idx].type = 1;
+
+      /* sst_iterator_create will open the file and seek to the index */
+      it.sources[idx].iter.sst_it = sst_iterator_create(meta, start_key, end_key);
+      it.sources[idx].active = it.sources[idx].iter.sst_it.active;
+      idx++;
+    }
+
+    node = node->next;
+  }
+
+  pthread_mutex_unlock(&lsmt->metadata_lock);
+
+  /* Pre-fill buffers for the first comparison */
+  for (size_t i = 0; i < it.source_count; i++) {
+    source_ensure_buffered(&it.sources[i]);
+  }
   return it;
 }
 
 void lsmt_iterator_close(lsmt_iterator_t *it) {
   if (it && it->active) {
+    for (size_t i = 0; i < it->source_count; i++) {
+      /* Free buffered data if we didn't consume it */
+      if (it->sources[i].has_buffered && it->sources[i].buffered_record.data) {
+        free(it->sources[i].buffered_record.data);
+      }
 
-    /* Close memtable iterator if exists. */
-    sl_iterator_close(&it->memtable_it);
-
-    /* Close sstable iterator. */
-    sst_iterator_close(&it->sst_it);
-
-    pthread_mutex_unlock(&it->lsmt->metadata_lock);
+      if (it->sources[i].type == 0) {
+        sl_iterator_close(&it->sources[i].iter.mem_it);
+      } else {
+        sst_iterator_close(&it->sources[i].iter.sst_it);
+      }
+    }
+    
+    free(it->sources);
     it->active = false;
   }
 }
 
 kv_record_t lsmt_iterator_next(lsmt_iterator_t *it) {
-  kv_record_t result = {0};
-  if (!it->active) return result;
+  kv_record_t min_record = {0};
+  int min_idx = -1;
 
-  /* Fetch from memtable. */
-  if (it->memtable_it.active) {
-    sl_kv_t sl_record = sl_iterator_next(&it->memtable_it); 
-    if (it->memtable_it.active) return raw_data_to_record(sl_record);
-    sl_iterator_close(&it->memtable_it);
+  /* Iterate all sources to find the smallest key */
+  for (size_t i = 0; i < it->source_count; i++) {
+    /* Ensure this source has data ready to peek */
+    source_ensure_buffered(&it->sources[i]);
 
-    /* Start fetching from the sstables. */
-    pthread_mutex_lock(&it->lsmt->metadata_lock);
-    it->sst_list = it->lsmt->metadata->list;
+    if (!it->sources[i].active || !it->sources[i].has_buffered) continue;
+
+    /* Logic to pick minimum key */
+    if (min_idx == -1) {
+      min_idx = (int)i;
+    } else {
+      sl_uint128_t k1 = it->sources[i].buffered_record.key;
+      sl_uint128_t k2 = it->sources[min_idx].buffered_record.key;
+      
+      if (key_compare(k1, k2) < 0) {
+        min_idx = (int)i;
+      }
+   }
   }
 
-  /* Fetch from sstables. */
-  while (it->sst_list != NULL) {
-    if (!it->sst_it.active) {
-      it->sst_it = sst_iterator_create(it->sst_list->content, it->start_key,
-          it->end_key);
-    }
-
-    if (it->sst_it.active) {
-      kv_record_t record = sst_iterator_next(&it->sst_it);
-      if (it->sst_it.active) return record;
-    }
-
-    sst_iterator_close(&it->sst_it);
-    it->sst_list = it->sst_list->next;
+  if (min_idx != -1) {
+    /* We found the smallest key. Return it and invalidate the buffer 
+     * for that source so it refills next time. */
+    min_record = it->sources[min_idx].buffered_record;
+    it->sources[min_idx].has_buffered = false; 
+    return min_record;
   }
 
+  /* No active sources left */
   lsmt_iterator_close(it);
-  return result;
+  return min_record;
 }
