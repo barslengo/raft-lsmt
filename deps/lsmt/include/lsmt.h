@@ -30,8 +30,7 @@ typedef struct kv_record {
 
 typedef struct sst_iterator {
   bool active;
-  FILE *fp;
-  char *io_buff; //read buffer
+  sst_metadata_record_t *meta;
   sl_uint128_t start_key;
   sl_uint128_t end_key;
 } sst_iterator_t;

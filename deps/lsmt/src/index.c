@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "index.h"
 
 #define DEFAULT_CAPACITY 1024
@@ -41,46 +42,38 @@ int index_flush(const index_t *index, const char *filename) {
   if (index == NULL) return 0;
   FILE *fp = fopen(filename, "wb");
 
+  uint32_t buf_size = sizeof(index_block_t);
   for (size_t i = 0; i < index->current; i++) {
-    sl_uint128_t key = index->blocks[i].key;
-    uint64_t offset = index->blocks[i].offset;
+    uint8_t buf[buf_size];
+    uint32_t off = 0;
 
-    if (fwrite(&key, sizeof(key), 1, fp) != 1) {
-      perror("Error on writing index");
-      exit(1);
-      return -1;
-    }
+    memcpy(buf + off, &index->blocks[i].key, sizeof(index->blocks[i].key));
+    off += sizeof(index->blocks[i].key);
+    memcpy(buf + off, &index->blocks[i].offset, sizeof(index->blocks[i].offset));
+    off += sizeof(index->blocks[i].offset);
 
-    if (fwrite(&offset, sizeof(offset), 1, fp) != 1) {
-      perror("Error on writing index");
+    if (fwrite(buf, off, 1, fp) != 1) {
+      perror("Error on writing index record.");
       exit(1);
       return -1;
     }
   }
-  /*
-  if (fwrite(index->blocks, sizeof(*index->blocks), index->current, fp) != index->current) {
-    perror("Error on writing index");
-    exit(1);
-    return -1;
-  }
-*/
+
   fclose(fp);
   return 0;
 }
 
 index_t *index_load(FILE* stream) {
   index_t *index = NULL;
-  sl_uint128_t key; 
-  uint64_t offset;
+  index_block_t ib;
+  const size_t rec_size = sizeof(ib.key) + sizeof(ib.offset);
+  uint8_t buf[rec_size];
 
-  while (fread(&key, sizeof(key), 1, stream) == 1 &&
-    fread(&offset, sizeof(offset), 1, stream) == 1) {
-
-    index = index_add(index, key, offset);
+  while (fread(buf, 1, rec_size, stream) == rec_size) {
+    memcpy(&ib.key, buf, sizeof(ib.key));
+    memcpy(&ib.offset, buf + sizeof(ib.key), sizeof(ib.offset));
+    index = index_add(index, ib.key, ib.offset);
   }
-
-  //printf("[INDEX] LOADED, size=%ld \n", index->current);
-  //fflush(stdout);
   return index;
 }
 

@@ -4,7 +4,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include "utils.h"
+#include "index.h"
 
 typedef struct queue queue_t;
 
@@ -17,6 +19,9 @@ typedef struct sst_metadata_record {
   uint64_t total_bytes;
   sl_uint128_t min_key;
   sl_uint128_t max_key;
+  index_t *cached_index;
+  FILE *cached_fp;
+  atomic_int refcount;
 } sst_metadata_record_t;
 
 typedef struct sst_node {
@@ -45,10 +50,14 @@ typedef struct sst_metadata {
 
 sst_metadata_t *sst_metadata_init(const char *path);
 sst_metadata_t *sst_metadata_load(const char *path);
+
+void sst_metadata_record_release(sst_metadata_record_t *meta);
+void sst_metadata_record_retain(sst_metadata_record_t *meta);
+
 int sst_metadata_free(sst_metadata_t *sst_meta);
 int sst_metadata_flush(sst_metadata_t *sst_meta);
 int sst_metadata_add(sst_metadata_t *sst_meta, sst_metadata_record_t record); 
-sst_metadata_record_t sst_metadata_pop(sst_metadata_t *sst_meta, uint8_t tier);
+sst_metadata_record_t *sst_metadata_pop(sst_metadata_t *sst_meta, uint8_t tier);
 sst_metadata_record_t create_sst_metadata(uint64_t id, uint32_t level, uint64_t size, sl_uint128_t min_key, sl_uint128_t max_key, char* sst_path, char *index_path);
 sst_metadata_record_t sst_metadata_lookup(sst_metadata_t *sst_meta, sl_uint128_t key);
 

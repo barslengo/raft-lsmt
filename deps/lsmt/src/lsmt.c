@@ -85,10 +85,21 @@ static sst_file_paths_t new_sstable_filename(const char *dir) {
 }
 
 static bool read_record_header(FILE *fp, sl_uint128_t *key, uint8_t *type, uint32_t *length) {
-  return (fread(key, sizeof(sl_uint128_t), 1, fp) == 1 &&
-        fread(type, sizeof(uint8_t), 1, fp) == 1 &&
-        fread(length, sizeof(uint32_t), 1, fp) == 1); 
+ /* Key(16) + Type(1) + Len(4) = 21 Bytes */
+  uint8_t buf[21]; 
+
+  if (fread(buf, 1, 21, fp) != 21) {
+    return false;
+  }
+
+  /* Unpack Buffer */
+  memcpy(key, buf, 16);
+  *type = buf[16];
+  memcpy(length, buf + 17, 4);
+
+  return true;
 }
+
 
 typedef struct written_record {
   sl_uint128_t key;
@@ -157,15 +168,19 @@ static written_record_t write_min_record(FILE *out, FILE *sstables[], uint8_t ss
   return result;
 }
 
-static sst_metadata_record_t sst_merge(sst_metadata_record_t records[], uint8_t length, const char *db_path) { 
+static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t length, const char *db_path) {
   sst_file_paths_t file_paths = new_sstable_filename(db_path);
 
-  FILE *fp[length];
+  FILE *fp[length]; // Local file handles for compaction only
+  
   for (uint8_t i = 0; i < length; i++) {
-    if (!(fp[i] = fopen(records[i].sstable_filename, "rb"))){
-      perror("Failed to open existing sstable!");
-      exit(1);
+    fp[i] = fopen(records[i]->sstable_filename, "rb");
+    if (!fp[i]) {
+      perror("Failed to open existing sstable for merge!");
+      exit(1); 
     }
+    /* User large buffer for sequential merge scan */
+    setvbuf(fp[i], NULL, _IOFBF, 128 * 1024);
   }
 
   FILE *new_file = fopen(file_paths.sst_file, "wb");
@@ -173,6 +188,8 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t records[], uint8_t 
     perror("Failed to open db file!");
     exit(1);
   }
+  // Buffer for writing
+  setvbuf(new_file, NULL, _IOFBF, 128 * 1024);
 
   uint64_t offset = 0;
   written_record_t record;
@@ -210,18 +227,17 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t records[], uint8_t 
   }
 
   fclose(new_file);
+
+  for (uint8_t i = 0; i < length; i++) {
+    fclose(fp[i]);
+  }
+
   //snprintf(sst_path, sizeof(sst_path), "%s/%s", db_path, file_paths.index_file); 
   index_flush(index, file_paths.index_file);
   index_free(index);
 
-  for (uint8_t i = 0; i < length; i++) {
-    fclose(fp[i]);
-    remove(records[i].sstable_filename);
-    remove(records[i].sst_index_filename);
-  }
-
-  sst_metadata_record_t metadata = create_sst_metadata(records[0].id,
-                                                       (records[0].level)+1,
+  sst_metadata_record_t metadata = create_sst_metadata(records[0]->id,
+                                                       (records[0]->level)+1,
                                                        offset,
                                                        min_key, max_key,
                                                        file_paths.sst_file,
@@ -256,20 +272,20 @@ static int sst_compact(sst_metadata_t *sst_meta, const char *db_path, pthread_mu
       uint8_t j = 0;
       double tot_size = 0;
       double size_delta = tier_size - tier_size_threshold;
-      sst_metadata_record_t records[SSTABLE_MERGE_LIMIT];
+      sst_metadata_record_t *records[SSTABLE_MERGE_LIMIT];
 
       /* This is not the optimal way, i should choose the sstables so that the
        * sum of their size is the minimum above "max_level_size". Or some other
        * heuristic anyway. */
       while (j < 2 || (j < SSTABLE_MERGE_LIMIT && tot_size <= size_delta)) {
-        sst_metadata_record_t record = sst_metadata_pop(sst_meta, tier);  
+        sst_metadata_record_t *record = sst_metadata_pop(sst_meta, tier);  
 
-        if (record.total_bytes == 0) {
+        if (!record || record->total_bytes == 0) {
           break;
         }
 
         records[j] = record; 
-        tot_size += records[j].total_bytes;
+        tot_size += records[j]->total_bytes;
         j++;
       }
 
@@ -284,9 +300,10 @@ static int sst_compact(sst_metadata_t *sst_meta, const char *db_path, pthread_mu
 
       /* Store the files to be deleted later on. */
       for (int k = 0; k < j; k++) {
-        strncpy(files_to_remove[delete_count].sst_path, records[k].sstable_filename, 255);
-        strncpy(files_to_remove[delete_count].idx_path, records[k].sst_index_filename, 255);
+        strncpy(files_to_remove[delete_count].sst_path, records[k]->sstable_filename, 255);
+        strncpy(files_to_remove[delete_count].idx_path, records[k]->sst_index_filename, 255);
         delete_count++;
+        sst_metadata_record_release(records[k]);
       }
 
       must_flush = true;
@@ -343,18 +360,43 @@ static void *dump_to_disk(void *arg) {
   sl_uint128_t min_key = node->key; 
   sl_uint128_t max_key = min_key;
 
+  uint8_t *buf = NULL;
+  size_t capacity = 256;
+
+  buf = malloc(capacity);
+  if (!buf) {
+    perror("malloc on dumping sst to disk");
+    exit(1);
+  }
+
   while(node != NULL) {
-    if (fwrite(&node->key, sizeof(sl_uint128_t), 1, fp) != 1) {
-      perror("[MemDump - key] Failed to write key to disk !");
-      exit(1);
+    uint8_t *data = (uint8_t*)node->content;
+
+    uint32_t record_content_size;
+    memcpy(&record_content_size, data + sizeof(uint8_t), sizeof(uint32_t));
+
+    size_t buf_size = RECORD_HEADER_SIZE + record_content_size;
+
+    /* grow buffer if needed */
+    if (buf_size > capacity) {
+      size_t new_cap = buf_size * 2;
+      uint8_t *tmp = realloc(buf, new_cap);
+      if (!tmp) {
+        perror("realloc buffer for kv record dump.");
+        free(buf);
+        fclose(fp);
+        exit(1);
+      }
+      buf = tmp;
+      capacity = new_cap;
     }
 
-    uint8_t *data = (uint8_t*)node->content;
-    uint32_t *size = (uint32_t *)(data+1);
-    uint64_t buf_size = sizeof(uint8_t) + sizeof(uint32_t) + (*size);
+    memcpy(buf, &node->key, sizeof(sl_uint128_t));
+    memcpy(buf + sizeof(sl_uint128_t), data, buf_size - sizeof(sl_uint128_t));
 
-    if (fwrite(data, buf_size, 1, fp) != 1) {
-      perror("[MemDump - content] Failed to write to disk");
+    if (fwrite(buf, buf_size, 1, fp) != 1) {
+      perror("Failed to write kv record to disk");
+      free(buf);
       exit(1);
     }
 
@@ -362,7 +404,7 @@ static void *dump_to_disk(void *arg) {
       index = index_add(index, node->key, offset);
     }
 
-    offset += RECORD_HEADER_SIZE + (*size);
+    offset += buf_size; 
     max_key = node->key;
     node = node->next;
   }
@@ -380,10 +422,10 @@ static void *dump_to_disk(void *arg) {
   }
 
   fclose(fp);
+  free(buf);
 
   index_flush(index, files.index_file); 
   index_free(index);
-  //sl_free(memtable);
   sl_release(memtable);
 
   sst_metadata_record_t metadata = create_sst_metadata(0, 0, offset, min_key, max_key, files.sst_file, files.index_file);
@@ -542,59 +584,67 @@ static kv_record_t raw_data_to_record(sl_kv_t raw) {
 
 static sst_iterator_t sst_iterator_create(sst_metadata_record_t *sst,
     sl_uint128_t start_key, sl_uint128_t end_key) {
+
+  sst_metadata_record_retain(sst);
   sst_metadata_record_t sst_info = *sst;
 
   sst_iterator_t it = {0};
   it.active = false;
+  it.meta = NULL;
 
   if (key_compare(sst_info.max_key, start_key) < 0 || 
       key_compare(sst_info.min_key, end_key) > 0) {
+    sst_metadata_record_release(sst);
     return it;
   }
 
-  /* Get the key offset reading the index file. */
-  index_t *index = index_load_from_disk(sst_info.sst_index_filename); 
-  uint64_t offset = index_lookup(index, start_key);
-  index_free(index);
+  /* Ensure index file is loaded. */
+  if (sst->cached_index == NULL) {
+    sst->cached_index = index_load_from_disk(sst_info.sst_index_filename); 
+    if (!sst->cached_index) {
+      fprintf(stderr, "Failed to load index for %s\n", sst->sstable_filename);
+      sst_metadata_record_release(sst);
+      return it;
+    }
+  }
+
+  /* Ensure the sst file is loaded. */
+  if (sst->cached_fp == NULL) {
+    sst->cached_fp = fopen(sst_info.sstable_filename, "rb");
+    if (!sst->cached_fp) {
+      sst_metadata_record_release(sst);
+      return it;
+    }
+    /* Set the read buffer to 64KB to improve sequential reads. */
+    setvbuf(sst->cached_fp, NULL, _IOFBF, 65536);
+  }
 
   /* Open the sstable file starting from the key offset. */
-  FILE *fp = fopen(sst_info.sstable_filename, "rb");
-  if (!fp) {
-    return it;
-  }
-
-  /* Set the read buffer to 64KB to improve sequential reads. */
-  char *io_buf = malloc(65536);
-  setvbuf(fp, io_buf, _IOFBF, 65536);
-
-  fseek(fp, offset, SEEK_SET);
+  uint64_t offset = index_lookup(sst->cached_index, start_key);
+  fseek(sst->cached_fp, offset, SEEK_SET);
 
   it.active = true;
-  it.fp = fp;
   it.start_key = start_key;
   it.end_key = end_key;
+  it.meta = sst;
   return it;
 }
 
 static void sst_iterator_close(sst_iterator_t *it) {
-  if (it && it->active && it->fp) {
-    fclose(it->fp);
-    if (it->io_buff) free(it->io_buff);
-
-    it->fp = NULL;
-    it->io_buff = NULL;
+  if (it && it->active) {
+    sst_metadata_record_release(it->meta);
+    it->meta = NULL;
     it->active = false;
   }
 }
 
 static kv_record_t sst_iterator_next(sst_iterator_t *it) {
   kv_record_t record = {0};
-  if (!it || !it->active || !it->fp) {
+  if (!it || !it->active || !it->meta) {
       return record; 
   }
 
-  FILE *fp = it->fp;
-
+  FILE *fp = it->meta->cached_fp;
   sl_uint128_t fetched_key; 
   uint8_t type;
   uint32_t length;
@@ -765,7 +815,7 @@ void lsmt_iterator_close(lsmt_iterator_t *it) {
         sst_iterator_close(&it->sources[i].iter.sst_it);
       }
     }
-    
+
     free(it->sources);
     it->active = false;
   }

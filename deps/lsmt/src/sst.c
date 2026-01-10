@@ -28,10 +28,36 @@ static int tier_free(sst_metadata_t *sst_meta, uint8_t max_tier) {
   return 0;
 }
 
+void sst_metadata_record_retain(sst_metadata_record_t *meta) {
+  if (meta) {
+    atomic_fetch_add(&meta->refcount, 1);
+  }
+}
+
+void sst_metadata_record_release(sst_metadata_record_t *meta) {
+  if (!meta) return;
+
+  if (atomic_fetch_sub(&meta->refcount, 1) == 1) {
+    if (meta->cached_index) {
+      index_free(meta->cached_index);
+      meta->cached_index = NULL;
+    }
+    if (meta->cached_fp) {
+      fclose(meta->cached_fp);
+      meta->cached_fp = NULL;
+    }
+    free(meta);
+  }
+}
+
 static sst_node_t *new_node(sst_metadata_record_t content) {
   sst_node_t *node = malloc(sizeof(sst_node_t));
   node->content = malloc(sizeof(sst_metadata_record_t));
+
+  content.cached_index = NULL;
+  content.cached_fp = NULL;
   *node->content = content; 
+  atomic_init(&node->content->refcount, 1);
 
   node->next = NULL;
   node->prev = NULL;
@@ -40,7 +66,9 @@ static sst_node_t *new_node(sst_metadata_record_t content) {
 
 static void node_free(sst_node_t *node) {
   if (!node) return;
-  if (node->content) free(node->content);
+  if (node->content) {
+    sst_metadata_record_release(node->content);
+  }
   free(node);
 }
 
@@ -111,6 +139,8 @@ sst_metadata_record_t create_sst_metadata(uint64_t id, uint32_t level,
     .min_key = min_key,
     .max_key = max_key
   };
+  metadata.cached_index = NULL;
+  metadata.cached_fp = NULL;
 
   strncpy(metadata.sstable_filename, sst_path, 128 - 1); 
   metadata.sstable_filename[128-1] = '\0';
@@ -149,16 +179,30 @@ int sst_metadata_flush(sst_metadata_t *sst_meta) {
   fwrite(&sst_meta->highest_tier, sizeof(sst_meta->highest_tier), 1, fp);
 
   sst_node_t *node = sst_meta->list;
+  size_t meta_max_size = sizeof(sst_metadata_record_t);
   while (node != NULL) {
+    uint8_t buf[meta_max_size];
+    uint32_t off = 0;
     sst_metadata_record_t data = *node->content;
-    fwrite(data.sstable_filename, sizeof(data.sstable_filename), 1, fp);
-    fwrite(data.sst_index_filename, sizeof(data.sst_index_filename), 1, fp);
-    fwrite(&data.id, sizeof(data.id), 1, fp);
-    fwrite(&data.level, sizeof(data.level), 1, fp);
-    fwrite(&data.created_at, sizeof(data.created_at), 1, fp);
-    fwrite(&data.total_bytes, sizeof(data.total_bytes), 1, fp);
-    fwrite(&data.min_key, sizeof(data.min_key), 1, fp);
-    fwrite(&data.max_key, sizeof(data.max_key), 1, fp);
+
+    memcpy(buf + off, data.sstable_filename, sizeof(data.sstable_filename));
+    off += sizeof(data.sstable_filename);
+    memcpy(buf + off, data.sst_index_filename, sizeof(data.sst_index_filename));
+    off += sizeof(data.sst_index_filename);
+    memcpy(buf + off, &data.id, sizeof(data.id));
+    off += sizeof(data.id);
+    memcpy(buf + off, &data.level, sizeof(data.level));
+    off += sizeof(data.level);
+    memcpy(buf + off, &data.created_at, sizeof(data.created_at));
+    off += sizeof(data.created_at);
+    memcpy(buf + off, &data.total_bytes, sizeof(data.total_bytes));
+    off += sizeof(data.total_bytes);
+    memcpy(buf + off, &data.min_key, sizeof(data.min_key));
+    off += sizeof(data.min_key);
+    memcpy(buf + off, &data.max_key, sizeof(data.max_key));
+    off += sizeof(data.max_key);
+
+    fwrite(buf, off, 1, fp);
     node = node->next;
   }
 
@@ -174,30 +218,6 @@ int sst_metadata_flush(sst_metadata_t *sst_meta) {
     exit(1);
   }
 
-  /*
-  // header metadata
-  fprintf(fp, "version: %d\n", meta->version); 
-  fprintf(fp, "last_dump_offset: %d\n", meta->last_dump_offset);
-  fprintf(fp, "highest_tier: %d\n", meta->highest_tier);
-
-  // SSTable metadata 
-  fprintf(fp, "--- SSTables ---\n");
-  dll_node_t *node = meta->sst_metadata.data->head;
-  while (node != NULL) {
-    sstable_metadata_record_t data = *node->content;
-    fprintf(fp, "[SSTable]\n");
-    fprintf(fp, "file_path: %s\n", data.sstable_filename);
-    fprintf(fp, "index_path: %s\n", data.sst_index_filename);
-    fprintf(fp, "id: %d\n", data.id);
-    fprintf(fp, "level: %d\n", data.level);
-    fprintf(fp, "created_at: %ld\n", data.created_at);
-    fprintf(fp, "total_bytes: %ld\n", data.total_bytes);
-    fprintf(fp, "min_key: %lu%ld\n", data.min_key.id, data.min_key.timestamp);
-    fprintf(fp, "max_key: %lu%ld\n", data.max_key.id, data.max_key.timestamp);
-    fprintf(fp, "\n");
-    node = node->next;
-  }
-  */
   fclose(fp);
 
   if (rename(temp_path, sst_meta->disk_path) != 0) {
@@ -222,18 +242,21 @@ int sst_metadata_add(sst_metadata_t *sst_meta, sst_metadata_record_t record) {
   return 0;
 }
 
-sst_metadata_record_t sst_metadata_pop(sst_metadata_t *sst_meta, uint8_t tier) {
+/*The caller will own the metadata_record reference. */
+sst_metadata_record_t *sst_metadata_pop(sst_metadata_t *sst_meta, uint8_t tier) {
   sst_node_t *node = (sst_node_t*)dequeue(sst_meta->tier[tier]);
 
   if (!node) {
-    /*this should never happen.. */
-    return (sst_metadata_record_t){0};
+    return NULL;
   }
 
-  sst_metadata_record_t record = *(node->content);
+  sst_metadata_record_t *record = node->content;
 
+  /* Detach content form the node so node_free doesnt decrement the refcount. */
+  node->content = NULL;
   sst_meta->list = node_remove(sst_meta->list, node);
-  sst_meta->tier_size[record.level] = fmax(0, sst_meta->tier_size[record.level] - record.total_bytes);
+
+  sst_meta->tier_size[record->level] = fmax(0, sst_meta->tier_size[record->level] - record->total_bytes);
 
   return record;
 }
