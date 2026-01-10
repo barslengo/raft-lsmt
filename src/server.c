@@ -23,9 +23,9 @@
 
 #define BATCH_SIZE 4096 //1024 //128
 #define CONTENT_MAX_SIZE 255
-#define QUERY_BYTES_LIMIT (512 * 1024) //512 KB 
+#define QUERY_BYTES_LIMIT (1 * 1024 * 1024) //1 MB 
 #define QUERY_REQ_SIZE (sizeof(uint64_t) + 2 * sizeof(sl_uint128_t)) //40 bytes.
-#define QUERY_BUDGET_NS (1 * 1000 * 1000)  // 1ms 
+#define QUERY_BUDGET_NS (30 * 1000 * 1000)  // 30ms 
 
 static char ACK_BUFFER[BATCH_SIZE];
 const uint8_t CONTENT_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t); 
@@ -858,7 +858,7 @@ static uint64_t serialize_response(query_response_t response, uint8_t **result) 
 
   // Body Serialization
   /* Body header. */
-  memcpy(out, &body_size, sizeof(body_size));
+  memcpy(out + offset, &body_size, sizeof(body_size));
   offset += sizeof(body_size);
   memcpy(out + offset, &response.records_count, sizeof(response.records_count));
   offset += sizeof(response.records_count);
@@ -967,6 +967,7 @@ static bool process_query_buffer(client_t *client, uint64_t budget_ns) {
     size_t records_capacity = 2048;
     uint32_t records_count = 0;
     size_t records_bytes = 0;
+    bool time_limit_hit = false;
     kv_record_t *records = malloc(sizeof(kv_record_t) * records_capacity); 
     if (!records) {
       fprintf(stderr, "OOM allocating records\n");
@@ -980,13 +981,18 @@ static bool process_query_buffer(client_t *client, uint64_t budget_ns) {
      * determine the key range of successfully retrieved records in order
      * to correctly support paging.
      */
-    sl_uint128_t min_key;
-    min_key.id = UINT64_MAX; min_key.timestamp = UINT64_MAX;
-    sl_uint128_t max_key; // !!!id=0 is reserved for the skiplist.
-    max_key.id = 1; max_key.timestamp = 0;
-    //printf("Loading records..\n");
+    sl_uint128_t min_key = { .id = UINT64_MAX, .timestamp = UINT64_MAX };
+    // !!!id=0 is reserved for the skiplist.
+    sl_uint128_t max_key = { .id = 1, .timestamp = 0 };
+
+   //printf("Loading records..\n");
     lsmt_iterator_t it = lsmt_iterator_create(db, start_key, end_key);
     while (it.active) {
+      if (records_count > 0 && uv_hrtime() > deadline) {
+        time_limit_hit = true;
+        break;
+      }
+
       kv_record_t record = lsmt_iterator_next(&it);
       if (!it.active) break;
 
@@ -1039,7 +1045,7 @@ static bool process_query_buffer(client_t *client, uint64_t budget_ns) {
     query_response_t response = {0};
     response.req_id = req_id;
     response.records_count = records_count;
-    response.limit_reached = records_bytes > QUERY_BYTES_LIMIT ? true : false;
+    response.limit_reached = (records_bytes > QUERY_BYTES_LIMIT) || time_limit_hit;
     response.min_key = min_key;
     response.max_key = max_key;
     response.records = records;
@@ -1169,19 +1175,27 @@ static void on_read_connection(uv_stream_t *server_handle, int status) {
   client->server = s;
   client->handle.data = client; 
   client->closing = false;
-
   client->query_async_pending = false;
-  uv_async_init(s->loop, &client->query_async, on_query_async);
-  client_retain(client);
-  client->query_async.data = client;
 
-  client_retain(client);
-  client->ctx.query.total_queries = 0;
-  client->ctx.query.active_query_start_ts = 0;
   uv_tcp_init(s->loop, &client->handle);
-
   if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
+
+    if (s->raft.state == RAFT_LEADER) {
+      Log(s->id, "TCP: Rejecting query client (I'm the Leader).");
+      client_retain(client);
+      uv_close((uv_handle_t *)&client->handle, on_client_close);
+      return;
+    }
+
     Log(s->id, "TCP: New query client connected.");
+    uv_async_init(s->loop, &client->query_async, on_query_async);
+    client_retain(client);
+    client->query_async.data = client;
+
+    client_retain(client);
+    client->ctx.query.total_queries = 0;
+    client->ctx.query.active_query_start_ts = 0;
+
     add_client(s, client, CLIENT_TYPE_QUERY);
 
     uv_tcp_keepalive(&client->handle, 1, 60);
