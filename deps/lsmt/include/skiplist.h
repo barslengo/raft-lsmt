@@ -18,6 +18,9 @@ typedef struct sl {
   size_t size;
   size_t levels;
   atomic_int refcount;
+
+  sl_uint128_t min_key;
+  sl_uint128_t max_key;
 } sl_t;
 
 typedef struct {

@@ -115,6 +115,11 @@ sl_t* sl_init() {
   skiplist->bottom_level = head;
   atomic_init(&skiplist->refcount, 1);
 
+  skiplist->min_key.id = UINT64_MAX;
+  skiplist->min_key.timestamp = UINT64_MAX;
+
+  skiplist->max_key.id = 0;
+  skiplist->max_key.timestamp = 0;
   return skiplist;
 }
 
@@ -245,6 +250,13 @@ int sl_insert(sl_t *skiplist, sl_uint128_t key, void *content, size_t content_si
   if (skiplist == NULL || skiplist->top_level == NULL) {
     printf("Invalid skiplist");
     return -1;
+  }
+
+  if (key_compare(key, skiplist->min_key) < 0) {
+    skiplist->min_key = key;
+  }
+  if (key_compare(key, skiplist->max_key) > 0) {
+    skiplist->max_key = key;
   }
 
   //search for bottom level position for the new node

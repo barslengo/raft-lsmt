@@ -21,6 +21,7 @@ typedef struct sst_metadata_record {
   sl_uint128_t max_key;
   index_t *cached_index;
   FILE *cached_fp;
+  bool old;
   atomic_int refcount;
 } sst_metadata_record_t;
 
@@ -60,6 +61,6 @@ int sst_metadata_add(sst_metadata_t *sst_meta, sst_metadata_record_t record);
 sst_metadata_record_t *sst_metadata_pop(sst_metadata_t *sst_meta, uint8_t tier);
 sst_metadata_record_t create_sst_metadata(uint64_t id, uint32_t level, uint64_t size, sl_uint128_t min_key, sl_uint128_t max_key, char* sst_path, char *index_path);
 sst_metadata_record_t sst_metadata_lookup(sst_metadata_t *sst_meta, sl_uint128_t key);
-
+uint32_t sst_count(sst_metadata_t *sst_meta, uint8_t tier);
 #endif
 

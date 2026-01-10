@@ -46,6 +46,12 @@ void sst_metadata_record_release(sst_metadata_record_t *meta) {
       fclose(meta->cached_fp);
       meta->cached_fp = NULL;
     }
+
+    if (meta->old) {
+      remove(meta->sstable_filename);
+      remove(meta->sst_index_filename);
+    }
+
     free(meta);
   }
 }
@@ -56,6 +62,7 @@ static sst_node_t *new_node(sst_metadata_record_t content) {
 
   content.cached_index = NULL;
   content.cached_fp = NULL;
+  content.old = false;
   *node->content = content; 
   atomic_init(&node->content->refcount, 1);
 
@@ -264,6 +271,6 @@ sst_metadata_record_t *sst_metadata_pop(sst_metadata_t *sst_meta, uint8_t tier) 
   return record;
 }
 
-uint32_t get_sst_count(sst_metadata_t *sst_meta, uint8_t tier) {
+uint32_t sst_count(sst_metadata_t *sst_meta, uint8_t tier) {
   return sst_meta->tier[tier]->size;
 }

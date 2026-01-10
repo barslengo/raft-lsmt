@@ -257,7 +257,12 @@ typedef struct {
 /* Iterate over all the tiers and compact the sstables
  * whose sum of their size exceed the tier threshold. */
 static int sst_compact(sst_metadata_t *sst_meta, const char *db_path, pthread_mutex_t *mutex) {
-  files_to_delete_t files_to_remove[128];
+
+  /* This buffer holds the merged sstables from all the tier processed
+   * in this cycle. They are holded until the metadata are flushed to disk
+   * to avoid data loss.
+   */
+  sst_metadata_record_t *sst_to_delete[256];
   int delete_count = 0;
   bool must_flush = false;
 
@@ -279,33 +284,52 @@ static int sst_compact(sst_metadata_t *sst_meta, const char *db_path, pthread_mu
       /* This is not the optimal way, i should choose the sstables so that the
        * sum of their size is the minimum above "max_level_size". Or some other
        * heuristic anyway. */
-      while (j < 2 || (j < SSTABLE_MERGE_LIMIT && tot_size <= size_delta)) {
-        sst_metadata_record_t *record = sst_metadata_pop(sst_meta, tier);  
+      while (j < SSTABLE_MERGE_LIMIT) {
+        /* Stop if enough files are found AND enough size cleared. */
+        if (j >= 2 && tot_size > size_delta) break;
 
-        if (!record || record->total_bytes == 0) {
-          break;
-        }
+        /* Check if tier is empty before popping. */
+        if (sst_count(sst_meta, tier) == 0) break;
+
+        sst_metadata_record_t *record = sst_metadata_pop(sst_meta, tier);  
+        if (!record) break; 
 
         records[j] = record; 
         tot_size += records[j]->total_bytes;
         j++;
       }
 
+      /* 
+       * Merging 1 or zero files makes no sense.
+       */
+      if (j < 2) {
+        //TODO: push back the popped records into the metadata list.
+        printf("Tried to merge %d files!, quitting.\n", j);
+        pthread_mutex_unlock(mutex);
+        exit(1);
+        continue; 
+      }
+ 
       /* Merge the selected sstables into a new one with incremented tier. 
        * If returns any error, then i must push back the records into the metadata list. (TODO) */
       pthread_mutex_unlock(mutex);
 
       sst_metadata_record_t new_sst = sst_merge(records, j, db_path);
-      pthread_mutex_lock(mutex);
 
+      pthread_mutex_lock(mutex);
       sst_metadata_add(sst_meta, new_sst); 
 
-      /* Store the files to be deleted later on. */
+      /* Store the sst to be deleted later on. */
       for (int k = 0; k < j; k++) {
-        strncpy(files_to_remove[delete_count].sst_path, records[k]->sstable_filename, 255);
-        strncpy(files_to_remove[delete_count].idx_path, records[k]->sst_index_filename, 255);
-        delete_count++;
-        sst_metadata_record_release(records[k]);
+        if (delete_count < 256) {
+          sst_to_delete[delete_count++] = records[k];
+        }
+        else {
+          /* if buffer is full then mark for file deletion
+           * and release it immediately. */
+          records[k]->old = true;
+          sst_metadata_record_release(records[k]);
+        }
       }
 
       must_flush = true;
@@ -323,13 +347,12 @@ static int sst_compact(sst_metadata_t *sst_meta, const char *db_path, pthread_mu
       fprintf(stderr, "Critical Error: Failed to flush metadata. Cannot delete old files.\n");
       exit(1);
     }
-
     pthread_mutex_unlock(mutex);
 
-    /* Delete the merged sstables from disk. */
+    /* Delete merged sst tables. */
     for (int k = 0; k < delete_count; k++) {
-      remove(files_to_remove[k].sst_path);
-      remove(files_to_remove[k].idx_path);
+      sst_to_delete[k]->old = true;
+      sst_metadata_record_release(sst_to_delete[k]);
     }
   }
   return 0;
@@ -484,6 +507,11 @@ lsmt_t *lsmt_init(const char *db_path) {
   lsmt_t *db = malloc(sizeof(lsmt_t));
   db->last_index = NULL;
   db->memtable = sl_init();
+  if (pthread_mutex_init(&db->memtable_lock, NULL) != 0) {
+    perror("LSMT INIT memtable_lock.");
+    exit(1);
+  }
+
   db->db_path = strdup(db_path);
 
   int res = ensureDir(db->db_path);
@@ -583,53 +611,55 @@ static kv_record_t raw_data_to_record(sl_kv_t raw) {
   return record;
 }
 
-
 static sst_iterator_t sst_iterator_create(sst_metadata_record_t *sst,
     sl_uint128_t start_key, sl_uint128_t end_key) {
 
-  sst_metadata_record_retain(sst);
-  sst_metadata_record_t sst_info = *sst;
-
   sst_iterator_t it = {0};
-  it.active = false;
   it.meta = NULL;
+  it.active = false;
 
-  if (key_compare(sst_info.max_key, start_key) < 0 || 
-      key_compare(sst_info.min_key, end_key) > 0) {
-    sst_metadata_record_release(sst);
+  if (key_compare(sst->max_key, start_key) < 0 || 
+      key_compare(sst->min_key, end_key) > 0) {
     return it;
   }
 
-  /* Ensure index file is loaded. */
-  if (sst->cached_index == NULL) {
-    sst->cached_index = index_load_from_disk(sst_info.sst_index_filename); 
-    if (!sst->cached_index) {
-      fprintf(stderr, "Failed to load index for %s\n", sst->sstable_filename);
-      sst_metadata_record_release(sst);
-      return it;
-    }
-  }
+  sst_metadata_record_retain(sst);
 
-  /* Ensure the sst file is loaded. */
-  if (sst->cached_fp == NULL) {
-    sst->cached_fp = fopen(sst_info.sstable_filename, "rb");
-    if (!sst->cached_fp) {
-      sst_metadata_record_release(sst);
-      return it;
-    }
-    /* Set the read buffer to 64KB to improve sequential reads. */
-    setvbuf(sst->cached_fp, NULL, _IOFBF, 65536);
-  }
-
-  /* Open the sstable file starting from the key offset. */
-  uint64_t offset = index_lookup(sst->cached_index, start_key);
-  fseek(sst->cached_fp, offset, SEEK_SET);
-
-  it.active = true;
+  it.meta = sst;
   it.start_key = start_key;
   it.end_key = end_key;
-  it.meta = sst;
+
+  /* active remains false until mounted! */
   return it;
+}
+
+static bool sst_iterator_mount(sst_iterator_t *it) {
+  if (!it->meta) return false;
+
+  sst_metadata_record_t *sst = it->meta;
+
+  /* Lazy Load Index. */
+  if (sst->cached_index == NULL) {
+    sst->cached_index = index_load_from_disk(sst->sst_index_filename); 
+    if (!sst->cached_index) {
+      fprintf(stderr, "Failed to load index for %s\n", sst->sstable_filename);
+      return false;
+    }
+  }
+
+  /* Lazy Open File. */
+  if (sst->cached_fp == NULL) {
+    sst->cached_fp = fopen(sst->sstable_filename, "rb");
+    if (!sst->cached_fp) return false;
+    /* Use small buffer to minimize read-amp during seek */
+    setvbuf(sst->cached_fp, NULL, _IOFBF, 16 * 1024);
+  }
+
+  uint64_t offset = index_lookup(sst->cached_index, it->start_key);
+  fseek(sst->cached_fp, offset, SEEK_SET);
+
+  it->active = true;
+  return true;
 }
 
 static void sst_iterator_close(sst_iterator_t *it) {
@@ -697,30 +727,101 @@ static kv_record_t sst_iterator_next(sst_iterator_t *it) {
 static void source_ensure_buffered(merge_source_t *src) {
   if (!src->active || src->has_buffered) return;
 
-  if (src->type == 0) { // Memtable
+  /* Memtable Type. */
+  if (src->type == 0) { 
     if (src->iter.mem_it.active) {
       sl_kv_t raw = sl_iterator_next(&src->iter.mem_it);
       if (src->iter.mem_it.active) {
         src->buffered_record = raw_data_to_record(raw);
         src->has_buffered = true;
-      } else {
+      }
+      else {
         src->active = false;
       }
-    } else {
+    }
+    else {
       src->active = false;
     }
-  } else { // SSTable
+  }
+  else { // SSTable
     if (src->iter.sst_it.active) {
       kv_record_t rec = sst_iterator_next(&src->iter.sst_it);
       if (src->iter.sst_it.active) {
         src->buffered_record = rec;
         src->has_buffered = true;
-      } else {
+      }
+      else {
         src->active = false;
       }
-    } else {
+    }
+    else {
       src->active = false;
     }
+  }
+}
+
+typedef struct {
+  merge_source_t *source;
+} mount_task_t;
+
+static void *mount_sst_worker(void *arg) {
+  mount_task_t *task = (mount_task_t *)arg;
+  merge_source_t *src = task->source;
+
+  // SSTable type.
+  if (src->type == 1) { 
+    // sst_iterator_mount will open the files and seek to the index.
+    if (sst_iterator_mount(&src->iter.sst_it)) {
+      src->active = true;
+    } else {
+      sst_iterator_close(&src->iter.sst_it);
+      src->active = false;
+    }
+  }
+
+  /* Read first Chunk */
+  source_ensure_buffered(src); 
+  return NULL;
+}
+
+static void sst_iterator_load_multithread(lsmt_iterator_t *iterator) {
+  const int MAX_THREAD_BATCH = 64; 
+
+  pthread_t threads[MAX_THREAD_BATCH];
+  mount_task_t args[MAX_THREAD_BATCH];
+  int active_threads = 0;
+
+  for (size_t i = 0; i < iterator->source_count; i++) {
+    // Memtable type.
+    if (iterator->sources[i].type == 0) {
+      source_ensure_buffered(&iterator->sources[i]);
+      continue;
+    }
+
+    //if (it.sources[i].type != 1) continue;
+
+    args[active_threads].source = &iterator->sources[i];
+    if (pthread_create(&threads[active_threads], NULL, mount_sst_worker, &args[active_threads]) == 0) {
+      active_threads++;
+    }
+    else {
+      /* If thread creation fails (OS limit), run immediately. */
+      mount_sst_worker(&args[active_threads]);
+    }
+
+    /* Check Batch Limit */
+    if (active_threads == MAX_THREAD_BATCH) {
+      /* Wait for this batch to finish before starting new ones. */
+      for (int k = 0; k < active_threads; k++) {
+        pthread_join(threads[k], NULL);
+      }
+      active_threads = 0; 
+    }
+  }
+
+  /* Flush remaining threads (if total count wasn't a multiple of 64) */
+  for (int k = 0; k < active_threads; k++) {
+    pthread_join(threads[k], NULL);
   }
 }
 
@@ -752,30 +853,44 @@ lsmt_iterator_t lsmt_iterator_create(lsmt_t *lsmt, sl_uint128_t start_key,
     node = node->next;
   }
 
+  /* Check if i must fetch the memtable. */
+  bool use_memtable = false;
+  pthread_mutex_lock(&lsmt->memtable_lock);
+  if (lsmt->memtable && lsmt->memtable->size > 0) {
+    bool is_left = key_compare(lsmt->memtable->max_key, start_key) < 0;
+    bool is_right = key_compare(lsmt->memtable->min_key, end_key) > 0;
+
+    use_memtable = (!is_left && !is_right);
+  }
+
+
+  //printf("[DEBUG] Iterator Sources: %lu SSTs + %d Memtable\n", valid_sst_count, use_memtable);
   /* Allocate sources: 1 Memtable + N *Valid* SSTables */
-  it.source_count = 1 + valid_sst_count;
+  it.source_count = (use_memtable ? 1 : 0) + valid_sst_count;
   it.sources = calloc(it.source_count, sizeof(merge_source_t));
   if (!it.sources) {
     perror("Failed to allocate iterator sources");
+    pthread_mutex_unlock(&lsmt->memtable_lock);
     pthread_mutex_unlock(&lsmt->metadata_lock);
     exit(1);
   }
 
+  size_t idx = 0;
   /* ---------------------------------------------------------
-   * INIT SOURCE 0: Memtable
+   * INIT SOURCE: Memtable
    * --------------------------------------------------------- */
-  pthread_mutex_lock(&lsmt->memtable_lock);
-  it.sources[0].type = 0;
-  it.sources[0].iter.mem_it = sl_iterator_create(lsmt->memtable, start_key, end_key);
-  it.sources[0].active = it.sources[0].iter.mem_it.active;
+  if (use_memtable) {
+    it.sources[idx].type = 0;
+    it.sources[idx].iter.mem_it = sl_iterator_create(lsmt->memtable, start_key, end_key);
+    it.sources[idx].active = it.sources[0].iter.mem_it.active;
+    idx++;
+  }
   pthread_mutex_unlock(&lsmt->memtable_lock);
 
   /* ---------------------------------------------------------
    * Initialize only the valid SSTables
    * --------------------------------------------------------- */
   node = lsmt->metadata->list;
-  size_t idx = 1;
-
   while(node) {
     sst_metadata_record_t *meta = node->content;
 
@@ -785,7 +900,6 @@ lsmt_iterator_t lsmt_iterator_create(lsmt_t *lsmt, sl_uint128_t start_key,
     if (!is_left_of_query && !is_right_of_query) {
       it.sources[idx].type = 1;
 
-      /* sst_iterator_create will open the file and seek to the index */
       it.sources[idx].iter.sst_it = sst_iterator_create(meta, start_key, end_key);
       it.sources[idx].active = it.sources[idx].iter.sst_it.active;
       idx++;
@@ -793,13 +907,26 @@ lsmt_iterator_t lsmt_iterator_create(lsmt_t *lsmt, sl_uint128_t start_key,
 
     node = node->next;
   }
-
   pthread_mutex_unlock(&lsmt->metadata_lock);
 
   /* Pre-fill buffers for the first comparison */
-  for (size_t i = 0; i < it.source_count; i++) {
-    source_ensure_buffered(&it.sources[i]);
-  }
+  sst_iterator_load_multithread(&it);
+  /*
+
+     for (size_t i = 0; i < it.source_count; i++) {
+     if (it.sources[i].type == 1) {
+
+     / sst_iterator_mount will perfom open the file and seek to the index.
+     if (sst_iterator_mount(&it.sources[i].iter.sst_it)) {
+     it.sources[i].active = true;
+     source_ensure_buffered(&it.sources[i]);
+     }
+     else {
+     sst_iterator_close(&it.sources[i].iter.sst_it);
+     }
+     }
+     }
+     */
   return it;
 }
 
