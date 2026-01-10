@@ -261,7 +261,9 @@ static int sst_compact(sst_metadata_t *sst_meta, const char *db_path, pthread_mu
   int delete_count = 0;
   bool must_flush = false;
 
+  pthread_mutex_lock(mutex);
   uint8_t highest_tier = sst_meta->highest_tier;
+  pthread_mutex_unlock(mutex);
 
   for (uint8_t tier = 0; tier < highest_tier; tier++) {
     pthread_mutex_lock(mutex);

@@ -93,19 +93,22 @@ static sst_node_t *node_add(sst_node_t *list, sst_node_t* node) {
 static sst_node_t *node_remove(sst_node_t *list, sst_node_t *node) {
   /* If node is the header. */
   if (node == list) {
+    sst_node_t *new_head = node->next;
+
+    if (new_head != NULL) {
+      new_head->prev = NULL;
+    }
+
     node_free(node);
-    return NULL;
+    return new_head;
   }
 
-  /*If prev node is the header, then i must update it. */
-  if (node->prev == list) {
-    list->next = node->next;
-  }
-  else {
+  /* Removing middle or tail node. */
+  if (node->prev) {
     node->prev->next = node->next;
   }
 
-  if (node->next != NULL) {
+  if (node->next) {
     node->next->prev = node->prev;
   }
 
