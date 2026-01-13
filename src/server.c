@@ -26,6 +26,7 @@
 #define QUERY_BYTES_LIMIT (1 * 1024 * 1024) //1 MB 
 #define QUERY_REQ_SIZE (sizeof(uint64_t) + 2 * sizeof(sl_uint128_t)) //40 bytes.
 #define QUERY_BUDGET_NS (30 * 1000 * 1000)  // 30ms 
+#define CACHE_TTL_MS (5 * 1000) //5 seconds
 
 static char ACK_BUFFER[BATCH_SIZE];
 const uint8_t CONTENT_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t); 
@@ -42,12 +43,23 @@ typedef struct __attribute__((packed)) {
 
 typedef struct query_response {
   bool limit_reached;
-  uint64_t req_id;
   uint32_t records_count;
-  kv_record_t *records;
+  uint64_t req_id;
+  uint64_t total_msg_size;
+  uint64_t records_bytes;
   sl_uint128_t min_key;
   sl_uint128_t max_key;
 } query_response_t;
+
+/* QUERY RESPONSE MSG SIZE. */
+static query_response_t __query_msg;
+static const uint32_t Q_RESP_HEADER_SIZE = sizeof(__query_msg.total_msg_size) + 
+                                    sizeof(__query_msg.req_id) + 
+                                    sizeof(__query_msg.limit_reached) +
+                                    sizeof(__query_msg.min_key) + 
+                                    sizeof(__query_msg.max_key) +
+                                    sizeof(__query_msg.records_bytes) + 
+                                    sizeof(__query_msg.records_count); 
 
 /* ========== CLUST CONFIG SECTION START ========== */
 typedef struct {
@@ -805,45 +817,11 @@ static void on_insert_connection(uv_stream_t *server_handle, int status) {
   }
 }
 
-
-
-/* response format: 
- * Header: [TOTAL_MSG_SIZE (8 Bytes) | REQ_ID (8 Bytes) | LIMIT (1 Byte) | MIN_KEY (16 bytes) | MAX_KEY (16 bytes)]
- * Body: [PAYLOAD_SIZE (8 Bytes) | RECORDS_COUNT (4 Bytes) | RECORDS]
- *
- * This function consumes and free the records pointed by the response obj.
- */
-static uint64_t serialize_response(query_response_t response, uint8_t **result) {
-  const uint32_t header_size = sizeof(uint64_t) + //total msg size
-                               sizeof(response.req_id) +
-                               sizeof(response.limit_reached) + 
-                               sizeof(response.min_key) +
-                               sizeof(response.max_key);
-
-  uint64_t body_size = sizeof(uint64_t) + //body size.
-                       sizeof(response.records_count); //total records.
-
-  const size_t key_size = sizeof(sl_uint128_t);
-  const size_t data_type_size = sizeof(uint8_t);
-  const size_t len_field_size = sizeof(uint32_t);
-  const int fixed_size =  key_size + len_field_size + data_type_size;
-
-  kv_record_t *records = response.records;
-  for (uint32_t i = 0; i < response.records_count; i++) {
-    body_size += fixed_size;
-    body_size += records[i].data_len;
-  }
- 
-  const uint64_t total_msg_size = header_size + body_size;
-  uint8_t *out = malloc(total_msg_size);
-  if (!out) {
-    printf("OOM on serializing data\n");
-    exit(1);
-  }
+static void set_query_response_header(uint8_t *out, query_response_t response) {
   uint64_t offset = 0;
   // Header Serialization
-  memcpy(out, &total_msg_size, sizeof(total_msg_size));
-  offset += sizeof(total_msg_size);
+  memcpy(out, &response.total_msg_size, sizeof(response.total_msg_size));
+  offset += sizeof(response.total_msg_size);
 
   memcpy(out + offset, &response.req_id, sizeof(response.req_id));
   offset += sizeof(response.req_id);
@@ -856,35 +834,14 @@ static uint64_t serialize_response(query_response_t response, uint8_t **result) 
   memcpy(out + offset, &response.max_key, sizeof(response.max_key));
   offset += sizeof(response.max_key);
 
-  // Body Serialization
   /* Body header. */
-  memcpy(out + offset, &body_size, sizeof(body_size));
-  offset += sizeof(body_size);
+  memcpy(out + offset, &response.records_bytes, sizeof(response.records_bytes));
+  offset += sizeof(response.records_bytes);
   memcpy(out + offset, &response.records_count, sizeof(response.records_count));
   offset += sizeof(response.records_count);
 
-  /* Body payload.
-   * Each record is serialized in the following order:
-   * [Key|DataType|DataLen|Data]. */
-  for (uint32_t i = 0; i < response.records_count; i++) {
-    memcpy(out + offset, &records[i].key, key_size); 
-    offset += key_size;
-
-    memcpy(out + offset, &records[i].data_type, data_type_size);
-    offset += data_type_size;
-
-    memcpy(out + offset, &records[i].data_len, len_field_size); 
-    offset += len_field_size; 
-
-    memcpy(out + offset, records[i].data, records[i].data_len);
-    offset += records[i].data_len;
-
-    free(records[i].data);
-  }
-  free(records);
-
-  *result = out;
-  return total_msg_size;
+  if (offset != Q_RESP_HEADER_SIZE) exit(1); 
+  //printf("------ %lu ------\n", offset);
 }
 
 static int send_response(client_t *c, uint8_t *data, uint64_t payload_size) {
@@ -922,6 +879,11 @@ static int send_response(client_t *c, uint8_t *data, uint64_t payload_size) {
  * [REQ_ID (8 Bytes) | START_KEY (16 Bytes) | END_KEY (16 bytes)]
  * For the response format consult the 'serialize_response' function.
  *
+ * Query Response format: 
+ * Header: [TOTAL_MSG_SIZE (8 Bytes) | REQ_ID (8 Bytes) | LIMIT (1 Byte) | MIN_KEY (16 bytes) | MAX_KEY (16 bytes)]
+ * Body: [PAYLOAD_SIZE (8 Bytes) | RECORDS_COUNT (4 Bytes) | RECORDS]
+ *
+ *
  * For each query request:
  * Lookup into the lsmt database for the key range provided, the lookup
  * is bounded to a fixed amount of bytes. The response returns the fetched
@@ -945,6 +907,9 @@ static bool process_query_buffer(client_t *client, uint64_t budget_ns) {
   uint64_t total_records = 0;
   size_t remaining = client->buffer_len;
 
+  lsmt_iterator_t x = lsmt_iterator_create(db);
+  lsmt_iterator_t *it = &x;
+
   while (remaining >= QUERY_REQ_SIZE) {
     //printf("Processing query\n");
     if (requests_processed > 0 && uv_hrtime() > deadline) {
@@ -964,12 +929,16 @@ static bool process_query_buffer(client_t *client, uint64_t budget_ns) {
 
     uint64_t t_iter_start = uv_hrtime();
 
-    size_t records_capacity = 2048;
     uint32_t records_count = 0;
     size_t records_bytes = 0;
     bool time_limit_hit = false;
-    kv_record_t *records = malloc(sizeof(kv_record_t) * records_capacity); 
-    if (!records) {
+
+    size_t buffer_cap = Q_RESP_HEADER_SIZE + 8 * 1024;
+    uint8_t *response_msg = malloc(sizeof(uint8_t) * buffer_cap); 
+    uint64_t msg_offset = Q_RESP_HEADER_SIZE;
+
+    if (!response_msg) {
+      lsmt_iterator_close(it);
       fprintf(stderr, "OOM allocating records\n");
       exit(1);
     }
@@ -985,39 +954,40 @@ static bool process_query_buffer(client_t *client, uint64_t budget_ns) {
     // !!!id=0 is reserved for the skiplist.
     sl_uint128_t max_key = { .id = 1, .timestamp = 0 };
 
-   //printf("Loading records..\n");
-    lsmt_iterator_t it = lsmt_iterator_create(db, start_key, end_key);
-    while (it.active) {
+    //printf("Loading records..\n");
+
+    lsmt_iterator_seek(it, start_key, end_key);
+
+    while (it->active) {
       if (records_count > 0 && uv_hrtime() > deadline) {
         time_limit_hit = true;
         break;
       }
 
-      kv_record_t record = lsmt_iterator_next(&it);
-      if (!it.active) break;
+      kv_raw_record_t record = lsmt_iterator_next(it);
+      if (!it->active) break;
 
-      records_bytes += record.record_size;
-      if (records_bytes > QUERY_BYTES_LIMIT) {
-        /*Bytes limit reached, i need to ignore the current record
-         * and free its content.
-         */
-        free(record.data);
-        break;
+      if (records_bytes + record.total_size > QUERY_BYTES_LIMIT) {
+        time_limit_hit = true;
+        break; 
       }
 
-      if (records_count >= records_capacity) { 
-        size_t new_capacity = records_capacity * 2;
-
-        // If realloc fails, it returns NULL but the original memory is still valid.
-        kv_record_t *tmp = realloc(records, new_capacity * sizeof(kv_record_t));
-
-        if (tmp == NULL) {
-          fprintf(stderr, "Critical: Out of memory during realloc\n");
-          exit(1); 
+      if (msg_offset + record.total_size > buffer_cap) { 
+        size_t new_cap = buffer_cap * 2;
+        // Ensure strictly enough space
+        if (new_cap < msg_offset + record.total_size) {
+          new_cap = msg_offset + record.total_size + 4096;
         }
 
-        records = tmp;
-        records_capacity = new_capacity;
+        uint8_t *tmp = realloc(response_msg, new_cap);
+        if (!tmp) {
+          lsmt_iterator_close(it);
+          free(response_msg);
+          fprintf(stderr, "OOM realloc response\n");
+          exit(1); 
+        }
+        response_msg = tmp;
+        buffer_cap = new_cap;
       }
 
       if (records_count == 0) {
@@ -1025,11 +995,12 @@ static bool process_query_buffer(client_t *client, uint64_t budget_ns) {
       }
 
       max_key = record.key;
-      records[records_count++] = record;
+      memcpy(response_msg + msg_offset, record.raw_data, record.total_size);
+      msg_offset += record.total_size;
+      records_bytes += record.total_size;
+      records_count++;
     }
-    lsmt_iterator_close(&it);
-    //printf("Loaded %u records\n", records_count);
-
+    //lsmt_iterator_close(it);
     dur_iter += (uv_hrtime() - t_iter_start);
 
     if (records_count == 0) {
@@ -1042,22 +1013,24 @@ static bool process_query_buffer(client_t *client, uint64_t budget_ns) {
     total_records += records_count;
     uint64_t t_ser_start = uv_hrtime();
 
-    query_response_t response = {0};
-    response.req_id = req_id;
-    response.records_count = records_count;
-    response.limit_reached = (records_bytes > QUERY_BYTES_LIMIT) || time_limit_hit;
-    response.min_key = min_key;
-    response.max_key = max_key;
-    response.records = records;
+    query_response_t msg_header = {0};
+    msg_header.total_msg_size = Q_RESP_HEADER_SIZE + records_bytes; 
+    msg_header.req_id = req_id;
+    msg_header.limit_reached = (records_bytes > QUERY_BYTES_LIMIT) || time_limit_hit;
+    msg_header.min_key = min_key;
+    msg_header.max_key = max_key;
+    msg_header.records_bytes = records_bytes;
+    msg_header.records_count = records_count;
 
-    uint8_t *res_buf = NULL;
-    uint64_t len = serialize_response(response, &res_buf);
+    set_query_response_header(response_msg, msg_header);
 
     dur_ser += (uv_hrtime() - t_ser_start);
 
     uint64_t t_send_start = uv_hrtime();
-    //printf("serialized data into a payload of size %u\n", len);
-    if (send_response(client, res_buf, len) != 0) {
+
+    if (send_response(client, response_msg, msg_header.total_msg_size) != 0) {
+      lsmt_iterator_close(it);
+      printf("FAILED SEND QUERY RESPONSE.\n");
       return false;
     }
     dur_send += (uv_hrtime() - t_send_start);
@@ -1086,6 +1059,7 @@ static bool process_query_buffer(client_t *client, uint64_t budget_ns) {
     printf("[Profile] Reqs: %d | Records: %lu | Total: %.3f ms | Iter: %.0f us | Ser: %.0f us | Send: %.0f us\n", 
         requests_processed, total_records, total_ms, iter_us, ser_us, send_us);
   }
+  lsmt_iterator_close(it);
   return true;
 }
 
@@ -1098,6 +1072,7 @@ static void on_query_async(uv_async_t *handle) {
   if (client->buffer_len < QUERY_REQ_SIZE) {
     return;
   }
+
 
   process_query_buffer(client, QUERY_BUDGET_NS);
 

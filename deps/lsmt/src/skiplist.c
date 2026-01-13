@@ -123,35 +123,58 @@ sl_t* sl_init() {
   return skiplist;
 }
 
-/* Create the iterator for the skiplist. It also moves to the
- * first key greater-equal than 'start_key'.
+/* 
+ * Create the iterator for the skiplist.
  */
-sl_iterator_t sl_iterator_create(sl_t *skiplist, sl_uint128_t start_key, sl_uint128_t end_key) {
+sl_iterator_t sl_iterator_create(sl_t *skiplist) {
   sl_iterator_t it = {0};
-  it.sl = skiplist;
-  sl_retain(it.sl);
+  it.active = false;
+  if (skiplist) {
+    sl_retain(skiplist);
+    it.sl = skiplist;
+    it.start_key = skiplist->min_key;
+    it.end_key = skiplist->max_key;
+  }
+  return it;
+}
 
-  it.active = true;
-  it.start_key = start_key;
-  it.end_key = end_key;
-
-  if (skiplist == NULL) {
-    sl_iterator_close(&it);
-    return it;
+void sl_iterator_close(sl_iterator_t *it) {
+  if (it && it->sl) {
+    sl_release(it->sl);
+    it->sl = NULL;
   }
 
+  if (it) {
+    it->active = false;
+  }
+}
+
+bool sl_iterator_seek(sl_iterator_t *it, sl_uint128_t start_key, sl_uint128_t end_key) {
+  if (!it ||!it->sl) return false; 
+
+  if (key_compare(it->sl->max_key, start_key) < 0 ||
+      key_compare(it->sl->min_key, end_key) > 0) {
+    it->active = false;
+    return false;
+  }
+
+  it->start_key = start_key;
+  it->end_key = end_key;
+  it->active = true;
+
   /* Traverse down to the bottom level to find the node strictly before start_key */
-  node_t *current = skiplist->top_level;
+  node_t *current = it->sl->top_level;
   while (current != NULL) {
     /* Move right while the next key is strictly less than start_key */
-    while (current->next != NULL && key_compare(current->next->key, it.start_key) < 0) {
+    while (current->next != NULL && key_compare(current->next->key, start_key) < 0) {
       current = current->next;
     }
 
     /* Drop down a level, or stop if we are at the bottom */
     if (current->lower_level != NULL) {
       current = current->lower_level;
-    } else {
+    }
+    else {
       break; 
     }
   }
@@ -161,16 +184,8 @@ sl_iterator_t sl_iterator_create(sl_t *skiplist, sl_uint128_t start_key, sl_uint
     current = current->next;
   }
 
-  it.current_node = current;
-  return it;
-}
-
-void sl_iterator_close(sl_iterator_t *it) {
-  if (it && it->active) {
-    it->active = false;
-    sl_release(it->sl);
-    it->sl = NULL;
-  }
+  it->current_node = current;
+  return true;
 }
 
 /* Iterates until the current key is greater than the 'end_key'
@@ -179,15 +194,14 @@ void sl_iterator_close(sl_iterator_t *it) {
  */
 sl_kv_t sl_iterator_next(sl_iterator_t *it) {
   sl_kv_t record = {0};
-
   if (!it || !it->active) return record;
 
   if (it->current_node == NULL || 
       key_compare(it->current_node->key, it->end_key) > 0) {
-    sl_iterator_close(it);
+    it->active = false;
+    //sl_iterator_close(it);
     return record;
   }
-
 
   record.key = it->current_node->key;
   record.content = it->current_node->content;

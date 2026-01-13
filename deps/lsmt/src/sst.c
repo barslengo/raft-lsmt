@@ -2,17 +2,12 @@
 #include <pthread.h>
 #include <string.h>
 #include <math.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include "utils.h"
 #include "queue.h"
 #include "sst.h"
-/*
-typedef struct sst_node {
-  sst_metadata_record_t *content;
-  struct sst_node *next;
-  struct sst_node *prev;
-} sst_node_t;
-*/
+
 static int tier_init(sst_metadata_t *sst_meta) {
   for (uint8_t i = 0; i < 64; i++) {
     sst_meta->tier[i] = NULL; 
@@ -42,9 +37,10 @@ void sst_metadata_record_release(sst_metadata_record_t *meta) {
       index_free(meta->cached_index);
       meta->cached_index = NULL;
     }
-    if (meta->cached_fp) {
-      fclose(meta->cached_fp);
-      meta->cached_fp = NULL;
+
+    if (meta->fd != -1) {
+      close(meta->fd);
+      meta->fd = -1;
     }
 
     if (meta->old) {
@@ -61,8 +57,8 @@ static sst_node_t *new_node(sst_metadata_record_t content) {
   node->content = malloc(sizeof(sst_metadata_record_t));
 
   content.cached_index = NULL;
-  content.cached_fp = NULL;
   content.old = false;
+  content.fd = -1;
   *node->content = content; 
   atomic_init(&node->content->refcount, 1);
 
@@ -150,7 +146,7 @@ sst_metadata_record_t create_sst_metadata(uint64_t id, uint32_t level,
     .max_key = max_key
   };
   metadata.cached_index = NULL;
-  metadata.cached_fp = NULL;
+  metadata.fd = -1;
 
   strncpy(metadata.sstable_filename, sst_path, 128 - 1); 
   metadata.sstable_filename[128-1] = '\0';

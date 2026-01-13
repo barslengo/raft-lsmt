@@ -20,8 +20,8 @@ typedef struct sst_metadata_record {
   sl_uint128_t min_key;
   sl_uint128_t max_key;
   index_t *cached_index;
-  FILE *cached_fp;
   bool old;
+  int fd; //file descriptor
   atomic_int refcount;
 } sst_metadata_record_t;
 
