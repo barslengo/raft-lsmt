@@ -15,7 +15,8 @@ typedef struct node {
 typedef struct sl {
   node_t *top_level;
   node_t *bottom_level;
-  size_t size;
+  /* calculated as (key_size + content_length) per each record. */
+  size_t size; 
   size_t levels;
   atomic_int refcount;
 

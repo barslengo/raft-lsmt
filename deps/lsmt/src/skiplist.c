@@ -357,6 +357,7 @@ int sl_insert(sl_t *skiplist, sl_uint128_t key, void *content, size_t content_si
     promotion_level++;
   }
 
-  skiplist->size = skiplist->size + sizeof(node_t) + content_size;
+  //skiplist->size = skiplist->size + sizeof(node_t) + content_size;
+  skiplist->size = skiplist->size + sizeof(sl_uint128_t) + content_size;
   return 0;
 }
