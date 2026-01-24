@@ -74,6 +74,9 @@ typedef struct lsmt_iterator {
 
   size_t sst_count;
   sst_iterator_t *sst_its;
+
+  sst_iterator_t **sorted_ssts;
+  size_t next_lazy_sst_idx;
 } lsmt_iterator_t;
 
 

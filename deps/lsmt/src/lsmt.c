@@ -276,7 +276,7 @@ static int sst_compact(sst_metadata_t *sst_meta, const char *db_path, pthread_mu
   uint8_t highest_tier = sst_meta->highest_tier;
   pthread_mutex_unlock(mutex);
 
-  for (uint8_t tier = 0; tier < highest_tier; tier++) {
+  for (uint8_t tier = 0; tier <= highest_tier; tier++) {
     pthread_mutex_lock(mutex);
     double tier_size = sst_meta->tier_size[tier];
     double tier_size_threshold = ZERO_LEVEL_MAX_SIZE * pow(10, tier);
@@ -867,6 +867,17 @@ static bool wr_sl_iterator_seek(wrapper_sl_it_t *wrap, sl_uint128_t start, sl_ui
   return active;
 }
 
+static int compare_sst_its_by_minkey(const void *a, const void *b) {
+  sst_iterator_t *it_a = *(sst_iterator_t **)a;
+  sst_iterator_t *it_b = *(sst_iterator_t **)b;
+
+  // Access metadata safely
+  sl_uint128_t key_a = it_a->meta->min_key;
+  sl_uint128_t key_b = it_b->meta->min_key;
+
+  return key_compare(key_a, key_b);
+}
+
 lsmt_iterator_t lsmt_iterator_create(lsmt_t *lsmt) {
   lsmt_iterator_t it = {0};
   it.lsmt = lsmt;
@@ -896,29 +907,33 @@ lsmt_iterator_t lsmt_iterator_create(lsmt_t *lsmt) {
     node = node->next;
   }
 
-  it.sst_its = calloc(it.sst_count, sizeof(sst_iterator_t));
-  if (!it.sst_its) {
-    perror("Failed to allocate sst iterator sources");
-    pthread_mutex_unlock(&lsmt->metadata_lock);
-    exit(1);
-  }
+  if (it.sst_count > 0) {
+    it.sst_its = calloc(it.sst_count, sizeof(sst_iterator_t));
+    it.sorted_ssts = calloc(it.sst_count, sizeof(sst_iterator_t*));
+    if (!it.sst_its || !it.sorted_ssts) {
+      perror("Failed to allocate sst iterator sources");
+      pthread_mutex_unlock(&lsmt->metadata_lock);
+      exit(1);
+    }
 
-  /* Create a snapshot of all the sstables on disk. */ 
-  node = lsmt->metadata->list;
-  size_t idx = 0;
-  while(node) {
-    it.sst_its[idx] = sst_iterator_create(node->content);
-    idx++;
-    node = node->next;
+    /* Create a snapshot of all the sstables on disk. */ 
+    node = lsmt->metadata->list;
+    size_t idx = 0;
+    while(node) {
+      it.sst_its[idx] = sst_iterator_create(node->content);
+      it.sorted_ssts[idx] = &(it.sst_its[idx]);
+      idx++;
+      node = node->next;
+    }
   }
-
   pthread_mutex_unlock(&lsmt->metadata_lock);
+  /* Sort the sstables by min_key after releasing the lock. */
+  qsort(it.sorted_ssts, it.sst_count, sizeof(sst_iterator_t*), compare_sst_its_by_minkey);
   return it;
 }
 
 void lsmt_iterator_close(lsmt_iterator_t *it) {
   if (it && it->active) {
-
     for (size_t i = 0; i < it->sl_count; i++) {
       wr_sl_iterator_close(&it->sl_its[i]);
     }
@@ -930,6 +945,11 @@ void lsmt_iterator_close(lsmt_iterator_t *it) {
     if (it->sst_its) {
       free(it->sst_its);
       it->sst_its = NULL;
+    }
+
+    if (it->sorted_ssts) {
+      free(it->sorted_ssts);
+      it->sorted_ssts = NULL;
     }
 
     it->active = false;
@@ -947,8 +967,31 @@ void lsmt_iterator_seek(lsmt_iterator_t *it, sl_uint128_t start, sl_uint128_t en
     wr_sl_iterator_seek(&it->sl_its[i], start, end);
   }
 
-  for (size_t i = 0; i < it->sst_count; i++) {
-    sst_iterator_seek(&it->sst_its[i], start, end);
+  if (it->sst_count > 0) {
+    it->next_lazy_sst_idx = 0;
+    for (size_t i = 0; i < it->sst_count; i++) {
+      sst_iterator_t *sst_it = it->sorted_ssts[i];
+      sst_it->active = false;
+      sst_it->buffered_record.valid = false;
+
+      /* Current sstable is out of range, so i can skip it. */
+      if (key_compare(sst_it->meta->min_key, end) > 0) {
+        continue;
+      }
+
+      /*If the current sstable starts before the range 
+       * it might contain the requested data. */
+      if (key_compare(sst_it->meta->min_key, start) <= 0) {
+        sst_iterator_seek(sst_it, start, end);
+        it->next_lazy_sst_idx++;
+      }
+      else {
+        /* The sstable starts after the beginning of the query,
+         * no need to open it now. Also since the sstables
+         * are oredered, theres no reason to continue the loop.*/
+        break;
+      }
+    }
   }
 }
 
@@ -964,73 +1007,70 @@ static void sst_ensure_buffered(sst_iterator_t *it) {
 
 kv_raw_record_t lsmt_iterator_next(lsmt_iterator_t *it) {
   kv_raw_record_t result = {0};
-  int sl_min_idx = -1;
-  int sst_min_idx = -1;
 
-  /* Lookup min key from memtables. */
+  if (!it || !it->active) return result;
+
+  /* Pointers to track the current best record found so far */
+  kv_raw_record_t *winner_record = NULL;
+
+  /* Find min key from Memtables. */
   for (size_t i = 0; i < it->sl_count; i++) {
     wrapper_sl_it_t *wrapper = &it->sl_its[i];
-
     wr_sl_ensure_buffered(wrapper);
+
     if (!wrapper->buffered_record.valid) continue;
 
-    if (sl_min_idx == -1) {
-      sl_min_idx = (int)i;
-    }
-    else {
-      sl_uint128_t k1 = wrapper->buffered_record.key;
-      sl_uint128_t k2 = it->sl_its[sl_min_idx].buffered_record.key;
-      if (key_compare(k1, k2) < 0) {
-        sl_min_idx = i;
-      }
+    if (winner_record == NULL ||
+        (key_compare(wrapper->buffered_record.key, winner_record->key) < 0)) {
+      winner_record = &wrapper->buffered_record;
     }
   }
 
-  /* Lookup min key from SSTables. */
-  for (size_t i = 0; i < it->sst_count; i++) {
-    sst_iterator_t *sst_it = &it->sst_its[i]; 
+  /* Find the min key in the currently opened SSTables. */
+  for (size_t i = 0; i < it->next_lazy_sst_idx; i++) {
+    sst_iterator_t *sst_it = it->sorted_ssts[i];
 
     sst_ensure_buffered(sst_it);
     if (!sst_it->buffered_record.valid) continue;
 
-    if (sst_min_idx == -1) {
-      sst_min_idx = (int)i;
-    }
-    else {
-      sl_uint128_t k1 = sst_it->buffered_record.key;
-      sl_uint128_t k2 = it->sst_its[sst_min_idx].buffered_record.key;
-      if (key_compare(k1, k2) < 0) {
-        sst_min_idx = i;
-      }
+    if (winner_record == NULL ||
+        key_compare(sst_it->buffered_record.key, winner_record->key) < 0) {
+      winner_record = &sst_it->buffered_record;
     }
   }
 
-  kv_raw_record_t *winner = NULL;
+  /* Check if any pending SSTable need to be opened.
+   * Iterate until the next pending SSTable's key range is after the
+   * current candidate.
+   */
+  while (it->next_lazy_sst_idx < it->sst_count) {
+    sst_iterator_t *pending_sst = it->sorted_ssts[it->next_lazy_sst_idx];
 
-  /* TODO: Compare minimum keys between SSTables and Memtables. */
-  if (sl_min_idx == -1 && sst_min_idx == -1) {
+    if (winner_record != NULL && 
+        key_compare(pending_sst->meta->min_key, winner_record->key) > 0) {
+      break;
+    }
+
+    sst_iterator_seek(pending_sst, it->start_key, it->end_key);
+    /* Mark as opened */
+    it->next_lazy_sst_idx++;
+
+    sst_ensure_buffered(pending_sst);
+
+    /* Update the candidate record. */
+    if (pending_sst->buffered_record.valid &&
+        (winner_record == NULL ||
+         key_compare(pending_sst->buffered_record.key, winner_record->key) < 0)) {
+      winner_record = &pending_sst->buffered_record;
+    }
+  }
+
+  if (winner_record == NULL) {
     it->active = false;
     return result;
   }
-  else if(sl_min_idx != -1 && sst_min_idx != -1) {
-    sl_uint128_t k_sl = it->sl_its[sl_min_idx].buffered_record.key;
-    sl_uint128_t k_sst = it->sst_its[sst_min_idx].buffered_record.key;
 
-    if (key_compare(k_sl, k_sst) < 0) {
-      winner = &it->sl_its[sl_min_idx].buffered_record;
-    } else {
-      winner = &it->sst_its[sst_min_idx].buffered_record;
-    }
-  }
-  else if (sl_min_idx != -1) {
-    winner = &it->sl_its[sl_min_idx].buffered_record;
-  }
-  else {
-    winner = &it->sst_its[sst_min_idx].buffered_record;
-  }
-
-  result = *winner;
-  /* Empty the buffer for next iterations. */
-  winner->valid = false;
+  result = *winner_record;
+  winner_record->valid = false; //Consume the record from the source
   return result;
 }
