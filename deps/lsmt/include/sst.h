@@ -21,7 +21,7 @@ typedef struct sst_metadata_record {
   sl_uint128_t max_key;
   index_t *cached_index;
   bool old;
-  int fd; //file descriptor
+  FILE *fp; //file pointer to the sst file.
   atomic_int refcount;
 } sst_metadata_record_t;
 
@@ -49,6 +49,64 @@ typedef struct sst_metadata {
   double tier_size[64];
 } sst_metadata_t;
 
+
+typedef struct kv_raw_record {
+  sl_uint128_t key;
+
+  /* Points to the internal buffer of the iterator. Do NOT free. */
+  uint8_t *raw_data;
+
+  /* Total size of raw_data in bytes. */
+  size_t total_size;
+
+  /* 
+   * True if the record was read successfully.
+   * False if EOF, Error, or Out-of-Range.
+   */
+  bool valid;
+} kv_raw_record_t;
+
+typedef struct sst_iterator {
+  bool active;
+  uint64_t current_offset;
+  sst_metadata_record_t *meta;
+  sl_uint128_t start_key;
+  sl_uint128_t end_key;
+
+  /* Internal use buffer. Owns record allocated data. */
+  uint8_t *buffer;
+  size_t buffer_cap;
+
+  /* The parsed result pointing to 'buffer' */
+  kv_raw_record_t buffered_record;
+
+  /* If true, the file pointer is currently pointing at the body of
+   * this record.
+   */
+  bool has_pending_header;
+
+  sl_uint128_t pending_key;
+  uint32_t pending_body_len;
+  uint8_t pending_raw_header[21];
+} sst_iterator_t;
+
+
+/*
+ * Handles multiple (count) SST iterators.
+ */
+typedef struct sst_k_iterators {
+  sst_iterator_t **iterators;
+  size_t count;
+  bool active;
+
+  size_t next_lazy_idx;
+  sl_uint128_t seek_start;
+  sl_uint128_t seek_end;
+
+  kv_raw_record_t current_record;
+} sst_k_iterators_t;
+
+
 sst_metadata_t *sst_metadata_init(const char *path);
 sst_metadata_t *sst_metadata_load(const char *path);
 
@@ -62,5 +120,15 @@ sst_metadata_record_t *sst_metadata_pop(sst_metadata_t *sst_meta, uint8_t tier);
 sst_metadata_record_t create_sst_metadata(uint64_t id, uint32_t level, uint64_t size, sl_uint128_t min_key, sl_uint128_t max_key, char* sst_path, char *index_path);
 sst_metadata_record_t sst_metadata_lookup(sst_metadata_t *sst_meta, sl_uint128_t key);
 uint32_t sst_count(sst_metadata_t *sst_meta, uint8_t tier);
+
+sst_iterator_t *sst_iterator_create(sst_metadata_record_t *sst);
+bool sst_iterator_seek(sst_iterator_t *it, sl_uint128_t start, sl_uint128_t end);
+void sst_iterator_free(sst_iterator_t *it);
+
+sst_k_iterators_t sst_k_iterators_create(sst_metadata_record_t **records, size_t count);
+void sst_k_iterators_close(sst_k_iterators_t *it);
+void sst_k_iterators_seek(sst_k_iterators_t *it, sl_uint128_t start, sl_uint128_t end);
+kv_raw_record_t *sst_k_iterators_next(sst_k_iterators_t *it);
+
 #endif
 

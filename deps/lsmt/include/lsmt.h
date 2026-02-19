@@ -20,39 +20,6 @@ typedef struct lsmt {
   pthread_mutex_t memtable_lock; //used when swapping memtable.
 } lsmt_t;
 
-typedef struct kv_raw_record {
-  sl_uint128_t key;
-
-  /* Points to the internal buffer of the iterator. Do NOT free. */
-  uint8_t *raw_data;
-
-  /* Total size of raw_data in bytes. */
-  size_t total_size;
-
-  /* 
-   * True if the record was read successfully.
-   * False if EOF, Error, or Out-of-Range.
-   */
-  bool valid;
-} kv_raw_record_t;
-
-
-typedef struct sst_iterator {
-  bool active;
-  uint64_t current_offset;
-  sst_metadata_record_t *meta;
-  sl_uint128_t start_key;
-  sl_uint128_t end_key;
-
-  /* Internal use buffer. Owns record allocated data. */
-  uint8_t *buffer;
-  size_t buffer_cap;
-
-  /* The parsed result pointing to 'buffer' */
-  kv_raw_record_t buffered_record;
-} sst_iterator_t;
-
-
 typedef struct wrapper_sl_it {
   sl_iterator_t sl_it;
 
@@ -72,11 +39,13 @@ typedef struct lsmt_iterator {
   size_t sl_count;
   wrapper_sl_it_t *sl_its;
 
-  size_t sst_count;
-  sst_iterator_t *sst_its;
+  sst_k_iterators_t sst_list;
 
-  sst_iterator_t **sorted_ssts;
-  size_t next_lazy_sst_idx;
+  /* If we peek at the SST list but the Memtable has a smaller key,
+   * we return the Memtable record. We must store the SST record 
+   * here so it's available for the next comparison.
+   */
+  kv_raw_record_t buffered_sst_record;
 } lsmt_iterator_t;
 
 

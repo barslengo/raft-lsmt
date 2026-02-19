@@ -38,9 +38,9 @@ void sst_metadata_record_release(sst_metadata_record_t *meta) {
       meta->cached_index = NULL;
     }
 
-    if (meta->fd != -1) {
-      close(meta->fd);
-      meta->fd = -1;
+    if (meta->fp != NULL) {
+      fclose(meta->fp);
+      meta->fp = NULL;
     }
 
     if (meta->old) {
@@ -58,7 +58,7 @@ static sst_node_t *new_node(sst_metadata_record_t content) {
 
   content.cached_index = NULL;
   content.old = false;
-  content.fd = -1;
+  content.fp = NULL;
   *node->content = content; 
   atomic_init(&node->content->refcount, 1);
 
@@ -146,7 +146,7 @@ sst_metadata_record_t create_sst_metadata(uint64_t id, uint32_t level,
     .max_key = max_key
   };
   metadata.cached_index = NULL;
-  metadata.fd = -1;
+  metadata.fp = NULL;
 
   strncpy(metadata.sstable_filename, sst_path, 128 - 1); 
   metadata.sstable_filename[128-1] = '\0';
@@ -269,4 +269,301 @@ sst_metadata_record_t *sst_metadata_pop(sst_metadata_t *sst_meta, uint8_t tier) 
 
 uint32_t sst_count(sst_metadata_t *sst_meta, uint8_t tier) {
   return sst_meta->tier[tier]->size;
+}
+
+/* SST ITERATORS. */
+sst_iterator_t *sst_iterator_create(sst_metadata_record_t *sst) {
+  sst_iterator_t *it = calloc(1, sizeof(sst_iterator_t));
+  sst_metadata_record_retain(sst);
+  it->meta = sst;
+  it->active = false;
+  it->buffer_cap = 1024;
+  it->buffer = malloc(it->buffer_cap);
+  return it;
+}
+
+void sst_iterator_free(sst_iterator_t *it) {
+  if (!it) return;
+  if (it->meta) sst_metadata_record_release(it->meta);
+  if (it->buffer) free(it->buffer);
+  free(it);
+}
+
+static bool sst_meta_record_ensure_open(sst_metadata_record_t *meta) {
+  if (!meta) return false;
+
+  if (meta->fp == NULL) {
+    meta->fp = fopen(meta->sstable_filename, "rb");
+
+    if (meta->fp == NULL) {
+      perror("Failed to open SST file");
+      return false;
+    }
+
+    // Lazy Load Index if missing
+    if (meta->cached_index == NULL) {
+      meta->cached_index = index_load_from_disk(meta->sst_index_filename); 
+      if (!meta->cached_index) {
+        fclose(meta->fp);
+        meta->fp = NULL;
+        return false;
+      }
+    }
+  }
+
+  return (meta->fp != NULL && meta->cached_index != NULL);
+}
+
+/* Reads the next sst record header.
+ * Parses key/len pair, but also returns the raw 21 bytes via out_raw_header.
+ * */
+static bool sst_read_next_header(FILE *fp, sl_uint128_t *out_key, 
+    uint32_t *out_body_len, uint8_t *out_raw_header) {
+
+  if (fread(out_raw_header, 1, 21, fp) != 21) {
+    return false;
+  }
+
+  memcpy(out_key, out_raw_header, 16);
+  memcpy(out_body_len, out_raw_header + 17, 4);
+  return true;
+}
+
+/* Returns true if the iterator is positioned and has valid data in range.
+ * Returns false if the file does not overlap the range (optimization). */
+bool sst_iterator_seek(sst_iterator_t *it, sl_uint128_t start, sl_uint128_t end) {
+  if (!it || !it->meta) return false;
+
+  sst_metadata_record_t *sst = it->meta;
+
+  /* 
+   * If the SSTable is completely out of the query range, do not touch the disk.
+   */
+  if (key_compare(sst->max_key, start) < 0 || 
+      key_compare(sst->min_key, end) > 0) {
+    it->active = false;
+    return false; 
+  }
+
+  if (!sst_meta_record_ensure_open(sst)) {
+    it->active = false;
+    return false;
+  }
+
+  /* Find closest index block. */
+  uint64_t offset = index_lookup(sst->cached_index, start);
+
+  if (fseek(sst->fp, offset, SEEK_SET) != 0) {
+    it->active = false;
+    return false;
+  }
+
+  sl_uint128_t key;
+  uint32_t body_len;
+  uint8_t raw_header[21];
+
+  /* Move from the closest index block position to the closest
+   * key of the provided range. */
+  while (sst_read_next_header(sst->fp, &key, &body_len, raw_header)) {
+
+    /* Went past the key range. */
+    if (key_compare(key, end) > 0) {
+      it->active = false;
+      return false;
+    }
+
+    /* Found. */
+    if (key_compare(key, start) >= 0) {
+      it->end_key = end;
+      it->active = true;
+      /* The file pointer is now point on the current
+       * record body. So i save this header into the struct.
+       * The next peek call will use this info.
+       */
+      it->has_pending_header = true;
+      it->pending_key = key;
+      it->pending_body_len = body_len;
+      memcpy(it->pending_raw_header, raw_header, 21);
+
+      /* Note: current_offset is pointing at the start of this header.
+       * We don't update it yet; peek() will update it after consuming.
+       * it->current_offset = offset;
+       */
+      return true;
+    }
+
+    /* current key is smaller than the query minimum.
+     * just skip to the next record.
+     */
+    if (fseek(it->meta->fp, body_len, SEEK_CUR) != 0) {
+      it->active = false;
+      return false;
+    }
+  }
+
+  /* EOF reached. */
+  it->active = false;
+  return false; 
+}
+
+/*
+ * Reads the next record into the internal buffer, returns pointer to it.
+ */
+static kv_raw_record_t *sst_iterator_peek(sst_iterator_t *it) {
+  if (!it || !it->active) return NULL; 
+  if (it->buffered_record.valid) return &it->buffered_record;
+
+  sl_uint128_t key;
+  uint32_t body_len;
+  uint8_t* header_src; 
+
+  if (it->has_pending_header) {
+    key = it->pending_key;
+    body_len = it->pending_body_len;
+    header_src = it->pending_raw_header;
+    it->has_pending_header = false;
+  }
+  else {
+    if (!sst_read_next_header(it->meta->fp, &key, &body_len, it->pending_raw_header)) {
+      it->active = false;
+      return NULL;
+    }
+    header_src = it->pending_raw_header;
+  }
+
+  if (key_compare(key, it->end_key) > 0) {
+    it->active = false;
+    return NULL;
+  }
+
+  size_t total_size = 21 + body_len;
+
+  if (it->buffer_cap < total_size) {
+    size_t new_cap = (total_size > it->buffer_cap * 2) ? total_size : it->buffer_cap * 2;
+    it->buffer = realloc(it->buffer, new_cap);
+    it->buffer_cap = new_cap;
+  }
+  memcpy(it->buffer, header_src, 21);
+
+  if (fread(it->buffer + 21, 1, body_len, it->meta->fp) != body_len) {
+    it->active = false;
+    return NULL;
+  }
+
+  it->buffered_record.key = key;
+  it->buffered_record.raw_data = it->buffer;
+  it->buffered_record.total_size = total_size;
+  it->buffered_record.valid = true;
+  it->current_offset += total_size;
+
+  return &it->buffered_record;
+}
+
+// Consumes the current record (invalidates buffer)
+static void sst_iterator_advance(sst_iterator_t *it) {
+  if (it) it->buffered_record.valid = false;
+}
+
+static int compare_sst_its_by_minkey(const void *a, const void *b) {
+  sst_iterator_t *it_a = *(sst_iterator_t **)a;
+  sst_iterator_t *it_b = *(sst_iterator_t **)b;
+
+  // Access metadata safely
+  sl_uint128_t key_a = it_a->meta->min_key;
+  sl_uint128_t key_b = it_b->meta->min_key;
+
+  return key_compare(key_a, key_b);
+}
+
+sst_k_iterators_t sst_k_iterators_create(sst_metadata_record_t **records, size_t count) {
+  sst_k_iterators_t k_its = {0};
+  k_its.count = count;
+  k_its.iterators = malloc(sizeof(sst_iterator_t*) * count);
+
+  for (size_t i = 0; i < count; i++) {
+    k_its.iterators[i] = sst_iterator_create(records[i]);
+  }
+
+  // Sort iterators by min_key for the lazy seek optimization
+  qsort(k_its.iterators, count, sizeof(sst_iterator_t*), compare_sst_its_by_minkey);
+  return k_its;
+}
+
+void sst_k_iterators_close(sst_k_iterators_t *it) {
+  if (!it) return;
+  for (size_t i = 0; i < it->count; i++) {
+    sst_iterator_free(it->iterators[i]);
+  }
+  free(it->iterators);
+  it->active = false;
+}
+
+void sst_k_iterators_seek(sst_k_iterators_t *it, sl_uint128_t start, sl_uint128_t end) {
+  it->seek_start = start;
+  it->seek_end = end;
+  it->active = true;
+  it->next_lazy_idx = 0;
+
+  // Reset all sub-iterators
+  for (size_t i = 0; i < it->count; i++) {
+    it->iterators[i]->active = false;
+    it->iterators[i]->buffered_record.valid = false;
+  }
+}
+
+// Performs the K-way merge step
+kv_raw_record_t *sst_k_iterators_next(sst_k_iterators_t *it) {
+  if (!it || !it->active) return NULL;
+
+  sst_iterator_t *winner = NULL;
+  kv_raw_record_t *winner_record = NULL;
+
+  /* Check already opened iterators. */
+  for (size_t i = 0; i < it->next_lazy_idx; i++) {
+    sst_iterator_t *sub = it->iterators[i];
+    kv_raw_record_t *rec = sst_iterator_peek(sub);
+
+    if (!rec) continue; // Iterator exhausted or invalid
+
+    if (winner_record == NULL || key_compare(rec->key, winner_record->key) < 0) {
+      winner = sub;
+      winner_record = rec;
+    }
+  }
+
+  /* Lazily open pending iterators if they are in range of the current winner. */
+  while (it->next_lazy_idx < it->count) {
+    sst_iterator_t *pending = it->iterators[it->next_lazy_idx];
+
+    /* If pending SST starts after our current winner, we can stop checking
+     * because the iterators are sorted by min_key. */
+    if (winner_record != NULL && 
+        key_compare(pending->meta->min_key, winner_record->key) > 0) {
+      break;
+    }
+
+    /* Initialize the pending iterator. */
+    sst_iterator_seek(pending, it->seek_start, it->seek_end);
+    it->next_lazy_idx++;
+
+    kv_raw_record_t *rec = sst_iterator_peek(pending);
+    if (rec) {
+      if (winner_record == NULL || key_compare(rec->key, winner_record->key) < 0) {
+        winner = pending;
+        winner_record = rec;
+      }
+    }
+  }
+
+  if (winner_record) {
+    /* Copy the winner to the output (shallow copy is fine, data is in winner's buffer). */
+    it->current_record = *winner_record;
+
+    sst_iterator_advance(winner);
+
+    return &it->current_record; 
+  }
+
+  it->active = false;
+  return NULL;
 }

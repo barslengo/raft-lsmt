@@ -85,175 +85,73 @@ static sst_file_paths_t new_sstable_filename(const char *dir) {
   return files;
 }
 
-static bool read_record_header(FILE *fp, sl_uint128_t *key, uint8_t *type, uint32_t *length) {
- /* Key(16) + Type(1) + Len(4) = 21 Bytes */
-  uint8_t buf[21]; 
-
-  if (fread(buf, 1, 21, fp) != 21) {
-    return false;
-  }
-
-  /* Unpack Buffer */
-  memcpy(key, buf, 16);
-  *type = buf[16];
-  memcpy(length, buf + 17, 4);
-
-  return true;
-}
-
-
-typedef struct written_record {
-  sl_uint128_t key;
-  uint32_t total_bytes;
-  bool end;
-} written_record_t;
-
-
-/* Read one entry per SSTable, compare the keys and write the minimum
- * key into the new SSTable. This function increment only the position of the file who
- * contained the inserted record.
- * Returns the number of inserted bytes. */
-static written_record_t write_min_record(FILE *out, FILE *sstables[], uint8_t sst_count) {
-  written_record_t result;
-  result.key.id = 0;
-  result.end = true;
-
-  uint8_t min_file_idx;
-  uint8_t type;
-  uint32_t length;
-  for (uint8_t i = 0; i < sst_count; i++) {
-    sl_uint128_t key;
-
-    /* Current file has no more valid entries. */
-    if (!read_record_header(sstables[i], &key, &type, &length)) {
-      continue;
-    }
-
-    result.end = false;
-    /* Temporary. Here i'm checking for the first occurrence. 
-     * I should probably init the result.key at maximum value. */
-    if (result.key.id == 0) {
-      result.key = key;
-      min_file_idx = i;
-    }
-
-    if (key_compare(key, result.key) < 0) {
-      result.key = key;
-      min_file_idx = i;
-    }
-
-    fseek(sstables[i], -RECORD_HEADER_SIZE, SEEK_CUR);
-  }
-
-  if (result.end) return result;
-
-  FILE *fp = sstables[min_file_idx];
-  uint32_t entry_length = RECORD_HEADER_SIZE + length; 
-  uint8_t *record = malloc(sizeof(uint8_t) * entry_length); 
-
-  /* Invalid/empty file. TODO. */
-  if (fread(record, sizeof(uint8_t), entry_length, fp) != entry_length) {
-    result.end = true;
-    return result;
-  }
-
-  /* Increment the file pointer because i'im inserting its entry. */
-  //fseek(fp, header_size, SEEK_CUR);
-
-  if (fwrite(record, sizeof(uint8_t), entry_length, out) != entry_length) {
-    perror("[MERGE] Failed to write records to disk !");
-    exit(1);
-  }
-  free(record);
-
-  result.total_bytes = entry_length;
-  return result;
-}
-
 static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t length, const char *db_path) {
   sst_file_paths_t file_paths = new_sstable_filename(db_path);
 
-  FILE *fp[length]; // Local file handles for compaction only
-  
-  for (uint8_t i = 0; i < length; i++) {
-    fp[i] = fopen(records[i]->sstable_filename, "rb");
-    if (!fp[i]) {
-      perror("Failed to open existing sstable for merge!");
-      exit(1); 
-    }
-    /* User large buffer for sequential merge scan */
-    setvbuf(fp[i], NULL, _IOFBF, 128 * 1024);
-  }
+  // 1. Setup the Set Iterator (Handles all reading, merging, and sorting)
+  sst_k_iterators_t set_it = sst_k_iterators_create(records, length);
 
+  // Seek from 0 to MAX to get everything
+  sl_uint128_t min_range = {0};
+  sl_uint128_t max_range = { .id = UINT64_MAX, .timestamp = UINT64_MAX };
+  sst_k_iterators_seek(&set_it, min_range, max_range);
+
+  // 2. Output File Setup
   FILE *new_file = fopen(file_paths.sst_file, "wb");
   if (!new_file) {
-    perror("Failed to open db file!");
+    perror("Failed to open new sst file");
     exit(1);
   }
-  // Buffer for writing
   setvbuf(new_file, NULL, _IOFBF, 128 * 1024);
 
-  written_record_t record;
+  index_t *index = index_init(1024);
+  uint64_t offset = 0;
+  size_t current_block_size = 0;
+
   sl_uint128_t min_key = {0};
   sl_uint128_t max_key = {0};
+  bool first = true;
 
-  index_t *index = index_init(1024);
-  size_t current_block_size = 0;
-  uint64_t offset = 0;
-
-  while ((record = write_min_record(new_file, fp, length)).end == false) {
-    /* Temporary solution for getting the min key. Overflow risk. */
-    if (offset == 0) min_key = record.key;
+  kv_raw_record_t *rec;
+  while ((rec = sst_k_iterators_next(&set_it)) != NULL) {
+    if (first) {
+      min_key = rec->key;
+      first = false;
+    }
+    max_key = rec->key;
 
     if (current_block_size == 0) {
-      if (index_add(index, record.key, offset) != 0) {
-        printf("Failed to add index entry on sst merge!\n");
-        exit(1);
-      }
+      if (index_add(index, rec->key, offset) != 0) exit(1);
     }
 
-    offset += record.total_bytes;
-    current_block_size += record.total_bytes;
-    max_key = record.key;
-
-    if (current_block_size >= index_block_size) {
-      current_block_size = 0;
+    if (fwrite(rec->raw_data, 1, rec->total_size, new_file) != rec->total_size) {
+      perror("Write failed during merge");
+      exit(1);
     }
+
+    offset += rec->total_size;
+    current_block_size += rec->total_size;
+    if (current_block_size >= index_block_size) current_block_size = 0;
   }
 
-  /* If the system crashes after syncing this new sstable to disk and
-   * before updating the metadata file (which stores the list of all sstables)
-   * then this new file will be ignored. This is way the deletion of the sstables
-   * used here is postponed after the metadata file update.
-   * */
-  if (fflush(new_file) != 0) {
-    perror("Failed to flush merged buffer.");
+
+  if (fflush(new_file) != 0 || fsync(fileno(new_file)) != 0) {
+    perror("Sync failed");
     fclose(new_file);
     exit(1);
   }
-
-  if (fsync(fileno(new_file)) != 0) {
-    perror("Failed to dump to disk the merged sstable.");
-    fclose(new_file);
-    exit(1);
-  }
-
   fclose(new_file);
 
-  for (uint8_t i = 0; i < length; i++) {
-    fclose(fp[i]);
-  }
-
-  //snprintf(sst_path, sizeof(sst_path), "%s/%s", db_path, file_paths.index_file); 
+  sst_k_iterators_close(&set_it);
   index_flush(index, file_paths.index_file);
   index_free(index);
 
   sst_metadata_record_t metadata = create_sst_metadata(records[0]->id,
-                                                       (records[0]->level)+1,
-                                                       offset,
-                                                       min_key, max_key,
-                                                       file_paths.sst_file,
-                                                       file_paths.index_file);
+      (records[0]->level)+1,
+      offset,
+      min_key, max_key,
+      file_paths.sst_file,
+      file_paths.index_file);
 
   free(file_paths.sst_file);
   free(file_paths.index_file); 
@@ -607,186 +505,6 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
   return rv;
 }
 
-static sst_iterator_t sst_iterator_create(sst_metadata_record_t *sst) {
-  sst_iterator_t it = {0};
-  sst_metadata_record_retain(sst);
-
-  it.active = false;
-  it.meta = sst;
-  it.current_offset = 0;
-  /* Init internal buffer. */
-  it.buffer_cap = 1024;
-  it.buffer = malloc(it.buffer_cap); 
-  if (!it.buffer) { 
-    perror("OOM");
-    exit(1);
-  } 
-
-  /* active remains false until mounted! */
-  return it;
-}
-
-static bool sst_meta_record_ensure_open(sst_metadata_record_t *meta) {
-  if (!meta) return false;
-
-  if (meta->fd == -1) {
-    meta->fd = open(meta->sstable_filename, O_RDONLY);
-
-    if (meta->fd == -1) {
-      perror("Failed to open SST file");
-      return false;
-    }
-
-    // Lazy Load Index if missing
-    if (meta->cached_index == NULL) {
-      meta->cached_index = index_load_from_disk(meta->sst_index_filename); 
-      if (!meta->cached_index) {
-        close(meta->fd);
-        meta->fd = -1;
-        return false;
-      }
-    }
-  }
-
-  return (meta->fd != -1 && meta->cached_index != NULL);
-}
-
-static void sst_iterator_close(sst_iterator_t *it) {
-  if (it && it->meta) {
-    sst_metadata_record_release(it->meta);
-    it->meta = NULL;
-    if (it->buffer) {
-      free(it->buffer);
-      it->buffer = NULL;
-    }
-  }
-  if (it) {
-    it->active = false;
-  }
-}
-
-/* Returns true if header read successfully, false on EOF/Error */
-static bool sst_read_header_at(int fd, uint64_t offset, 
-    sl_uint128_t *out_key, size_t *out_total_size) {
-  uint8_t buf[21]; // 16 (Key) + 1 (Type) + 4 (Len)
-
-  if (pread(fd, buf, 21, offset) != 21) {
-    return false;
-  }
-
-  memcpy(out_key, buf, 16);
-
-  /* Skip Type value at byte 16 */
-  uint32_t data_len;
-  memcpy(&data_len, buf + 17, 4);
-
-  if (out_total_size) {
-    *out_total_size = 21 + data_len;
-  }
-
-  return true;
-}
-
-/* Returns true if the iterator is positioned and has valid data in range.
- * Returns false if the file does not overlap the range (optimization). */
-static bool sst_iterator_seek(sst_iterator_t *it, sl_uint128_t start, sl_uint128_t end) {
-  if (!it || !it->meta) return false;
-
-  sst_metadata_record_t *sst = it->meta;
-
-  /* 
-   * If the SSTable is completely out of the query range, do not touch the disk.
-   */
-  if (key_compare(sst->max_key, start) < 0 || 
-      key_compare(sst->min_key, end) > 0) {
-    it->active = false;
-    return false; 
-  }
-
-  if (!sst_meta_record_ensure_open(sst)) {
-    it->active = false;
-    return false;
-  }
-
-  /* Find closest index block. */
-  uint64_t offset = index_lookup(sst->cached_index, start);
-
-  sl_uint128_t key;
-  size_t total_size;
-
-  /* Move from the closest index block position to the closest
-   * key of the provided range. */
-  while (sst_read_header_at(sst->fd, offset, &key, &total_size)) {
-    /* Went past the key range. */
-    if (key_compare(key, end) > 0) {
-      it->active = false;
-      return false;
-    }
-
-    /* Found. */
-    if (key_compare(key, start) >= 0) {
-      it->current_offset = offset;
-      it->end_key = end;
-      it->active = true;
-      it->buffered_record.valid = false;
-      return true;
-    }
-    /* Move to the next header. */
-    offset += total_size;
-  }
-
-  it->active = false;
-  return false; 
-}
-
-static kv_raw_record_t sst_iterator_next(sst_iterator_t *it) {
-  kv_raw_record_t record = {0};
-  record.valid = false;
-
-  if (!it || !it->active || !it->meta || it->meta->fd == -1) {
-    return record; 
-  }
-
-  sl_uint128_t key;
-  size_t total_size;
-
-  if (!sst_read_header_at(it->meta->fd, it->current_offset, &key, &total_size)) {
-    it->active = false;
-    return record;
-  }
-
-  if (key_compare(key, it->end_key) > 0) {
-    it->active = false;
-    return record;
-  }
-
-  // Prepare Buffer (Reuse logic)
-  if (it->buffer_cap < total_size) {
-    size_t new_cap = (total_size > it->buffer_cap * 2) ? total_size : it->buffer_cap * 2;
-    uint8_t *tmp = realloc(it->buffer, new_cap);
-    if (!tmp) { 
-      perror("OOM");
-      exit(1);
-    }
-    it->buffer = tmp;
-    it->buffer_cap = new_cap;
-  }
-
-  /* Read the full record into the buffer. */
-  if (pread(it->meta->fd, it->buffer, total_size, it->current_offset) != total_size) {
-    it->active = false;
-    return record;
-  }
-
-  record.key = key;
-  record.raw_data = it->buffer;
-  record.total_size = total_size;
-  record.valid = true;
-
-  it->current_offset += total_size;
-  return record;
-}
-
 static wrapper_sl_it_t wr_sl_it_create(sl_t *skiplist) {
   wrapper_sl_it_t wrapper = {0};
   wrapper.sl_it = sl_iterator_create(skiplist);
@@ -847,7 +565,10 @@ static void wr_sl_ensure_buffered(wrapper_sl_it_t *wrap) {
 }
 
 void wr_sl_iterator_close(wrapper_sl_it_t *it) {
+  if (!it) return;
+
   sl_iterator_close(&it->sl_it);
+
   if (it->buffer) {
     free(it->buffer);
     it->buffer = NULL;
@@ -867,210 +588,132 @@ static bool wr_sl_iterator_seek(wrapper_sl_it_t *wrap, sl_uint128_t start, sl_ui
   return active;
 }
 
-static int compare_sst_its_by_minkey(const void *a, const void *b) {
-  sst_iterator_t *it_a = *(sst_iterator_t **)a;
-  sst_iterator_t *it_b = *(sst_iterator_t **)b;
-
-  // Access metadata safely
-  sl_uint128_t key_a = it_a->meta->min_key;
-  sl_uint128_t key_b = it_b->meta->min_key;
-
-  return key_compare(key_a, key_b);
-}
-
 lsmt_iterator_t lsmt_iterator_create(lsmt_t *lsmt) {
   lsmt_iterator_t it = {0};
   it.lsmt = lsmt;
   it.active = true;
-  it.sl_count = 0;
 
   pthread_mutex_lock(&lsmt->metadata_lock);
-
-  /* Memtable Init. */
   pthread_mutex_lock(&lsmt->memtable_lock);
-  bool use_memtable = (lsmt->memtable && lsmt->memtable->size > 0); 
 
-  if (use_memtable) {
-    it.sl_its = calloc(1, sizeof(wrapper_sl_it_t));
+  /* Initialize Memtable Iterator. */
+  if (lsmt->memtable && lsmt->memtable->size > 0) {
     it.sl_count = 1;
+    it.sl_its = malloc(sizeof(wrapper_sl_it_t) * it.sl_count);
     it.sl_its[0] = wr_sl_it_create(lsmt->memtable);
   }
-  pthread_mutex_unlock(&lsmt->memtable_lock);
 
-  /* SSTable init. */
-  it.sst_count = 0;
+  /* Initialize SST Iterators. */
+  size_t sst_count = 0;
   sst_node_t *node = lsmt->metadata->list;
-
-  /* TODO: replace with a function call to sst_metdata. */
   while(node) {
-    it.sst_count++;
+    sst_count++;
     node = node->next;
   }
 
-  if (it.sst_count > 0) {
-    it.sst_its = calloc(it.sst_count, sizeof(sst_iterator_t));
-    it.sorted_ssts = calloc(it.sst_count, sizeof(sst_iterator_t*));
-    if (!it.sst_its || !it.sorted_ssts) {
-      perror("Failed to allocate sst iterator sources");
-      pthread_mutex_unlock(&lsmt->metadata_lock);
-      exit(1);
-    }
-
-    /* Create a snapshot of all the sstables on disk. */ 
+  if (sst_count > 0) {
+    sst_metadata_record_t **records = malloc(sizeof(sst_metadata_record_t*) * sst_count);
     node = lsmt->metadata->list;
-    size_t idx = 0;
+    size_t i = 0;
     while(node) {
-      it.sst_its[idx] = sst_iterator_create(node->content);
-      it.sorted_ssts[idx] = &(it.sst_its[idx]);
-      idx++;
+      records[i++] = node->content;
       node = node->next;
     }
+    // Pass ownership of the array to the iterator (it copies pointers, we free the array)
+    it.sst_list = sst_k_iterators_create(records, sst_count);
+    free(records);
+  } else {
+    it.sst_list.count = 0;
   }
+
+  pthread_mutex_unlock(&lsmt->memtable_lock);
   pthread_mutex_unlock(&lsmt->metadata_lock);
-  /* Sort the sstables by min_key after releasing the lock. */
-  qsort(it.sorted_ssts, it.sst_count, sizeof(sst_iterator_t*), compare_sst_its_by_minkey);
   return it;
 }
 
 void lsmt_iterator_close(lsmt_iterator_t *it) {
   if (it && it->active) {
-    for (size_t i = 0; i < it->sl_count; i++) {
-      wr_sl_iterator_close(&it->sl_its[i]);
+
+    if (it->sl_count > 0 && it->sl_its) {
+      for (size_t i = 0; i < it->sl_count; i++) {
+        wr_sl_iterator_close(&it->sl_its[i]);
+      }
+      free(it->sl_its);
+      it->sl_its = NULL;
     }
 
-    for (size_t i = 0; i < it->sst_count; i++) {
-      sst_iterator_close(&it->sst_its[i]);
-    }
-
-    if (it->sst_its) {
-      free(it->sst_its);
-      it->sst_its = NULL;
-    }
-
-    if (it->sorted_ssts) {
-      free(it->sorted_ssts);
-      it->sorted_ssts = NULL;
-    }
-
+    sst_k_iterators_close(&it->sst_list);
     it->active = false;
   }
 }
 
 void lsmt_iterator_seek(lsmt_iterator_t *it, sl_uint128_t start, sl_uint128_t end) {
   if (!it) return;
-
-  it->start_key = start;
-  it->end_key = end;
   it->active = true;
 
-  for (size_t i = 0; i < it->sl_count; i++) {
-    wr_sl_iterator_seek(&it->sl_its[i], start, end);
-  }
-
-  if (it->sst_count > 0) {
-    it->next_lazy_sst_idx = 0;
-    for (size_t i = 0; i < it->sst_count; i++) {
-      sst_iterator_t *sst_it = it->sorted_ssts[i];
-      sst_it->active = false;
-      sst_it->buffered_record.valid = false;
-
-      /* Current sstable is out of range, so i can skip it. */
-      if (key_compare(sst_it->meta->min_key, end) > 0) {
-        continue;
-      }
-
-      /*If the current sstable starts before the range 
-       * it might contain the requested data. */
-      if (key_compare(sst_it->meta->min_key, start) <= 0) {
-        sst_iterator_seek(sst_it, start, end);
-        it->next_lazy_sst_idx++;
-      }
-      else {
-        /* The sstable starts after the beginning of the query,
-         * no need to open it now. Also since the sstables
-         * are oredered, theres no reason to continue the loop.*/
-        break;
-      }
+  if (it->sl_count > 0) {
+    for (size_t i = 0; i < it->sl_count; i++) {
+      wr_sl_iterator_seek(&it->sl_its[i], start, end);
     }
   }
-}
 
-static void sst_ensure_buffered(sst_iterator_t *it) {
-  if (!it->active || it->buffered_record.valid) return;
-
-  it->buffered_record = sst_iterator_next(it);
-
-  if (!it->buffered_record.valid) {
-    it->active = false; 
+  if (it->sst_list.count > 0) {
+    sst_k_iterators_seek(&it->sst_list, start, end);
   }
 }
 
 kv_raw_record_t lsmt_iterator_next(lsmt_iterator_t *it) {
   kv_raw_record_t result = {0};
-
   if (!it || !it->active) return result;
 
-  /* Pointers to track the current best record found so far */
-  kv_raw_record_t *winner_record = NULL;
-
-  /* Find min key from Memtables. */
-  for (size_t i = 0; i < it->sl_count; i++) {
-    wrapper_sl_it_t *wrapper = &it->sl_its[i];
-    wr_sl_ensure_buffered(wrapper);
-
-    if (!wrapper->buffered_record.valid) continue;
-
-    if (winner_record == NULL ||
-        (key_compare(wrapper->buffered_record.key, winner_record->key) < 0)) {
-      winner_record = &wrapper->buffered_record;
+  /* Peek Memtable. */
+  kv_raw_record_t *mem_rec = NULL;
+  if (it->sl_count > 0) {
+    wr_sl_ensure_buffered(&it->sl_its[0]);
+    if (it->sl_its[0].buffered_record.valid) {
+      mem_rec = &it->sl_its[0].buffered_record;
     }
   }
 
-  /* Find the min key in the currently opened SSTables. */
-  for (size_t i = 0; i < it->next_lazy_sst_idx; i++) {
-    sst_iterator_t *sst_it = it->sorted_ssts[i];
-
-    sst_ensure_buffered(sst_it);
-    if (!sst_it->buffered_record.valid) continue;
-
-    if (winner_record == NULL ||
-        key_compare(sst_it->buffered_record.key, winner_record->key) < 0) {
-      winner_record = &sst_it->buffered_record;
-    }
-  }
-
-  /* Check if any pending SSTable need to be opened.
-   * Iterate until the next pending SSTable's key range is after the
-   * current candidate.
+  /* Peek from SST list.
+   * sst_list_iterator_next advances state. 
+   * To strictly compare, we'd need peek on the iterator list too.
+   * BUT: standard pattern is:
+   * if (!buffered_sst_val) buffered_sst_val = sst_list_next();
    */
-  while (it->next_lazy_sst_idx < it->sst_count) {
-    sst_iterator_t *pending_sst = it->sorted_ssts[it->next_lazy_sst_idx];
-
-    if (winner_record != NULL && 
-        key_compare(pending_sst->meta->min_key, winner_record->key) > 0) {
-      break;
-    }
-
-    sst_iterator_seek(pending_sst, it->start_key, it->end_key);
-    /* Mark as opened */
-    it->next_lazy_sst_idx++;
-
-    sst_ensure_buffered(pending_sst);
-
-    /* Update the candidate record. */
-    if (pending_sst->buffered_record.valid &&
-        (winner_record == NULL ||
-         key_compare(pending_sst->buffered_record.key, winner_record->key) < 0)) {
-      winner_record = &pending_sst->buffered_record;
+  if (!it->buffered_sst_record.valid && it->sst_list.active) {
+    kv_raw_record_t *rec = sst_k_iterators_next(&it->sst_list);
+    if (rec) {
+      // Deep copy to local buffer because set_iterator advances
+      it->buffered_sst_record = *rec; 
+      it->buffered_sst_record.valid = true;
     }
   }
 
-  if (winner_record == NULL) {
+  kv_raw_record_t *sst_rec = it->buffered_sst_record.valid ?
+    &it->buffered_sst_record : NULL;
+
+  if (mem_rec && sst_rec) {
+    if (key_compare(mem_rec->key, sst_rec->key) <= 0) {
+      result = *mem_rec;
+      mem_rec->valid = false; // Advance Memtable
+                              // If keys are identical (update), consume SST too to hide old version
+      if (key_compare(mem_rec->key, sst_rec->key) == 0) {
+        it->buffered_sst_record.valid = false; 
+      }
+    } else {
+      result = *sst_rec;
+      it->buffered_sst_record.valid = false; // Advance SST Set
+    }
+  } else if (mem_rec) {
+    result = *mem_rec;
+    mem_rec->valid = false;
+  } else if (sst_rec) {
+    result = *sst_rec;
+    it->buffered_sst_record.valid = false;
+  } else {
     it->active = false;
-    return result;
   }
 
-  result = *winner_record;
-  winner_record->valid = false; //Consume the record from the source
   return result;
 }
