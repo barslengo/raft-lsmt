@@ -134,15 +134,15 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t
     if (current_block_size >= index_block_size) current_block_size = 0;
   }
 
-
   if (fflush(new_file) != 0 || fsync(fileno(new_file)) != 0) {
     perror("Sync failed");
     fclose(new_file);
     exit(1);
   }
-  fclose(new_file);
 
+  fclose(new_file);
   sst_k_iterators_close(&set_it);
+
   index_flush(index, file_paths.index_file);
   index_free(index);
 
