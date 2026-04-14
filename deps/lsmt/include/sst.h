@@ -19,9 +19,9 @@ typedef struct sst_metadata_record {
   uint64_t total_bytes;
   sl_uint128_t min_key;
   sl_uint128_t max_key;
-  index_t *cached_index;
   bool old;
-  FILE *fp; //file pointer to the sst file.
+  index_t *cached_index;
+  pthread_mutex_t index_lock;
   atomic_int refcount;
 } sst_metadata_record_t;
 
@@ -70,6 +70,7 @@ typedef struct sst_iterator {
   bool active;
   uint64_t current_offset;
   sst_metadata_record_t *meta;
+  FILE *fp;
   sl_uint128_t start_key;
   sl_uint128_t end_key;
 

@@ -17,7 +17,8 @@ typedef struct lsmt {
   char *db_path;
 
   pthread_mutex_t metadata_lock;
-  pthread_mutex_t memtable_lock; //used when swapping memtable.
+  //pthread_mutex_t memtable_lock; //used when swapping memtable.
+  pthread_rwlock_t memtable_rwlock;
 } lsmt_t;
 
 typedef struct wrapper_sl_it {

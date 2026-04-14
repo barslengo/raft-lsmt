@@ -38,10 +38,7 @@ void sst_metadata_record_release(sst_metadata_record_t *meta) {
       meta->cached_index = NULL;
     }
 
-    if (meta->fp != NULL) {
-      fclose(meta->fp);
-      meta->fp = NULL;
-    }
+    pthread_mutex_destroy(&meta->index_lock);
 
     if (meta->old) {
       remove(meta->sstable_filename);
@@ -58,7 +55,7 @@ static sst_node_t *new_node(sst_metadata_record_t content) {
 
   content.cached_index = NULL;
   content.old = false;
-  content.fp = NULL;
+  //content.fp = NULL;
   *node->content = content; 
   atomic_init(&node->content->refcount, 1);
 
@@ -146,7 +143,7 @@ sst_metadata_record_t create_sst_metadata(uint64_t id, uint32_t level,
     .max_key = max_key
   };
   metadata.cached_index = NULL;
-  metadata.fp = NULL;
+  pthread_mutex_init(&metadata.index_lock, NULL);
 
   strncpy(metadata.sstable_filename, sst_path, 128 - 1); 
   metadata.sstable_filename[128-1] = '\0';
@@ -276,6 +273,7 @@ sst_iterator_t *sst_iterator_create(sst_metadata_record_t *sst) {
   sst_iterator_t *it = calloc(1, sizeof(sst_iterator_t));
   sst_metadata_record_retain(sst);
   it->meta = sst;
+  it->fp = NULL;
   it->active = false;
   it->buffer_cap = 1024;
   it->buffer = malloc(it->buffer_cap);
@@ -285,33 +283,41 @@ sst_iterator_t *sst_iterator_create(sst_metadata_record_t *sst) {
 void sst_iterator_free(sst_iterator_t *it) {
   if (!it) return;
   if (it->meta) sst_metadata_record_release(it->meta);
+  if (it->fp) fclose(it->fp);
   if (it->buffer) free(it->buffer);
   free(it);
 }
 
-static bool sst_meta_record_ensure_open(sst_metadata_record_t *meta) {
-  if (!meta) return false;
+static bool sst_iterator_ensure_open(sst_iterator_t *it) {
+  if (!it || !it->meta) return false;
 
-  if (meta->fp == NULL) {
-    meta->fp = fopen(meta->sstable_filename, "rb");
-
-    if (meta->fp == NULL) {
+  // Open a file descriptor unique to THIS iterator
+  if (it->fp == NULL) {
+    it->fp = fopen(it->meta->sstable_filename, "rb");
+    if (it->fp == NULL) {
       perror("Failed to open SST file");
       return false;
     }
+  }
 
-    // Lazy Load Index if missing
-    if (meta->cached_index == NULL) {
-      meta->cached_index = index_load_from_disk(meta->sst_index_filename); 
-      if (!meta->cached_index) {
-        fclose(meta->fp);
-        meta->fp = NULL;
-        return false;
-      }
+  // Thread-Safe Lazy Load Index using Double-Checked Locking
+  if (it->meta->cached_index == NULL) {
+    pthread_mutex_lock(&it->meta->index_lock);
+
+    if (it->meta->cached_index == NULL) {
+      it->meta->cached_index = index_load_from_disk(it->meta->sst_index_filename); 
+    }
+
+    pthread_mutex_unlock(&it->meta->index_lock);
+
+    if (!it->meta->cached_index) {
+      fclose(it->fp);
+      it->fp = NULL;
+      return false;
     }
   }
 
-  return (meta->fp != NULL && meta->cached_index != NULL);
+  return true;
 }
 
 /* Reads the next sst record header.
@@ -345,7 +351,7 @@ bool sst_iterator_seek(sst_iterator_t *it, sl_uint128_t start, sl_uint128_t end)
     return false; 
   }
 
-  if (!sst_meta_record_ensure_open(sst)) {
+  if (!sst_iterator_ensure_open(it)) {
     it->active = false;
     return false;
   }
@@ -353,7 +359,7 @@ bool sst_iterator_seek(sst_iterator_t *it, sl_uint128_t start, sl_uint128_t end)
   /* Find closest index block. */
   uint64_t offset = index_lookup(sst->cached_index, start);
 
-  if (fseek(sst->fp, offset, SEEK_SET) != 0) {
+  if (fseek(it->fp, offset, SEEK_SET) != 0) {
     it->active = false;
     return false;
   }
@@ -364,7 +370,7 @@ bool sst_iterator_seek(sst_iterator_t *it, sl_uint128_t start, sl_uint128_t end)
 
   /* Move from the closest index block position to the closest
    * key of the provided range. */
-  while (sst_read_next_header(sst->fp, &key, &body_len, raw_header)) {
+  while (sst_read_next_header(it->fp, &key, &body_len, raw_header)) {
 
     /* Went past the key range. */
     if (key_compare(key, end) > 0) {
@@ -395,7 +401,7 @@ bool sst_iterator_seek(sst_iterator_t *it, sl_uint128_t start, sl_uint128_t end)
     /* current key is smaller than the query minimum.
      * just skip to the next record.
      */
-    if (fseek(it->meta->fp, body_len, SEEK_CUR) != 0) {
+    if (fseek(it->fp, body_len, SEEK_CUR) != 0) {
       it->active = false;
       return false;
     }
@@ -424,7 +430,7 @@ static kv_raw_record_t *sst_iterator_peek(sst_iterator_t *it) {
     it->has_pending_header = false;
   }
   else {
-    if (!sst_read_next_header(it->meta->fp, &key, &body_len, it->pending_raw_header)) {
+    if (!sst_read_next_header(it->fp, &key, &body_len, it->pending_raw_header)) {
       it->active = false;
       return NULL;
     }
@@ -445,7 +451,7 @@ static kv_raw_record_t *sst_iterator_peek(sst_iterator_t *it) {
   }
   memcpy(it->buffer, header_src, 21);
 
-  if (fread(it->buffer + 21, 1, body_len, it->meta->fp) != body_len) {
+  if (fread(it->buffer + 21, 1, body_len, it->fp) != body_len) {
     it->active = false;
     return NULL;
   }

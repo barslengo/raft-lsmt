@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#define _GNU_SOURCE
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -425,10 +426,16 @@ lsmt_t *lsmt_init(const char *db_path) {
   lsmt_t *db = malloc(sizeof(lsmt_t));
   db->last_index = NULL;
   db->memtable = sl_init();
-  if (pthread_mutex_init(&db->memtable_lock, NULL) != 0) {
+
+  pthread_rwlockattr_t attr;
+  pthread_rwlockattr_init(&attr);
+  pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+
+  if (pthread_rwlock_init(&db->memtable_rwlock, &attr) != 0) {
     perror("LSMT INIT memtable_lock.");
     exit(1);
   }
+  pthread_rwlockattr_destroy(&attr);
 
   db->db_path = strdup(db_path);
 
@@ -448,7 +455,7 @@ lsmt_t *lsmt_init(const char *db_path) {
 }
 
 void lsmt_flush(lsmt_t *lsmt) {
-  pthread_mutex_lock(&lsmt->memtable_lock);
+  pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
   for(size_t i = 0; i < thread_idx; i++) {
     pthread_join(thread_pool[i], NULL);
   }
@@ -460,7 +467,7 @@ void lsmt_flush(lsmt_t *lsmt) {
 
   dump_to_disk(task_args);
   lsmt->memtable = sl_init();
-  pthread_mutex_unlock(&lsmt->memtable_lock);
+  pthread_rwlock_unlock(&lsmt->memtable_rwlock);
 }
 
 void lsmt_free(lsmt_t *lsmt) {
@@ -469,16 +476,15 @@ void lsmt_free(lsmt_t *lsmt) {
   if (lsmt->metadata) sst_metadata_free(lsmt->metadata); 
   if (lsmt->db_path) free(lsmt->db_path);
   pthread_mutex_destroy(&lsmt->metadata_lock);
-  pthread_mutex_destroy(&lsmt->memtable_lock);
+  pthread_rwlock_destroy(&lsmt->memtable_rwlock);
 
   free(lsmt);
 }
 
 int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size) {
   if (lsmt == NULL || lsmt->memtable == NULL) return -1;
-
+  pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
   if (lsmt->memtable->size > SIZE_THRESHOLD) {
-    pthread_mutex_lock(&lsmt->memtable_lock);
     //dump content to disk in a new thread.
     dump_task_t *task_args = malloc(sizeof(dump_task_t));
     task_args->lsmt = lsmt;
@@ -499,9 +505,9 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
     }
 
     lsmt->memtable = sl_init();
-    pthread_mutex_unlock(&lsmt->memtable_lock);
   }
   int rv = sl_insert(lsmt->memtable, key, content, size);
+  pthread_rwlock_unlock(&lsmt->memtable_rwlock);
   return rv;
 }
 
@@ -594,7 +600,7 @@ lsmt_iterator_t lsmt_iterator_create(lsmt_t *lsmt) {
   it.active = true;
 
   pthread_mutex_lock(&lsmt->metadata_lock);
-  pthread_mutex_lock(&lsmt->memtable_lock);
+  pthread_rwlock_rdlock(&lsmt->memtable_rwlock);
 
   /* Initialize Memtable Iterator. */
   if (lsmt->memtable && lsmt->memtable->size > 0) {
@@ -626,25 +632,26 @@ lsmt_iterator_t lsmt_iterator_create(lsmt_t *lsmt) {
     it.sst_list.count = 0;
   }
 
-  pthread_mutex_unlock(&lsmt->memtable_lock);
+  pthread_rwlock_unlock(&lsmt->memtable_rwlock);
   pthread_mutex_unlock(&lsmt->metadata_lock);
   return it;
 }
 
 void lsmt_iterator_close(lsmt_iterator_t *it) {
-  if (it && it->active) {
+  if (!it) return;
 
-    if (it->sl_count > 0 && it->sl_its) {
-      for (size_t i = 0; i < it->sl_count; i++) {
-        wr_sl_iterator_close(&it->sl_its[i]);
-      }
-      free(it->sl_its);
-      it->sl_its = NULL;
+
+  if (it->sl_count > 0 && it->sl_its) {
+    for (size_t i = 0; i < it->sl_count; i++) {
+      wr_sl_iterator_close(&it->sl_its[i]);
     }
-
-    sst_k_iterators_close(&it->sst_list);
-    it->active = false;
+    free(it->sl_its);
+    it->sl_its = NULL;
+    it->sl_count = 0;
   }
+
+  sst_k_iterators_close(&it->sst_list);
+  it->active = false;
 }
 
 void lsmt_iterator_seek(lsmt_iterator_t *it, sl_uint128_t start, sl_uint128_t end) {
@@ -669,7 +676,9 @@ kv_raw_record_t lsmt_iterator_next(lsmt_iterator_t *it) {
   /* Peek Memtable. */
   kv_raw_record_t *mem_rec = NULL;
   if (it->sl_count > 0) {
+    pthread_rwlock_rdlock(&it->lsmt->memtable_rwlock);
     wr_sl_ensure_buffered(&it->sl_its[0]);
+    pthread_rwlock_unlock(&it->lsmt->memtable_rwlock);
     if (it->sl_its[0].buffered_record.valid) {
       mem_rec = &it->sl_its[0].buffered_record;
     }
