@@ -76,6 +76,7 @@ class StatsTracker:
 # ==============================================================================
 @dataclass(frozen=True)
 class Node:
+    cluster_name: str
     id: int
     host: str
     port: int
@@ -83,21 +84,21 @@ class Node:
 class LeaderRegistry:
     """Thread-safe registry to track the current leader of the cluster."""
     def __init__(self):
-        self._leader: Optional[Node] = None
+        self._leaders: Dict[str, Node] = {}
         self._lock = threading.Lock()
 
     def set_leader(self, node: Node):
         with self._lock:
-            self._leader = node
+            self._leaders[node.cluster_name] = node
 
-    def get_leader(self) -> Optional[Node]:
+    def get_leader(self, cluster_name: str) -> Optional[Node]:
         with self._lock:
-            return self._leader
+            return self._leaders.get(cluster_name)
 
     def clear_leader(self, node: Node):
         with self._lock:
-            if self._leader == node:
-                self._leader = None
+            if self._leaders.get(node.cluster_name) == node:
+                self._leaders[node.cluster_name] = None
 
 class RoutingStrategy(ABC):
     """Abstract base class for routing strategies."""
@@ -131,12 +132,20 @@ class LeaderRoutingStrategy(RoutingStrategy):
 
 class Router:
     """Orchestrator for routing logic."""
-    def __init__(self, nodes: List[Node], strategy: RoutingStrategy):
-        self.nodes = nodes
+    def __init__(self, clusters: Dict[str, List[Node]], strategy: RoutingStrategy):
+        self.clusters = clusters
+        self.cluster_names = sorted(list(clusters.keys()))
         self.strategy = strategy
 
+    def get_cluster_for_key(self, key_id: int, timestamp: int) -> str:
+        val = struct.pack("<QQ", key_id, timestamp)
+        h = int(hashlib.md5(val).hexdigest(), 16)
+        return self.cluster_names[h % len(self.cluster_names)]
+
     def route(self, key_id: int, timestamp: int) -> Node:
-        return self.strategy.get_node(key_id, timestamp, self.nodes)
+        cluster_name = self.get_cluster_for_key(key_id, timestamp)
+        nodes = self.clusters[cluster_name]
+        return self.strategy.get_node(key_id, timestamp, nodes)
 
 # ==============================================================================
 # TRANSPORT MODULE (NetworkClient)
@@ -244,8 +253,9 @@ class WriteWorker(threading.Thread):
         Sends a batch of requests. It prioritizes the known leader from the registry.
         If it fails, it falls back to other nodes to discover the new leader.
         """
+        cluster_name = preferred_node.cluster_name
         # 1. Try known leader first
-        known_leader = self.leader_registry.get_leader()
+        known_leader = self.leader_registry.get_leader(cluster_name)
         
         # 2. Build trial list: [KnownLeader, PreferredNode, ...Others]
         nodes_to_try = []
@@ -254,7 +264,7 @@ class WriteWorker(threading.Thread):
         if preferred_node not in nodes_to_try:
             nodes_to_try.append(preferred_node)
         
-        for n in self.router.nodes:
+        for n in self.router.clusters[cluster_name]:
             if n not in nodes_to_try:
                 nodes_to_try.append(n)
         
@@ -297,24 +307,31 @@ class QueryWorker(threading.Thread):
         self.history = history
         self.history_lock = history_lock
         self.leader_registry = leader_registry
-        self.client = TCPClient()
+        self.clients: Dict[str, TCPClient] = {}
         self.active = False
 
-    def connect_any(self):
-        while not self.stop_event.is_set():
-            leader = self.leader_registry.get_leader()
-            # Filter out the leader for queries (followers only)
-            available_nodes = [n for n in self.router.nodes if n != leader]
-            if not available_nodes:
-                available_nodes = self.router.nodes # Fallback if only one node exists
+    def connect_all(self):
+        for cluster_name, nodes in self.router.clusters.items():
+            if cluster_name not in self.clients:
+                self.clients[cluster_name] = TCPClient()
             
-            node = random.choice(available_nodes)
-            try:
-                self.client.connect(node.host, node.port + 4000)
-                self.active = True
-                return
-            except:
-                time.sleep(0.5)
+            client = self.clients[cluster_name]
+            if client.sock is None:
+                leader = self.leader_registry.get_leader(cluster_name)
+                # Filter out the leader for queries (followers only)
+                available_nodes = [n for n in nodes if n != leader]
+                if not available_nodes:
+                    available_nodes = nodes # Fallback if only one node exists
+                
+                node = random.choice(available_nodes)
+                try:
+                    client.connect(node.host, node.port + 4000)
+                except:
+                    pass
+
+        self.active = all(c.sock is not None for c in self.clients.values())
+        if not self.active:
+            time.sleep(0.5)
 
     def get_valid_query_range(self):
         try:
@@ -339,7 +356,9 @@ class QueryWorker(threading.Thread):
                 start_id, end_id = rng
                 req_id = random.randint(1, 1000000)
                 req_data = struct.pack(QUERY_REQ_FMT, req_id, start_id, 0, end_id, 2**64 - 1)
-                self.client.send(req_data)
+                
+                for client in self.clients.values():
+                    client.send(req_data)
             except Exception:
                 self.active = False
                 break
@@ -347,21 +366,26 @@ class QueryWorker(threading.Thread):
     def receiver_loop(self):
         while self.active and not self.stop_event.is_set():
             try:
-                header_data = self.client.recv_exact(QUERY_RESP_HEADER_SIZE)
-                unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
-                # Indices: 0:total_size, 1:req_id, 2:limit, 3:min_id, 4:min_ts, 5:max_id, 6:max_ts, 7:records_bytes, 8:records_count
-                total_size = unpacked[0]
-                body_size = total_size - QUERY_RESP_HEADER_SIZE
-                if body_size > 0:
-                    _ = self.client.recv_exact(body_size)
-                self.stats.record_read(total_size)
+                total_bytes = 0
+                for client in self.clients.values():
+                    header_data = client.recv_exact(QUERY_RESP_HEADER_SIZE)
+                    unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
+                    # Indices: 0:total_size, 1:req_id, 2:limit, 3:min_id, 4:min_ts, 5:max_id, 6:max_ts, 7:records_bytes, 8:records_count
+                    total_size = unpacked[0]
+                    body_size = total_size - QUERY_RESP_HEADER_SIZE
+                    if body_size > 0:
+                        _ = client.recv_exact(body_size)
+                    total_bytes += total_size
+                self.stats.record_read(total_bytes)
             except Exception:
                 self.active = False
                 break
 
     def run(self):
         while not self.stop_event.is_set():
-            self.connect_any()
+            self.connect_all()
+            if not self.active:
+                continue
             t_send = threading.Thread(target=self.sender_loop, daemon=True)
             t_recv = threading.Thread(target=self.receiver_loop, daemon=True)
             t_send.start()
@@ -370,6 +394,8 @@ class QueryWorker(threading.Thread):
             t_send.join()
             if not self.stop_event.is_set():
                 self.stats.record_read_error()
+                for client in self.clients.values():
+                    client.close()
 
 # ==============================================================================
 # UTILS

@@ -33,28 +33,41 @@ def verify_data(router: Router, total_requests: int, leader_registry: LeaderRegi
     print(f"Verifying {total_requests} records...")
     
     found_keys: Set[int] = set()
-    client = TCPClient(timeout=10.0)
+    clients: Dict[str, TCPClient] = {}
     
-    def connect_to_follower():
-        leader = leader_registry.get_leader()
-        available = [n for n in router.nodes if n != leader]
-        if not available: available = router.nodes
-        
-        for _ in range(len(available) * 2):
-            node = random.choice(available)
-            try:
-                client.connect(node.host, node.port + 4000)
-                return True
-            except:
+    def connect_to_followers():
+        success = True
+        for cluster_name, nodes in router.clusters.items():
+            if cluster_name not in clients:
+                clients[cluster_name] = TCPClient(timeout=10.0)
+            
+            client = clients[cluster_name]
+            if client.sock is not None:
                 continue
-        return False
+                
+            leader = leader_registry.get_leader(cluster_name)
+            available = [n for n in nodes if n != leader]
+            if not available: available = nodes
+            
+            connected = False
+            for _ in range(len(available) * 2):
+                node = random.choice(available)
+                try:
+                    client.connect(node.host, node.port + 4000)
+                    connected = True
+                    break
+                except:
+                    continue
+            if not connected:
+                success = False
+        return success
 
-    if not connect_to_follower():
-        print("Failed to connect for verification.")
+    if not connect_to_followers():
+        print("Failed to connect to all clusters for verification.")
         return False
 
     current_start_id = 1
-    batch_size = 100_000 #5000
+    batch_size = 5000
     start_time = time.time()
     
     while len(found_keys) < total_requests and current_start_id <= total_requests:
@@ -65,35 +78,45 @@ def verify_data(router: Router, total_requests: int, leader_registry: LeaderRegi
         req_data = struct.pack(QUERY_REQ_FMT, req_id, current_start_id, 0, end_id, 2**64 - 1)
         
         try:
-            client.send(req_data)
-            header_data = client.recv_exact(QUERY_RESP_HEADER_SIZE)
-            unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
+            # Send to all
+            for client in clients.values():
+                client.send(req_data)
             
-            # Indices: 0:total_size, 1:req_id, 2:limit, 3:min_id, 4:min_ts, 5:max_id, 6:max_ts, 7:records_bytes, 8:records_count
-            total_size = unpacked[0]
-            limit_reached = unpacked[2]
-            records_bytes = unpacked[7]
-            records_count = unpacked[8]
+            cluster_max_parsed_id = -1
+            any_limit_reached = False
             
-            body_size = total_size - QUERY_RESP_HEADER_SIZE
+            # Recv from all
+            for client in clients.values():
+                header_data = client.recv_exact(QUERY_RESP_HEADER_SIZE)
+                unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
+                
+                # Indices: 0:total_size, 1:req_id, 2:limit, 3:min_id, 4:min_ts, 5:max_id, 6:max_ts, 7:records_bytes, 8:records_count
+                total_size = unpacked[0]
+                limit_reached = unpacked[2]
+                records_bytes = unpacked[7]
+                records_count = unpacked[8]
+                
+                if limit_reached > 0:
+                    any_limit_reached = True
+                
+                body_size = total_size - QUERY_RESP_HEADER_SIZE
+                
+                if body_size > 0:
+                    body = client.recv_exact(body_size)
+                    if records_bytes > 0 and records_count > 0:
+                        record_size = records_bytes // records_count
+                        offset = 0
+                        for _ in range(records_count):
+                            if offset + 8 > len(body): break
+                            key_id = struct.unpack_from("<Q", body, offset)[0]
+                            found_keys.add(key_id)
+                            cluster_max_parsed_id = max(cluster_max_parsed_id, key_id)
+                            offset += record_size
             
-            max_parsed_id = -1
-            if body_size > 0:
-                body = client.recv_exact(body_size)
-                if records_bytes > 0 and records_count > 0:
-                    record_size = records_bytes // records_count
-                    offset = 0
-                    for _ in range(records_count):
-                        if offset + 8 > len(body): break
-                        key_id = struct.unpack_from("<Q", body, offset)[0]
-                        found_keys.add(key_id)
-                        max_parsed_id = max(max_parsed_id, key_id)
-                        offset += record_size
-            
-            if limit_reached > 0 and max_parsed_id != -1:
+            if any_limit_reached and cluster_max_parsed_id != -1:
                 # If limited, resume from the next ID after the max one we actually parsed
-                current_start_id = max_parsed_id + 1
-            elif limit_reached > 0 and max_parsed_id == -1:
+                current_start_id = cluster_max_parsed_id + 1
+            elif any_limit_reached and cluster_max_parsed_id == -1:
                 # Edge case: limited but no records parsed (shouldn't happen, but prevent infinite loop)
                 current_start_id += 1
             else:
@@ -105,7 +128,9 @@ def verify_data(router: Router, total_requests: int, leader_registry: LeaderRegi
                 
         except Exception as e:
             print(f"Error during verification at ID {current_start_id}: {e}")
-            if not connect_to_follower():
+            for client in clients.values():
+                client.close()
+            if not connect_to_followers():
                 break
             time.sleep(1)
 
@@ -133,8 +158,14 @@ def main():
 
     # 1. Load Config
     with open(args.config, 'r') as f:
-        config_data = json.load(f)["A"]
-    nodes = [Node(n['id'], n['host'], n['port']) for n in config_data]
+        config_data = json.load(f)
+    
+    clusters = {}
+    for cluster_name, nodes_data in config_data.items():
+        clusters[cluster_name] = [
+            Node(cluster_name=cluster_name, id=n['id'], host=n['host'], port=n['port'])
+            for n in nodes_data
+        ]
     
     # 2. Setup Router
     strategy = {
@@ -142,7 +173,7 @@ def main():
         "round-robin": RoundRobinRoutingStrategy(),
         "leader": LeaderRoutingStrategy()
     }[args.routing_strategy]
-    router = Router(nodes, strategy)
+    router = Router(clusters, strategy)
     
     # 3. Pre-generate Data
     print(f"Generating {args.requests} requests...")
@@ -184,7 +215,6 @@ def main():
     
     # 7. Verification Phase
     if args.verify:
-        time.sleep(3)
         verify_data(router, args.requests, leader_registry)
 
     print("Benchmark finished.")
