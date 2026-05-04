@@ -13,15 +13,18 @@ from benchmark_core import (
 )
 
 
-def load_dump_files(file_paths: List[str]) -> Set[int]:
-    """Load all key IDs from JSON dump files."""
-    all_keys = set()
+def load_dump_files(file_paths: List[str]) -> List[Dict]:
+    """Load all key ID and timestamp pairs from JSON dump files.
+    
+    JSON format: [{'id': int, 'ts': int}, ...]
+    Returns list of dicts with 'id' and 'ts' keys.
+    """
+    all_records = []
     for file_path in file_paths:
         with open(file_path, 'r') as f:
             data = json.load(f)
-        for entry in data:
-            all_keys.add(entry['id'])
-    return all_keys
+        all_records.extend(data)
+    return all_records
 
 
 def find_dump_files(folder_path: str) -> List[str]:
@@ -29,158 +32,216 @@ def find_dump_files(folder_path: str) -> List[str]:
     return glob.glob(os.path.join(folder_path, '*-dump.json'))
 
 
-def connect_to_followers(router: Router, leader_registry: LeaderRegistry) -> Dict[str, TCPClient]:
-    """Connect to follower nodes in all clusters."""
-    clients = {}
-    for cluster_name, nodes in router.clusters.items():
-        clients[cluster_name] = TCPClient(timeout=10.0)
-        client = clients[cluster_name]
-        
-        leader = leader_registry.get_leader(cluster_name)
-        available = [n for n in nodes if n != leader]
-        if not available:
-            available = nodes
-        
-        connected = False
-        for _ in range(len(available) * 2):
-            node = random.choice(available)
-            try:
-                client.connect(node.host, node.port + 4000)
-                connected = True
-                break
-            except:
-                continue
-        if not connected:
-            raise Exception(f"Failed to connect to any follower in cluster {cluster_name}")
-    return clients
-
-
-def query_range(client: TCPClient, start_id: int, end_id: int, req_id: int) -> Set[int]:
-    """Query a range of keys from a single client and return found keys."""
-    found_keys = set()
-    req_data = struct.pack(QUERY_REQ_FMT, req_id, start_id, 0, end_id, 2**64 - 1)
+def check_integrity(router: Router, expected_records: List[Dict], leader_registry: LeaderRegistry) -> bool:
+    """Check if all expected {id, ts} records are present in the database.
     
-    try:
-        client.send(req_data)
-        header_data = client.recv_exact(QUERY_RESP_HEADER_SIZE)
-        if not header_data:
-            return found_keys
-        
-        unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
-        total_size = unpacked[0]
-        records_bytes = unpacked[7]
-        records_count = unpacked[8]
-        
-        body_size = total_size - QUERY_RESP_HEADER_SIZE
-        if body_size > 0:
-            body = client.recv_exact(body_size)
-            if records_bytes > 0 and records_count > 0:
-                record_size = records_bytes // records_count
-                offset = 0
-                for _ in range(records_count):
-                    if offset + 8 > len(body):
-                        break
-                    key_id = struct.unpack_from("<Q", body, offset)[0]
-                    found_keys.add(key_id)
-                    offset += record_size
-    except Exception as e:
-        print(f"Error querying range {start_id}-{end_id}: {e}")
-    
-    return found_keys
-
-
-def check_integrity(router: Router, expected_keys: Set[int], leader_registry: LeaderRegistry) -> bool:
-    """Check if all expected keys are present in the database."""
+    Uses per-cluster paging: each cluster maintains its own query range.
+    """
     print(f"\n--- Integrity Check ---")
-    print(f"Checking {len(expected_keys)} keys...")
+    print(f"Checking {len(expected_records)} records...")
     
-    if not expected_keys:
-        print("No keys to check.")
-        return True
+    # Build set of expected (id, ts) pairs
+    expected_set = set((r['id'], r['ts']) for r in expected_records)
     
-    min_id = min(expected_keys)
-    max_id = max(expected_keys)
+    # Get min and max ID from expected records for the query range
+    min_id = min(r['id'] for r in expected_records)
+    max_id = max(r['id'] for r in expected_records)
     
-    # Sort expected keys for efficient range queries
-    sorted_keys = sorted(expected_keys)
+    found_records: Set = set()  # Will store (id, ts) tuples
+    clients: Dict[str, TCPClient] = {}
     
-    clients = {}
-    # Connect to all clusters
-    try:
-        clients = connect_to_followers(router, leader_registry)
-    except Exception as e:
-        print(f"Failed to connect: {e}")
+    # Per-cluster paging state
+    cluster_current_start = {}
+    cluster_limit_reached = {}
+    
+    def connect_to_followers():
+        success = True
+        for cluster_name, nodes in router.clusters.items():
+            if cluster_name not in clients:
+                clients[cluster_name] = TCPClient(timeout=10.0)
+            
+            client = clients[cluster_name]
+            if client.sock is not None:
+                continue
+            
+            leader = leader_registry.get_leader(cluster_name)
+            available = [n for n in nodes if n != leader]
+            if not available: available = nodes
+            
+            connected = False
+            for _ in range(len(available) * 2):
+                node = random.choice(available)
+                try:
+                    client.connect(node.host, node.port + 4000)
+                    connected = True
+                    break
+                except:
+                    continue
+            if not connected:
+                success = False
+        return success
+    
+    if not connect_to_followers():
+        print("Failed to connect to all clusters for verification.")
         return False
     
-    found_keys: Set[int] = set()
+    # Initialize per-cluster state
+    for cluster_name in router.clusters.keys():
+        cluster_current_start[cluster_name] = min_id
+        cluster_limit_reached[cluster_name] = False
+    
+    batch_size = 5000
     start_time = time.time()
     
-    # Query in batches to find all keys
-    batch_size = 5000
-    current_start = min_id
-    
-    while len(found_keys) < len(expected_keys) and current_start <= max_id:
-        current_end = min(current_start + batch_size - 1, max_id)
-        req_id = random.randint(1, 1000000)
+    while True:
+        all_clusters_done = True
+        any_found = False
         
-        # Scatter query to all clusters
-        all_batch_keys = set()
-        for client in clients.values():
-            batch_keys = query_range(client, current_start, current_end, req_id)
-            all_batch_keys.update(batch_keys)
-        
-        found_keys.update(all_batch_keys)
-        
-        # Print progress every batch
-        if len(found_keys) % 10000 == 0 or len(found_keys) > 0:
-            print(f"Retrieved {len(found_keys)} unique keys... (Searched up to ID: {current_end})")
-        
-        # If we found keys in this batch, check if we can skip ahead
-        if all_batch_keys:
-            max_found_in_batch = max(all_batch_keys)
-            # Move to next batch after the last found key
-            current_start = max_found_in_batch + 1
-            # But ensure we don't skip over any expected keys
-            # Find the next expected key after max_found_in_batch
-            for key in sorted_keys:
-                if key > max_found_in_batch:
-                    current_start = key
-                    break
-        else:
-            # No keys found, move forward
-            current_start = current_end + 1
-    
-    # Also check if any expected keys are beyond max_id (shouldn't happen but just in case)
-    # Do a final check for any remaining keys
-    remaining_keys = expected_keys - found_keys
-    if remaining_keys:
-        print(f"\n{len(remaining_keys)} keys not found, checking individually...")
-        for key in sorted(remaining_keys):
+        for cluster_name, client in clients.items():
+            current_start_id = cluster_current_start[cluster_name]
+            
+            if current_start_id > max_id:
+                continue
+            
+            end_id = min(current_start_id + batch_size - 1, max_id)
             req_id = random.randint(1, 1000000)
+            
+            req_data = struct.pack(QUERY_REQ_FMT, req_id, current_start_id, 0, end_id, 2**64 - 1)
+            
+            try:
+                client.send(req_data)
+                
+                header_data = client.recv_exact(QUERY_RESP_HEADER_SIZE)
+                if not header_data:
+                    raise Exception("Connection closed")
+                unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
+                
+                total_size = unpacked[0]
+                limit_reached = unpacked[2]
+                records_bytes = unpacked[7]
+                records_count = unpacked[8]
+                
+                cluster_limit_reached[cluster_name] = (limit_reached > 0)
+                
+                body_size = total_size - QUERY_RESP_HEADER_SIZE
+                if body_size > 0:
+                    body = client.recv_exact(body_size)
+                    if records_bytes > 0 and records_count > 0:
+                        record_size = records_bytes // records_count
+                        offset = 0
+                        cluster_max_parsed_id = -1
+                        for _ in range(records_count):
+                            if offset + 16 > len(body):
+                                break
+                            # Each record is key_id (8 bytes) + timestamp (8 bytes)
+                            key_id = struct.unpack_from("<Q", body, offset)[0]
+                            timestamp = struct.unpack_from("<Q", body, offset + 8)[0]
+                            pair = (key_id, timestamp)
+                            if pair in expected_set:
+                                found_records.add(pair)
+                                any_found = True
+                            cluster_max_parsed_id = max(cluster_max_parsed_id, key_id)
+                            offset += record_size
+                        
+                        # Per-cluster paging logic
+                        if cluster_limit_reached[cluster_name] and cluster_max_parsed_id != -1:
+                            cluster_current_start[cluster_name] = cluster_max_parsed_id + 1
+                        elif cluster_limit_reached[cluster_name] and cluster_max_parsed_id == -1:
+                            cluster_current_start[cluster_name] += 1
+                        else:
+                            cluster_current_start[cluster_name] = end_id + 1
+                        
+                        if cluster_current_start[cluster_name] <= max_id:
+                            all_clusters_done = False
+                else:
+                    # No body, advance this cluster
+                    cluster_current_start[cluster_name] = end_id + 1
+                    if cluster_current_start[cluster_name] <= max_id:
+                        all_clusters_done = False
+                
+            except Exception as e:
+                print(f"Error during verification for {cluster_name} at ID {current_start_id}: {e}")
+                client.close()
+                if not connect_to_followers():
+                    return False
+                else:
+                    # Reset this cluster's state to retry from same position
+                    cluster_current_start[cluster_name] = current_start_id
+                    all_clusters_done = False
+                time.sleep(0.1)
+        
+        # Check termination: all clusters done OR all expected records found
+        if all_clusters_done:
+            break
+        
+        if len(found_records) >= len(expected_set):
+            break
+        
+        if any_found and len(found_records) % 10000 < batch_size:
+            min_current = min(cluster_current_start.values())
+            print(f"Retrieved {len(found_records)} records... (Searched up to ID: {min_current - 1})")
+    
+    # Final check: query each missing record individually with exact (id, ts)
+    missing = expected_set - found_records
+    if missing:
+        print(f"\n{len(missing)} records missing from batch queries, checking individually...")
+        still_missing = set()
+        for key_id, ts in sorted(missing):
+            req_id = random.randint(1, 1000000)
+            # Query exact (id, ts) range on all clusters
+            found = False
             for client in clients.values():
-                batch_keys = query_range(client, key, key, req_id)
-                if key in batch_keys:
-                    found_keys.add(key)
+                req_data = struct.pack(QUERY_REQ_FMT, req_id, key_id, ts, key_id, ts)
+                try:
+                    client.send(req_data)
+                    header_data = client.recv_exact(QUERY_RESP_HEADER_SIZE)
+                    if not header_data:
+                        continue
+                    unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
+                    total_size = unpacked[0]
+                    body_size = total_size - QUERY_RESP_HEADER_SIZE
+                    if body_size > 0:
+                        body = client.recv_exact(body_size)
+                        records_bytes = unpacked[7]
+                        records_count = unpacked[8]
+                        if records_bytes > 0 and records_count > 0:
+                            record_size = records_bytes // records_count
+                            offset = 0
+                            for _ in range(records_count):
+                                if offset + 16 > len(body):
+                                    break
+                                rid = struct.unpack_from("<Q", body, offset)[0]
+                                rts = struct.unpack_from("<Q", body, offset + 8)[0]
+                                if rid == key_id and rts == ts:
+                                    found_records.add((key_id, ts))
+                                    found = True
+                                    break
+                                offset += record_size
+                except Exception as e:
+                    pass
+                if found:
                     break
+            if not found:
+                still_missing.add((key_id, ts))
+        missing = still_missing
     
     elapsed = time.time() - start_time
     print(f"Integrity check completed in {elapsed:.2f}s")
-    print(f"Total unique keys found: {len(found_keys)} / {len(expected_keys)}")
+    print(f"Total unique records found: {len(found_records)} / {len(expected_set)}")
     
     # Close all clients
     for client in clients.values():
         client.close()
     
-    missing = expected_keys - found_keys
-    if not missing:
-        print("SUCCESS: All keys are present in the database.")
+    if len(found_records) == len(expected_set):
+        print("SUCCESS: All records are present in the database.")
         return True
     else:
-        print(f"FAILURE: {len(missing)} keys are missing from the database.")
+        print(f"FAILURE: {len(missing)} records are missing from the database.")
         if len(missing) <= 10:
-            print(f"Missing keys: {sorted(missing)}")
+            print(f"Missing records: {sorted(missing)}")
         else:
-            print(f"Missing keys (first 10): {sorted(list(missing))[:10]}")
+            print(f"Missing records (first 10): {sorted(list(missing))[:10]}")
         return False
 
 
@@ -225,12 +286,12 @@ def main():
         dump_files = args.records
         print(f"Loaded {len(dump_files)} dump files from arguments")
     
-    # Extract all expected keys
-    expected_keys = load_dump_files(dump_files)
-    print(f"Total keys to verify: {len(expected_keys)}")
+    # Extract all expected records
+    expected_records = load_dump_files(dump_files)
+    print(f"Total records to verify: {len(expected_records)}")
     
     # Run integrity check
-    success = check_integrity(router, expected_keys, leader_registry)
+    success = check_integrity(router, expected_records, leader_registry)
     
     return 0 if success else 1
 

@@ -147,18 +147,18 @@ def verify_data(router: Router, total_requests: int, leader_registry: LeaderRegi
         return False
 
 def dump_requests_to_json(requests: List, filename: str):
-    """Dump insert requests to a JSON file."""
+    """Dump insert requests to a JSON file, skipping duplicates."""
+    seen = set()
     dump_data = []
-    for binary_packet, metadata in requests:
-        dump_data.append({
-            'binary_hex': binary_packet.hex(),
-            'id': metadata['id'],
-            'ts': metadata['ts']
-        })
+    for _, meta in requests:
+        key_id = meta['id']
+        if key_id not in seen:
+            seen.add(key_id)
+            dump_data.append({'id': key_id, 'ts': meta['ts']})
     
     with open(filename, 'w') as f:
         json.dump(dump_data, f, indent=2)
-    print(f"Dumped {len(requests)} requests to {filename}")
+    print(f"Dumped {len(dump_data)} unique requests to {filename}")
 
 def main():
     parser = argparse.ArgumentParser(description="Modular Raft DB Benchmark Runner")
