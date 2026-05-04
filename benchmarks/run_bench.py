@@ -4,17 +4,19 @@ import random
 import time
 import threading
 import struct
+import queue
+import select
 from typing import List, Dict, Set
 from benchmark_core import (
     Node, Router, HashRoutingStrategy, RoundRobinRoutingStrategy, LeaderRoutingStrategy,
     StatsTracker, WriteWorker, QueryWorker, create_insert_request, TCPClient,
-    QUERY_REQ_FMT, QUERY_RESP_HEADER_FMT, QUERY_RESP_HEADER_SIZE, LeaderRegistry
+    QUERY_REQ_FMT, QUERY_RESP_HEADER_FMT, QUERY_RESP_HEADER_SIZE, LeaderRegistry, ZipfGenerator
 )
 
 def stats_reporter(stats: StatsTracker, stop_event: threading.Event):
     last_snap = stats.get_snapshot()
-    print(f"{'Time':<8} | {'Write OPS':<10} | {'Read OPS':<10} | {'Read BW (MB/s)':<15} | {'Committed':<10} | {'Errors (W/R)':<12}")
-    print("-" * 85)
+    print(f"{'Time':<8} | {'Write OPS':<10} | {'Read OPS':<10} | {'Read BW (MB/s)':<15} | {'Avg Latency (ms)':<16} | {'Committed':<10} | {'Errors (W/R)':<12}")
+    print("-" * 105)
     
     while not stop_event.is_set():
         time.sleep(1.0)
@@ -24,8 +26,9 @@ def stats_reporter(stats: StatsTracker, stop_event: threading.Event):
         r_rate = snap["read_ops"] - last_snap["read_ops"]
         r_bytes_delta = snap["read_bytes"] - last_snap["read_bytes"]
         bw_mb = r_bytes_delta / (1024 * 1024)
+        avg_lat = stats.get_and_reset_latency() * 1000.0
         
-        print(f"{int(snap['elapsed']):<8} | {w_rate:<10} | {r_rate:<10} | {bw_mb:<15.2f} | {snap['write_ops']:<10} | {snap['write_errors']}/{snap['read_errors']:<10}")
+        print(f"{int(snap['elapsed']):<8} | {w_rate:<10} | {r_rate:<10} | {bw_mb:<15.2f} | {avg_lat:<16.2f} | {snap['write_ops']:<10} | {snap['write_errors']}/{snap['read_errors']:<10}")
         last_snap = snap
 
 def verify_data(router: Router, total_requests: int, leader_registry: LeaderRegistry):
@@ -74,23 +77,23 @@ def verify_data(router: Router, total_requests: int, leader_registry: LeaderRegi
         end_id = min(current_start_id + batch_size - 1, total_requests)
         req_id = random.randint(1, 1000000)
         
-        # Request from current_start_id to end_id
         req_data = struct.pack(QUERY_REQ_FMT, req_id, current_start_id, 0, end_id, 2**64 - 1)
         
         try:
-            # Send to all
+            # Scatter
             for client in clients.values():
                 client.send(req_data)
             
             cluster_max_parsed_id = -1
             any_limit_reached = False
             
-            # Recv from all
+            # Gather
             for client in clients.values():
                 header_data = client.recv_exact(QUERY_RESP_HEADER_SIZE)
+                if not header_data:
+                    raise Exception("Connection closed")
                 unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
                 
-                # Indices: 0:total_size, 1:req_id, 2:limit, 3:min_id, 4:min_ts, 5:max_id, 6:max_ts, 7:records_bytes, 8:records_count
                 total_size = unpacked[0]
                 limit_reached = unpacked[2]
                 records_bytes = unpacked[7]
@@ -100,7 +103,6 @@ def verify_data(router: Router, total_requests: int, leader_registry: LeaderRegi
                     any_limit_reached = True
                 
                 body_size = total_size - QUERY_RESP_HEADER_SIZE
-                
                 if body_size > 0:
                     body = client.recv_exact(body_size)
                     if records_bytes > 0 and records_count > 0:
@@ -114,13 +116,10 @@ def verify_data(router: Router, total_requests: int, leader_registry: LeaderRegi
                             offset += record_size
             
             if any_limit_reached and cluster_max_parsed_id != -1:
-                # If limited, resume from the next ID after the max one we actually parsed
                 current_start_id = cluster_max_parsed_id + 1
             elif any_limit_reached and cluster_max_parsed_id == -1:
-                # Edge case: limited but no records parsed (shouldn't happen, but prevent infinite loop)
                 current_start_id += 1
             else:
-                # Not limited, we successfully got everything in this range
                 current_start_id = end_id + 1
             
             if len(found_keys) % 10000 < batch_size and len(found_keys) > 0:
@@ -153,6 +152,8 @@ def main():
     parser.add_argument("--readers", type=int, default=1, help="Number of Reader Connections")
     parser.add_argument("--requests", type=int, default=100000, help="Total items to insert")
     parser.add_argument("--routing-strategy", choices=["hash", "round-robin", "leader"], default="hash", help="Routing strategy to use")
+    parser.add_argument("--data-dist", choices=["sequential", "uniform", "zipfian"], default="sequential", help="Distribution of inserted keys")
+    parser.add_argument("--query-dist", choices=["uniform", "zipfian"], default="uniform", help="Distribution of queried keys")
     parser.add_argument("--verify", action="store_true", help="Run verification phase after benchmark")
     args = parser.parse_args()
 
@@ -176,21 +177,28 @@ def main():
     router = Router(clusters, strategy)
     
     # 3. Pre-generate Data
-    print(f"Generating {args.requests} requests...")
-    requests = [create_insert_request(i + 1) for i in range(args.requests)]
+    print(f"Generating {args.requests} requests (Data Dist: {args.data_dist})...")
+    if args.data_dist == 'sequential':
+        keys = list(range(1, args.requests + 1))
+    elif args.data_dist == 'uniform':
+        keys = list(range(1, args.requests + 1))
+        random.shuffle(keys)
+    elif args.data_dist == 'zipfian':
+        zipf = ZipfGenerator(args.requests)
+        keys = [zipf.next() for _ in range(args.requests)]
+    
+    requests = [create_insert_request(k) for k in keys]
     
     # 4. Start Telemetry
     stats = StatsTracker()
     leader_registry = LeaderRegistry()
     stop_event = threading.Event()
-    history = []
-    history_lock = threading.Lock()
     
     reporter_thread = threading.Thread(target=stats_reporter, args=(stats, stop_event), daemon=True)
     reporter_thread.start()
 
     # 5. Start Workers
-    readers = [QueryWorker(router, stats, stop_event, history, history_lock, leader_registry) for _ in range(args.readers)]
+    readers = [QueryWorker(router, stats, stop_event, leader_registry, args.requests) for _ in range(args.readers)]
     for r in readers: r.start()
 
     writers = []
@@ -199,7 +207,7 @@ def main():
     for i in range(args.writers):
         start = i * chunk_size
         end = start + chunk_size if i < args.writers - 1 else args.requests
-        w = WriteWorker(requests[start:end], router, stats, stop_event, history, history_lock, leader_registry)
+        w = WriteWorker(requests[start:end], router, stats, stop_event, [], threading.Lock(), leader_registry)
         w.start()
         writers.append(w)
 

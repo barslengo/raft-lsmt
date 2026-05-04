@@ -7,9 +7,20 @@ import argparse
 import random
 import sys
 import hashlib
+import select
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Tuple, Protocol
 from dataclasses import dataclass
+
+class ZipfGenerator:
+    def __init__(self, n: int, alpha: float = 1.0):
+        self.n = n
+        size = min(n, 100000)
+        self.population = list(range(1, size + 1))
+        self.weights = [1.0 / (i ** alpha) for i in range(1, size + 1)]
+        
+    def next(self) -> int:
+        return random.choices(self.population, weights=self.weights, k=1)[0]
 
 # ==============================================================================
 # PROTOCOL CONSTANTS
@@ -41,6 +52,20 @@ class StatsTracker:
         self.read_errors = 0
         self.write_errors = 0
         self.start_time = time.time()
+        self.query_latencies = []
+        self.latency_lock = threading.Lock()
+
+    def record_query_latency(self, latency_sec: float):
+        with self.latency_lock:
+            self.query_latencies.append(latency_sec)
+
+    def get_and_reset_latency(self) -> float:
+        with self.latency_lock:
+            if not self.query_latencies:
+                return 0.0
+            avg = sum(self.query_latencies) / len(self.query_latencies)
+            self.query_latencies = []
+            return avg
 
     def record_write(self, count: int):
         with self._lock:
@@ -299,15 +324,17 @@ class WriteWorker(threading.Thread):
                 time.sleep(0.1)
 
 class QueryWorker(threading.Thread):
-    def __init__(self, router: Router, stats: StatsTracker, stop_event: threading.Event, history: List[Dict], history_lock: threading.Lock, leader_registry: LeaderRegistry):
+    def __init__(self, router: Router, stats: StatsTracker, stop_event: threading.Event, leader_registry: LeaderRegistry, max_key: int):
         super().__init__()
         self.router = router
         self.stats = stats
         self.stop_event = stop_event
-        self.history = history
-        self.history_lock = history_lock
         self.leader_registry = leader_registry
+        self.max_key = max_key
         self.clients: Dict[str, TCPClient] = {}
+        self.pending_requests = {}
+        self.pending_lock = threading.Lock()
+        self.semaphore = threading.Semaphore(50)
         self.active = False
 
     def connect_all(self):
@@ -333,29 +360,19 @@ class QueryWorker(threading.Thread):
         if not self.active:
             time.sleep(0.5)
 
-    def get_valid_query_range(self):
-        try:
-            with self.history_lock:
-                hist_len = len(self.history)
-                if hist_len < 10:
-                    return None
-                idx = random.randint(0, hist_len - 1)
-                start_id = self.history[idx]['id']
-            range_len = random.randint(10, 5000)
-            return start_id, start_id + range_len
-        except:
-            return None
-
     def sender_loop(self):
         while self.active and not self.stop_event.is_set():
             try:
-                rng = self.get_valid_query_range()
-                if not rng:
-                    time.sleep(0.1)
+                if not self.semaphore.acquire(timeout=0.1):
                     continue
-                start_id, end_id = rng
+                    
+                start_id = random.randint(1, self.max_key)
+                end_id = start_id + random.randint(10, 5000)
                 req_id = random.randint(1, 1000000)
                 req_data = struct.pack(QUERY_REQ_FMT, req_id, start_id, 0, end_id, 2**64 - 1)
+                
+                with self.pending_lock:
+                    self.pending_requests[req_id] = {'start': time.time(), 'count': 0}
                 
                 for client in self.clients.values():
                     client.send(req_data)
@@ -366,17 +383,35 @@ class QueryWorker(threading.Thread):
     def receiver_loop(self):
         while self.active and not self.stop_event.is_set():
             try:
-                total_bytes = 0
-                for client in self.clients.values():
+                sockets = [c.sock for c in self.clients.values() if c.sock]
+                if not sockets:
+                    time.sleep(0.1)
+                    continue
+                
+                readable, _, _ = select.select(sockets, [], [], 0.5)
+                for sock in readable:
+                    client = next(c for c in self.clients.values() if c.sock == sock)
                     header_data = client.recv_exact(QUERY_RESP_HEADER_SIZE)
+                    if not header_data:
+                        raise Exception("Connection closed")
                     unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
-                    # Indices: 0:total_size, 1:req_id, 2:limit, 3:min_id, 4:min_ts, 5:max_id, 6:max_ts, 7:records_bytes, 8:records_count
+                    
                     total_size = unpacked[0]
+                    req_id = unpacked[1]
                     body_size = total_size - QUERY_RESP_HEADER_SIZE
                     if body_size > 0:
                         _ = client.recv_exact(body_size)
-                    total_bytes += total_size
-                self.stats.record_read(total_bytes)
+                    
+                    self.stats.record_read(total_size)
+                    
+                    with self.pending_lock:
+                        if req_id in self.pending_requests:
+                            self.pending_requests[req_id]['count'] += 1
+                            if self.pending_requests[req_id]['count'] == len(self.clients):
+                                latency = time.time() - self.pending_requests[req_id]['start']
+                                self.stats.record_query_latency(latency)
+                                del self.pending_requests[req_id]
+                                self.semaphore.release()
             except Exception:
                 self.active = False
                 break
@@ -386,6 +421,10 @@ class QueryWorker(threading.Thread):
             self.connect_all()
             if not self.active:
                 continue
+                
+            self.pending_requests.clear()
+            self.semaphore = threading.Semaphore(50)
+            
             t_send = threading.Thread(target=self.sender_loop, daemon=True)
             t_recv = threading.Thread(target=self.receiver_loop, daemon=True)
             t_send.start()
