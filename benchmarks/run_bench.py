@@ -7,6 +7,7 @@ import struct
 import queue
 import select
 from typing import List, Dict, Set
+from datetime import datetime
 from benchmark_core import (
     Node, Router, HashRoutingStrategy, RoundRobinRoutingStrategy, LeaderRoutingStrategy,
     StatsTracker, WriteWorker, QueryWorker, create_insert_request, TCPClient,
@@ -145,6 +146,20 @@ def verify_data(router: Router, total_requests: int, leader_registry: LeaderRegi
         print(f"FAILURE: {missing} keys are missing from the database.")
         return False
 
+def dump_requests_to_json(requests: List, filename: str):
+    """Dump insert requests to a JSON file."""
+    dump_data = []
+    for binary_packet, metadata in requests:
+        dump_data.append({
+            'binary_hex': binary_packet.hex(),
+            'id': metadata['id'],
+            'ts': metadata['ts']
+        })
+    
+    with open(filename, 'w') as f:
+        json.dump(dump_data, f, indent=2)
+    print(f"Dumped {len(requests)} requests to {filename}")
+
 def main():
     parser = argparse.ArgumentParser(description="Modular Raft DB Benchmark Runner")
     parser.add_argument("--config", required=True, help="Path to cluster_conf.json")
@@ -155,6 +170,7 @@ def main():
     parser.add_argument("--data-dist", choices=["sequential", "uniform", "zipfian"], default="sequential", help="Distribution of inserted keys")
     parser.add_argument("--query-dist", choices=["uniform", "zipfian"], default="uniform", help="Distribution of queried keys")
     parser.add_argument("--verify", action="store_true", help="Run verification phase after benchmark")
+    parser.add_argument("--dump", action="store_true", help="Dump insert requests to JSON file")
     args = parser.parse_args()
 
     # 1. Load Config
@@ -188,6 +204,12 @@ def main():
         keys = [zipf.next() for _ in range(args.requests)]
     
     requests = [create_insert_request(k) for k in keys]
+    
+    # Dump requests if flag is set
+    if args.dump:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        dump_filename = f"{timestamp}-dump.json"
+        dump_requests_to_json(requests, dump_filename)
     
     # 4. Start Telemetry
     stats = StatsTracker()
