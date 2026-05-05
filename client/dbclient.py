@@ -7,8 +7,23 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from collections import defaultdict
-from router import Router
-from types import Node, Record, QueryRequest
+from .router import Router
+from .types import Node, Record, QueryRequest
+
+# Protocol constants matching the server
+LSMT_TYPE_INT = 1
+
+# Query Protocol
+# Request: [REQ_ID (8)] [START_KEY_ID (8)] [START_TS (8)] [END_KEY_ID (8)] [END_TS (8)] = 40 bytes
+QUERY_REQ_FMT = "<Q Q Q Q Q"
+QUERY_REQ_SIZE = 40
+
+# Response Header: [TOTAL_SIZE (8)] [REQ_ID (8)] [LIMIT (1)] [MIN_ID (8)] [MIN_TS (8)] [MAX_ID (8)] [MAX_TS (8)] [RECORDS_BYTES (8)] [RECORDS_COUNT (4)]
+QUERY_RESP_HEADER_FMT = "<Q Q B Q Q Q Q Q I"
+QUERY_RESP_HEADER_SIZE = 61
+
+INSERT_CMD_FORMAT_PREFIX = "<QQ"  # Key (u64), Timestamp (u64)
+
 
 @dataclass(frozen=True)
 class DbClientConfig:
@@ -18,13 +33,14 @@ class DbClientConfig:
     read_timeout: float = 10.0
     max_retries: int = 3
 
+
 class DbClient:
     def __init__(self, config: DbClientConfig, router: Router):
         self.config = config
         self.thread_pool = ThreadPoolExecutor(max_workers=config.thread_pool_size)
         self._sockets: Dict[Node, socket.socket] = {}  # Socket pool
         self._socket_locks: Dict[Node, threading.Lock] = defaultdict(threading.Lock)
-        self._write_buffer: Dict[Node, List[Tuple[int, int, Any]]] = defaultdict(list)
+        self._write_buffer: Dict[Node, List[Record]] = defaultdict(list)
         self._buffer_lock = threading.Lock()
         self.clusters: Dict[str, List[Node]] = {}
         self.router = router 
@@ -67,14 +83,13 @@ class DbClient:
             return self._sockets[node]
 
     # ====================== WRITE OPERATIONS ======================
-    def write(self, records: List[Tuple[int, int, Any]], verbose: bool = False):
+    def write(self, records: List[Record], verbose: bool = False):
         """
         Buffer records and flush in batches.
         If the leader fails, retry on the new leader.
         """
         with self._buffer_lock:
             for record in records:
-                key_id, timestamp, content = record
                 node = self.router.get_node_insert(record)
 
                 self._write_buffer[node].append(record)
@@ -88,10 +103,8 @@ class DbClient:
         """
         Flush a batch of records to a node.
         If the batch request fails or timeout, try to resend.
-
-        TODO: if the node is not connecting or after max_retries the batch
-        still isnt correctly stored on server, then trigger the function to
-        discover the new leader.
+        If the node is not connecting or after max_retries the batch
+        still isnt correctly stored on server, then discover the new leader.
         """
         with self._buffer_lock:
             batch = self._write_buffer[node]
@@ -102,33 +115,49 @@ class DbClient:
 
         def _send_batch():
             retries = 0
+            current_node = node
             while retries < self.config.max_retries:
                 try:
-                    sock = self._get_socket(node)
+                    sock = self._get_socket(current_node)
                     payload = self._serialize_batch(batch)
                     sock.sendall(payload)
                     # Wait for ACKs (1 byte per record)
                     acks = self._recv_exact(sock, len(batch))
                     if len(acks) != len(batch):
-                        raise RuntimeError(f"Incomplete ACKs from {node}")
+                        raise RuntimeError(f"Incomplete ACKs from {current_node}")
                     return
                 except Exception as e:
                     retries += 1
-                    self.router.leader_registry.clear_leader(node)
+                    self.router.leader_registry.clear_leader(current_node)
+                    
+                    # Try to discover new leader by iterating through cluster nodes
+                    if retries < self.config.max_retries:
+                        cluster_name = current_node.cluster_name
+                        nodes = self.clusters.get(cluster_name, [])
+                        # Find next node in the cluster
+                        try:
+                            current_idx = nodes.index(current_node)
+                        except ValueError:
+                            current_idx = 0
+                        next_idx = (current_idx + 1) % len(nodes)
+                        current_node = nodes[next_idx]
+                    
                     if retries >= self.config.max_retries:
-                        raise RuntimeError(f"Failed to send batch to {node} after {retries} retries: {e}")
-                    # Wait and retry on new leader
+                        raise RuntimeError(f"Failed to send batch to {current_node} after {retries} retries: {e}")
+                    # Wait and retry on new node/leader
                     time.sleep(0.1 * retries)
 
         self.thread_pool.submit(_send_batch)
 
-    def _serialize_batch(self, batch: List[Tuple[int, int, Any]]) -> bytes:
+    def _serialize_batch(self, batch: List[Record]) -> bytes:
         """Serialize a batch of records into a single payload."""
         payload = bytearray()
-        for key_id, timestamp, content in batch:
-            # Example: <I (msg_size) Q (key_id) Q (timestamp) ... (content)>
-            inner_payload = struct.pack("<BIQ", 1, 8, key_id)  # LSMT_TYPE_INT, size=8, content
-            outer_payload = struct.pack("<QQ", key_id, timestamp) + inner_payload
+        for record in batch:
+            # Each record: msg_size (4) + outer_payload
+            # outer_payload: key_id (8) + timestamp (8) + inner_payload
+            # inner_payload: type (1) + size (1) + content (variable)
+            inner_payload = struct.pack("<BIQ", LSMT_TYPE_INT, 8, record.content)
+            outer_payload = struct.pack("<QQ", record.key_id, record.timestamp) + inner_payload
             payload.extend(struct.pack("<I", len(outer_payload)) + outer_payload)
         return bytes(payload)
 
@@ -153,10 +182,7 @@ class DbClient:
     # ====================== READ OPERATIONS ======================
     def read_sync(
         self,
-        min_id: int,
-        min_ts: int,
-        max_id: int,
-        max_ts: int,
+        query: QueryRequest,
         verbose: bool = False,
         timeout: float = None,
     ) -> Dict[str, Any]:
@@ -165,13 +191,12 @@ class DbClient:
         If `verbose=True`, return {cluster: {node: response}}.
         If `timeout` is set, raise `TimeoutError` if not all responses arrive in time.
         """
-        query = (min_id, min_ts, max_id, max_ts)
         nodes = self.router.get_nodes_for_read(query)
 
         futures = []
         for node in nodes:
             future = self.thread_pool.submit(
-                self._query_single_node, node, min_id, min_ts, max_id, max_ts
+                self._query_single_node, node, query
             )
             futures.append(future)
 
@@ -194,10 +219,7 @@ class DbClient:
 
     def send_read_request(
         self,
-        min_id: int,
-        min_ts: int,
-        max_id: int,
-        max_ts: int,
+        query: QueryRequest,
         callback: Optional[Callable[[Node, Dict, float, Optional[Exception]], None]] = None,
         verbose: bool = False,
     ):
@@ -206,7 +228,6 @@ class DbClient:
         If `callback` is provided, it will be called with:
             callback(node, response, latency_seconds, error=None)
         """
-        query = (min_id, min_ts, max_id, max_ts)
         nodes = self.router.get_nodes_for_read(query)
         send_time = time.time()
 
@@ -214,7 +235,7 @@ class DbClient:
             def _query_and_callback(node, send_time):
                 query_start = time.time()
                 try:
-                    node, response = self._query_single_node(node, min_id, min_ts, max_id, max_ts)
+                    node, response = self._query_single_node(node, query)
                     latency = time.time() - query_start
                     if callback:
                         callback(node, response, latency, error=None)
@@ -224,11 +245,12 @@ class DbClient:
 
             self.thread_pool.submit(_query_and_callback, node, send_time)
 
-    def _query_single_node(self, node: Node, min_id: int, min_ts: int, max_id: int, max_ts: int) -> Tuple[Node, Dict]:
+    def _query_single_node(self, node: Node, query: QueryRequest) -> Tuple[Node, Dict]:
         """Query a single node and return (node, response)."""
         try:
             sock = self._get_socket(node)
-            req_data = struct.pack(QUERY_REQ_FMT, random.randint(1, 1000000), min_id, min_ts, max_id, max_ts)
+            req_data = struct.pack(QUERY_REQ_FMT, random.randint(1, 1000000), 
+                                   query.min_id, query.min_ts, query.max_id, query.max_ts)
             sock.sendall(req_data)
 
             # Read response header
