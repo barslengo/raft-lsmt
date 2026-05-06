@@ -316,58 +316,129 @@ class DbClient:
             self.thread_pool.submit(_query_and_callback, node, send_time)
 
     def _query_single_node(self, node: Node, query: QueryRequest) -> Tuple[Node, Dict]:
-        """Query a single node and return (node, response)."""
-        try:
-            sock = self._get_socket(node, for_query=True)
-            # Pack start_key as 16 bytes (id=8 + timestamp=8)
-            start_key = struct.pack("<QQ", query.min_id, query.min_ts)
-            # Pack end_key as 16 bytes (id=8 + timestamp=8)
-            end_key = struct.pack("<QQ", query.max_id, query.max_ts)
-            req_data = struct.pack(QUERY_REQ_FMT, random.randint(1, 1000000), start_key, end_key)
-            sock.sendall(req_data)
+        """Query a single node with pagination support.
+        
+        If the initial node fails, try other nodes in the same cluster
+        (preferring non-leaders first, then leader).
+        For each successful node, fetch all records using pagination.
+        """
+        cluster_name = node.cluster_name
+        nodes = self.clusters.get(cluster_name, [])
+        
+        # Get current leader for this cluster
+        leader = self.router.leader_registry.get_leader(cluster_name)
+        
+        # Build ordered list: non-leaders first, then leader
+        non_leaders = [n for n in nodes if n != leader]
+        leader_node = [n for n in nodes if n == leader]
+        preferred_nodes = non_leaders + leader_node
+        
+        last_error = None
+        for n in preferred_nodes:
+            try:
+                # Query with pagination
+                all_records = []
+                current_min_id = query.min_id
+                current_min_ts = query.min_ts
+                
+                while True:
+                    # Create page query
+                    page_query = QueryRequest(
+                        min_id=current_min_id,
+                        min_ts=current_min_ts,
+                        max_id=query.max_id,
+                        max_ts=query.max_ts
+                    )
+                    
+                    sock = self._get_socket(n, for_query=True)
+                    start_key = struct.pack("<QQ", page_query.min_id, page_query.min_ts)
+                    end_key = struct.pack("<QQ", page_query.max_id, page_query.max_ts)
+                    req_data = struct.pack(QUERY_REQ_FMT, random.randint(1, 1000000), start_key, end_key)
+                    sock.sendall(req_data)
 
-            # Read response header
-            header_data = self._recv_exact(sock, QUERY_RESP_HEADER_SIZE, timeout=self.config.read_timeout)
-            if not header_data:
-                raise ConnectionError(f"Node {node} closed connection")
+                    # Read response header
+                    header_data = self._recv_exact(sock, QUERY_RESP_HEADER_SIZE, timeout=self.config.read_timeout)
+                    if not header_data:
+                        raise ConnectionError(f"Node {n} closed connection")
 
-            unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
-            total_size = unpacked[0]
-            req_id = unpacked[1]
-            limit_reached = unpacked[2]
-            min_key_raw = unpacked[3]  # 16 bytes
-            max_key_raw = unpacked[4]  # 16 bytes
-            records_bytes = unpacked[5]
-            records_count = unpacked[6]
-            
-            # Parse min_key and max_key from raw bytes
-            min_id, min_ts = struct.unpack("<QQ", min_key_raw)
-            max_id, max_ts = struct.unpack("<QQ", max_key_raw)
-            
-            body_size = total_size - QUERY_RESP_HEADER_SIZE
+                    unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
+                    total_size = unpacked[0]
+                    req_id = unpacked[1]
+                    limit_reached = unpacked[2]
+                    min_key_raw = unpacked[3]  # 16 bytes
+                    max_key_raw = unpacked[4]  # 16 bytes
+                    records_bytes = unpacked[5]
+                    records_count = unpacked[6]
+                    
+                    # Parse min_key and max_key from raw bytes
+                    min_id, min_ts = struct.unpack("<QQ", min_key_raw)
+                    max_id, max_ts = struct.unpack("<QQ", max_key_raw)
+                    
+                    body_size = total_size - QUERY_RESP_HEADER_SIZE
 
-            # Read body (if any)
-            body_data = b""
-            if body_size > 0:
-                body_data = self._recv_exact(sock, body_size, timeout=self.config.read_timeout)
+                    # Read body (if any)
+                    body_data = b""
+                    if body_size > 0:
+                        body_data = self._recv_exact(sock, body_size, timeout=self.config.read_timeout)
 
-            return (node, self._parse_response(req_id, limit_reached, 
-                                                  min_id, min_ts, max_id, max_ts,
-                                                  records_bytes, records_count, body_data))
-        except Exception as e:
-            cache_key = (node, True)
-            with self._socket_locks[node]:
-                if cache_key in self._sockets:
-                    try:
-                        self._sockets[cache_key].close()
-                    except:
-                        pass
-                    del self._sockets[cache_key]
-            raise RuntimeError(f"Query to {node} failed: {e}")
+                    response = self._parse_response(req_id, limit_reached, 
+                                                    min_id, min_ts, max_id, max_ts,
+                                                    records_bytes, records_count, body_data)
+                    
+                    all_records.extend(response["records"])
+                    
+                    # Check if we have more records to fetch
+                    if not response["limit_reached"]:
+                        # All records retrieved for this query range
+                        aggregated = {
+                            "req_id": req_id,
+                            "limit_reached": False,
+                            "min_id": query.min_id,
+                            "min_ts": query.min_ts,
+                            "max_id": max_id if all_records else query.max_id,
+                            "max_ts": max_ts if all_records else query.max_ts,
+                            "records_bytes": records_bytes,
+                            "records_count": len(all_records),
+                            "records": all_records
+                        }
+                        return (n, aggregated)
+                    
+                    # Pagination: start after the last record we got
+                    if max_id >= query.max_id and max_ts >= query.max_ts:
+                        # Reached the end of the query range
+                        aggregated = {
+                            "req_id": req_id,
+                            "limit_reached": False,
+                            "min_id": query.min_id,
+                            "min_ts": query.min_ts,
+                            "max_id": query.max_id,
+                            "max_ts": query.max_ts,
+                            "records_bytes": records_bytes,
+                            "records_count": len(all_records),
+                            "records": all_records
+                        }
+                        return (n, aggregated)
+                    
+                    # Next page: start from the next key
+                    current_min_id = max_id + 1
+                    current_min_ts = 0
+                    
+            except Exception as e:
+                last_error = e
+                cache_key = (n, True)
+                with self._socket_locks[n]:
+                    if cache_key in self._sockets:
+                        try:
+                            self._sockets[cache_key].close()
+                        except:
+                            pass
+                        del self._sockets[cache_key]
+        
+        raise RuntimeError(f"Query to cluster {cluster_name} failed after trying {len(preferred_nodes)} nodes. Last error: {last_error}")
 
     def _parse_response(self, req_id, limit_reached, min_id, min_ts, max_id, max_ts, 
                          records_bytes, records_count, body_data):
-        """Parse raw response into a dict."""
+        """Parse raw response into a dict with parsed records."""
         result = {
             "req_id": req_id,
             "limit_reached": bool(limit_reached),
@@ -377,7 +448,37 @@ class DbClient:
             "max_ts": max_ts,
             "records_bytes": records_bytes,
             "records_count": records_count,
+            "records": []
         }
-        if body_data:
-            result["body"] = body_data.hex()
+        
+        if body_data and records_count > 0:
+            offset = 0
+            for _ in range(records_count):
+                # Query response format: key_id (8) + timestamp (8) + type (1) + content_size (4) + content
+                if offset + 21 > len(body_data):
+                    break
+                key_id, timestamp = struct.unpack_from("<QQ", body_data, offset)
+                offset += 16
+                rec_type = struct.unpack_from("<B", body_data, offset)[0]
+                offset += 1
+                content_size = struct.unpack_from("<I", body_data, offset)[0]
+                offset += 4
+                
+                if offset + content_size > len(body_data):
+                    break
+                content_raw = body_data[offset:offset + content_size]
+                offset += content_size
+                
+                # Parse content based on type
+                if rec_type == LSMT_TYPE_INT and content_size == 8:
+                    content = struct.unpack("<Q", content_raw)[0]
+                else:
+                    content = content_raw
+                
+                result["records"].append(Record(
+                    key_id=key_id,
+                    timestamp=timestamp,
+                    content=content
+                ))
+        
         return result
