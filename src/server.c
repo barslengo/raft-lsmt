@@ -301,9 +301,11 @@ static void remove_client(struct Server *s, client_t *c) {
 
   if (c->prev) {
     c->prev->next = c->next;
-  } else {
+  }
+  else if (*head_ptr == c) {
     *head_ptr = c->next;
   }
+
   if (c->next) {
     c->next->prev = c->prev;
   }
@@ -541,7 +543,13 @@ static void dispatch_queries(client_t *client) {
     task->t_start_ns = uv_hrtime();
 
     s->active_queries_count++;
-    uv_queue_work(client->server->loop, &task->work_req, background_query_cb, after_query_cb);
+
+    if (uv_queue_work(client->server->loop, &task->work_req, background_query_cb, after_query_cb) != 0) {
+      s->active_queries_count--;
+      client_release(client);
+      free(task);
+    }
+    //uv_queue_work(client->server->loop, &task->work_req, background_query_cb, after_query_cb);
   }
 
   // Shift remaining partial bytes back to the start of the buffer
@@ -641,7 +649,8 @@ static int FsmApply(struct raft_fsm *fsm,
     count++;
 
     if (e != 0) {
-      return RAFT_INVALID;
+      Logf(s->id, "Warning: lsmt_insert failed with %d.", e);
+      //return RAFT_INVALID;
     }
     /* Advance the offset to the next message in the batch */
     offset += msg_size;
@@ -667,6 +676,7 @@ static int FsmSnapshot(struct raft_fsm *fsm,
   (*bufs)[0].len = sizeof(insert_cmd_t); //sizeof(uint64_t);
   (*bufs)[0].base = raft_malloc((*bufs)[0].len);
   if ((*bufs)[0].base == NULL) {
+    raft_free(*bufs);
     return RAFT_NOMEM;
   }
   //*(uint64_t *)(*bufs)[0].base = f->count;
@@ -680,7 +690,7 @@ static int FsmRestore(struct raft_fsm *fsm, struct raft_buffer *buf)
     return RAFT_MALFORMED;
   }
   //f->count = *(uint64_t *)buf->base;
-  raft_free(buf->base);
+  //raft_free(buf->base);
   return 0;
 }
 
@@ -727,6 +737,57 @@ static void serverTransferCb(struct raft_transfer *req)
   const char *address;
   raft_leader(&s->raft, &id, &address);
   raft_close(&s->raft, serverRaftCloseCb);
+}
+
+static void on_redirect_write_complete(uv_write_t *req, int status) {
+  ack_write_t *wr = (ack_write_t *)req;
+
+  close_and_free_client(wr->client);
+  client_release(wr->client);
+  free(wr->buf.base);
+  free(wr);
+}
+
+static void redirect_to_leader_and_close(client_t *client) {
+  struct Server *s = client->server;
+  raft_id leader_id;
+  const char *leader_addr;
+
+  raft_leader(&s->raft, &leader_id, &leader_addr);
+
+  char *msg = malloc(256);
+  if (!msg) {
+    close_and_free_client(client);
+    return;
+  }
+
+  int len = snprintf(msg, 256, "REDIRECT %llu %s\n", 
+      (unsigned long long)leader_id, 
+      leader_addr ? leader_addr : "UNKNOWN");
+
+  printf("%s\n", msg);
+
+  ack_write_t *wr = malloc(sizeof(ack_write_t));
+  if (!wr) {
+    free(msg);
+    close_and_free_client(client);
+    return;
+  }
+
+  uv_read_stop((uv_stream_t*)&client->handle);
+
+  wr->req.data = wr;
+  wr->client = client;
+  client_retain(client);
+  wr->buf = uv_buf_init(msg, len);
+
+  int r = uv_write(&wr->req, (uv_stream_t*)&client->handle, &wr->buf, 1, on_redirect_write_complete);
+  if (r != 0) {
+    free(msg);
+    client_release(client);
+    free(wr);
+    close_and_free_client(client);
+  }
 }
 
 
@@ -939,7 +1000,9 @@ static bool process_insert_buffer(client_t *client) {
 
     if (s->raft.state != RAFT_LEADER) {
       Log(s->id, "TCP: Rejecting command, not the leader.");
-      close_and_free_client(client);
+      //sendback the current leader ip:port.
+      redirect_to_leader_and_close(client);
+      //close_and_free_client(client);
       return false;
     } else {
 
@@ -999,6 +1062,8 @@ static bool process_insert_buffer(client_t *client) {
   }
   return true;
 }
+
+
 // Libuv callback for when a new client connects to our server
 static void on_insert_connection(uv_stream_t *server_handle, int status) {
   if (status < 0) {
@@ -1024,17 +1089,17 @@ static void on_insert_connection(uv_stream_t *server_handle, int status) {
 
   uv_tcp_init(s->loop, &client->handle);
 
+
   if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
+    client_retain(client);
 
     if (s->raft.state != RAFT_LEADER) {
       Log(s->id, "TCP: Rejecting insert client (Not Leader).");
-      client_retain(client);
-      uv_close((uv_handle_t *)&client->handle, on_client_close);
+      redirect_to_leader_and_close(client);
       return;
     }
 
     Log(s->id, "TCP: New insert client connected.");
-    client_retain(client);
     add_client(s, client, CLIENT_TYPE_INSERT);
 
     uv_tcp_keepalive(&client->handle, 1, 60);
@@ -1042,6 +1107,7 @@ static void on_insert_connection(uv_stream_t *server_handle, int status) {
     uv_read_start((uv_stream_t *)&client->handle, alloc_cb, on_client_read);
   }
   else {
+    client_retain(client);
     close_and_free_client(client);
   }
 }
@@ -1107,15 +1173,15 @@ static void on_read_connection(uv_stream_t *server_handle, int status) {
 
   uv_tcp_init(s->loop, &client->handle);
   if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
+    client_retain(client);
+
     if (s->raft.state == RAFT_LEADER) {
       Log(s->id, "TCP: Rejecting query client (I'm the Leader).");
-      client_retain(client);
-      uv_close((uv_handle_t *)&client->handle, on_client_close);
+      close_and_free_client(client);
       return;
     }
 
     Log(s->id, "TCP: New query client connected.");
-    client_retain(client);
     client->ctx.query.total_queries = 0;
     client->ctx.query.active_query_start_ts = 0;
 
@@ -1125,6 +1191,7 @@ static void on_read_connection(uv_stream_t *server_handle, int status) {
     uv_tcp_nodelay(&client->handle, 1); 
     uv_read_start((uv_stream_t *)&client->handle, alloc_cb, on_client_query);
   } else {
+    client_retain(client);
     close_and_free_client(client);
   }
 }

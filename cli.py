@@ -69,6 +69,8 @@ def show(results: dict, verbose: bool = False):
     else:
         if isinstance(results, dict):
             for key, value in results.items():
+                if key == "records":
+                    continue
                 if (isinstance(value, str)) and len(value) > max_str_len:
                     print(f"{key}: {value[:max_str_len]}...")
                 else:
@@ -184,12 +186,12 @@ def main():
     
     # 3. Setup DbClient
     client_config = DbClientConfig(
-        thread_pool_size=32,
+        thread_pool_size=16,
         batch_size=4096,
         write_timeout=5.0,
         read_timeout=10.0,
-        max_retries=3
     )
+
     db_client = DbClient(client_config, router)
     db_client.connect(clusters)
     

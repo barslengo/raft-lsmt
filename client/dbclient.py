@@ -48,24 +48,30 @@ class DbClient:
     # ====================== CONNECTION MANAGEMENT ======================
     def connect(self, clusters: Dict[str, List[Node]]):
         """
-        Establish connections to all nodes (leaders and replicas).
-        Update the leader registry if a leader is found during connection.
+        Establish eager connections ONLY to the actual leader of each cluster.
+        Followers are quickly probed and discarded to avoid stale socket buffers.
         """
         self.clusters = clusters
+        
         for cluster_name, nodes in clusters.items():
             for node in nodes:
                 try:
-                    # Connect to write port
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(self.config.write_timeout)
                     sock.connect((node.host, node.port))
-                    self._sockets[(node, False)] = sock
-                    # Assume the first node is the leader (or use a discovery protocol)
-                    if not self.router.leader_registry.get_leader(cluster_name):
+                    
+                    readable, _, _ = select.select([sock], [],[], 0.05)
+                    
+                    if readable:
+                        sock.close()
+                    else:
+                        sock.settimeout(self.config.write_timeout)
+                        self._sockets[(node, False)] = sock
                         self.router.leader_registry.set_leader(node)
-                    print(f"Connected to {node} (write port {node.port})")
+                        print(f"Connected eagerly to LEADER {node.id} ({cluster_name}) on port {node.port}")
+                        break
+                        
                 except Exception as e:
-                    print(f"Failed to connect to {node} (write port): {e}")
+                    pass
 
     def disconnect(self):
         """Close all sockets and clean up."""
@@ -110,82 +116,121 @@ class DbClient:
     # ====================== WRITE OPERATIONS ======================
     def write(self, records: List[Record], verbose: bool = False):
         """
-        Buffer records and flush in batches.
-        If the leader fails, retry on the new leader.
+        Buffer records and flush exactly in sizes of config.batch_size.
+        Leftover records remain in the buffer until flush() is called.
         """
-        nodes_to_flush = []
-        with self._buffer_lock:
-            for record in records:
-                node = self.router.get_node_insert(record)
-
-                self._write_buffer[node].append(record)
-                if len(self._write_buffer[node]) >= self.config.batch_size:
-                    nodes_to_flush.append(node)
+        batches_to_send =[]
         
-        # Flush outside the lock to avoid deadlock
-        for node in nodes_to_flush:
-            self._flush_batch(node)
-
+        node_records = defaultdict(list)
+        for record in records:
+            node = self.router.get_node_insert(record)
+            node_records[node].append(record)
+            
+        with self._buffer_lock:
+            for node, recs in node_records.items():
+                self._write_buffer[node].extend(recs)
+                
+                while len(self._write_buffer[node]) >= self.config.batch_size:
+                    batch = self._write_buffer[node][:self.config.batch_size]
+                    del self._write_buffer[node][:self.config.batch_size]
+                    batches_to_send.append((node, batch))
+                    
+        futures =[]
+        for node, batch in batches_to_send:
+            futures.append(self._flush_batch(node, batch))
+            
         if verbose:
             with self._buffer_lock:
                 pending = sum(len(v) for v in self._write_buffer.values())
             return {"status": "buffered", "pending": pending}
 
-    def _flush_batch(self, node: Node) -> Future:
-        """
-        Flush a batch of records to a node.
-        If the batch request fails or timeout, try to resend.
-        If the node is not connecting or after max_retries the batch
-        still isnt correctly stored on server, then discover the new leader.
-        
-        Returns:
-            Future: A Future object that can be used to wait for completion
-        """
-        with self._buffer_lock:
-            batch = self._write_buffer[node]
-            self._write_buffer[node] = []
+    def _flush_batch(self, node: Node, batch: List[Record]) -> Future:
+            """
+            Flush a batch of records to a node.
+            If it receives a REDIRECT, it instantly targets the new leader.
+            If it fails, it falls back to other nodes to discover the new leader.
 
-        if not batch:
-            # Return a completed future for empty batches
-            future = Future()
-            future.set_result(None)
-            return future
+            Returns:
+                Future: A Future object that can be used to wait for completion
+            """
+            if not batch:
+                future = Future()
+                future.set_result([])
+                return future
 
-        def _send_batch():
-            retries = 0
-            current_node = node
-            while retries < self.config.max_retries:
-                try:
-                    sock = self._get_socket(current_node, for_query=False)
-                    payload = self._serialize_batch(batch)
-                    sock.sendall(payload)
-                    # Wait for ACKs (1 byte per record)
-                    acks = self._recv_exact(sock, len(batch), timeout=self.config.write_timeout)
-                    if len(acks) != len(batch):
-                        raise RuntimeError(f"Incomplete ACKs from {current_node}")
-                    return
-                except Exception as e:
-                    retries += 1
-                    self.router.leader_registry.clear_leader(current_node)
+            def _send_batch():
+                cluster_name = node.cluster_name
+                nodes = self.clusters.get(cluster_name,[])
+                retries = 0
+                
+                while retries < self.config.max_retries:
+                    current_node = self.router.leader_registry.get_leader(cluster_name)
+                    if not current_node:
+                        current_node = nodes[retries % len(nodes)]
                     
-                    # Try to discover new leader by iterating through cluster nodes
-                    if retries < self.config.max_retries:
-                        cluster_name = current_node.cluster_name
-                        nodes = self.clusters.get(cluster_name, [])
-                        # Find next node in the cluster
+                    try:
+                        sock = self._get_socket(current_node, for_query=False)
+                        payload = self._serialize_batch(batch)
+                        
                         try:
-                            current_idx = nodes.index(current_node)
-                        except ValueError:
-                            current_idx = 0
-                        next_idx = (current_idx + 1) % len(nodes)
-                        current_node = nodes[next_idx]
-                    
-                    if retries >= self.config.max_retries:
-                        raise RuntimeError(f"Failed to send batch to {current_node} after {retries} retries: {e}")
-                    # Wait and retry on new node/leader
-                    time.sleep(0.1 * retries)
+                            sock.sendall(payload)
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
+                        
+                        first_byte = sock.recv(1)
+                        if not first_byte:
+                            raise ConnectionError("Connection closed by server")
+                            
+                        if first_byte == b'R':
+                            rest = sock.recv(255)
+                            msg_str = (b'R' + rest).decode('utf-8', errors='ignore').strip()
+                            
+                            with self._socket_locks[current_node]:
+                                cache_key = (current_node, False)
+                                if cache_key in self._sockets:
+                                    try: self._sockets[cache_key].close()
+                                    except: pass
+                                    del self._sockets[cache_key]
+                            
+                            if msg_str.startswith("REDIRECT"):
+                                parts = msg_str.split(" ")
+                                print(parts)
+                                if len(parts) >= 3:
+                                    leader_id = int(parts[1])
+                                    print(leader_id)
+                                    if leader_id == 0:
+                                        raise ConnectionError("Cluster in election...")
+                                    
+                                    new_leader = next((n for n in nodes if n.id == leader_id), None)
+                                    if new_leader:
+                                        self.router.leader_registry.set_leader(new_leader)
+                                        continue 
+                            
+                            raise ConnectionError("Invalid Redirect") 
+                        else:
+                            remaining = len(batch) - 1
+                            if remaining > 0:
+                                self._recv_exact(sock, remaining, timeout=self.config.write_timeout)
+                                
+                            self.router.leader_registry.set_leader(current_node)
+                            return batch
+                            
+                    except Exception as e:
+                        self.router.leader_registry.clear_leader(current_node)
+                        
+                        with self._socket_locks[current_node]:
+                            cache_key = (current_node, False)
+                            if cache_key in self._sockets:
+                                try: self._sockets[cache_key].close()
+                                except: pass
+                                del self._sockets[cache_key]
+                        
+                        retries += 1
+                        time.sleep(5)
+                
+                raise RuntimeError(f"Failed batch request to the cluster {cluster_name} after {retries} attemps")
 
-        return self.thread_pool.submit(_send_batch)
+            return self.thread_pool.submit(_send_batch)
 
     def _serialize_batch(self, batch: List[Record]) -> bytes:
         """Serialize a batch of records into a single payload.
@@ -223,9 +268,9 @@ class DbClient:
         """Force-flush all buffered writes and wait for completion."""
         futures = []
         with self._buffer_lock:
-            for node, batch in self._write_buffer.items():
+            for node, batch in list(self._write_buffer.items()):
                 if batch:
-                    future = self._flush_batch(node)
+                    future = self._flush_batch(node, batch)
                     futures.append(future)
                     self._write_buffer[node] = []
         

@@ -19,8 +19,13 @@ class LeaderRegistry:
 
     def clear_leader(self, node: Node):
         with self._lock:
-            if self._leaders.get(node.cluster_name) == node:
-                self._leaders[node.cluster_name] = None
+            # Clear leader for the entire cluster, not just this node
+            self._leaders[node.cluster_name] = None
+
+    def clear_cluster_leader(self, cluster_name: str):
+        """Clear leader for a specific cluster."""
+        with self._lock:
+            self._leaders[cluster_name] = None
 
 class RoutingStrategy(ABC):
     """Abstract base class for routing strategies."""
