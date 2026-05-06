@@ -1,7 +1,7 @@
 import threading
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Tuple, Callable
-from .types import Record, QueryRequest, Node
+from .db_datatypes import Record, QueryRequest, Node
 
 class LeaderRegistry:
     """Thread-safe registry to track the current leader of each cluster."""

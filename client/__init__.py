@@ -1,4 +1,4 @@
-from .types import Node, Record, QueryRequest
+from .db_datatypes import Node, Record, QueryRequest
 from .router import Router, RoutingStrategy, LeaderRegistry
 from .routing_strats import HashRoutingStrategy, RoundRobinRoutingStrategy, LeaderRoutingStrategy
 from .dbclient import DbClient, DbClientConfig

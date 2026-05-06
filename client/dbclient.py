@@ -8,18 +8,18 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from collections import defaultdict
 from .router import Router
-from .types import Node, Record, QueryRequest
+from .db_datatypes import Node, Record, QueryRequest
 
 # Protocol constants matching the server
 LSMT_TYPE_INT = 1
 
 # Query Protocol
-# Request: [REQ_ID (8)] [START_KEY_ID (8)] [START_TS (8)] [END_KEY_ID (8)] [END_TS (8)] = 40 bytes
-QUERY_REQ_FMT = "<Q Q Q Q Q"
+# Request: [REQ_ID (8)] [START_KEY (16 bytes: id+timestamp)] [END_KEY (16 bytes: id+timestamp)] = 40 bytes
+QUERY_REQ_FMT = "<Q 16s 16s"
 QUERY_REQ_SIZE = 40
 
-# Response Header: [TOTAL_SIZE (8)] [REQ_ID (8)] [LIMIT (1)] [MIN_ID (8)] [MIN_TS (8)] [MAX_ID (8)] [MAX_TS (8)] [RECORDS_BYTES (8)] [RECORDS_COUNT (4)]
-QUERY_RESP_HEADER_FMT = "<Q Q B Q Q Q Q Q I"
+# Response Header: [TOTAL_SIZE (8)] [REQ_ID (8)] [LIMIT (1)] [MIN_KEY (16)] [MAX_KEY (16)] [RECORDS_BYTES (8)] [RECORDS_COUNT (4)]
+QUERY_RESP_HEADER_FMT = "<Q Q B 16s 16s Q I"
 QUERY_RESP_HEADER_SIZE = 61
 
 INSERT_CMD_FORMAT_PREFIX = "<QQ"  # Key (u64), Timestamp (u64)
@@ -27,18 +27,18 @@ INSERT_CMD_FORMAT_PREFIX = "<QQ"  # Key (u64), Timestamp (u64)
 
 @dataclass(frozen=True)
 class DbClientConfig:
-    thread_pool_size: int = 32
+    thread_pool_size: int = 16
     batch_size: int = 4096
     write_timeout: float = 5.0
     read_timeout: float = 10.0
-    max_retries: int = 3
+    max_retries: int = 10
 
 
 class DbClient:
     def __init__(self, config: DbClientConfig, router: Router):
         self.config = config
         self.thread_pool = ThreadPoolExecutor(max_workers=config.thread_pool_size)
-        self._sockets: Dict[Node, socket.socket] = {}  # Socket pool
+        self._sockets: Dict[Tuple[Node, bool], socket.socket] = {}  # Socket pool: (node, is_query_port)
         self._socket_locks: Dict[Node, threading.Lock] = defaultdict(threading.Lock)
         self._write_buffer: Dict[Node, List[Record]] = defaultdict(list)
         self._buffer_lock = threading.Lock()
@@ -55,32 +55,57 @@ class DbClient:
         for cluster_name, nodes in clusters.items():
             for node in nodes:
                 try:
+                    # Connect to write port
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(self.config.write_timeout)
                     sock.connect((node.host, node.port))
-                    self._sockets[node] = sock
+                    self._sockets[(node, False)] = sock
                     # Assume the first node is the leader (or use a discovery protocol)
                     if not self.router.leader_registry.get_leader(cluster_name):
                         self.router.leader_registry.set_leader(node)
+                    print(f"Connected to {node} (write port {node.port})")
                 except Exception as e:
-                    print(f"Failed to connect to {node}: {e}")
+                    print(f"Failed to connect to {node} (write port): {e}")
 
     def disconnect(self):
         """Close all sockets and clean up."""
-        for node, sock in self._sockets.items():
+        for cache_key, sock in self._sockets.items():
             try:
                 sock.close()
             except:
                 pass
         self._sockets.clear()
 
-    def _get_socket(self, node: Node) -> socket.socket:
-        """Get or create a socket for a node (thread-safe)."""
+    def _get_socket(self, node: Node, for_query: bool = False) -> socket.socket:
+        """Get or create a socket for a node (thread-safe).
+        
+        Args:
+            node: The node to connect to
+            for_query: If True, connect to query port (node.port + 4000)
+        """
+        port = node.port + 4000 if for_query else node.port
+        
         with self._socket_locks[node]:
-            if node not in self._sockets:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.connect((node.host, node.port))
-                self._sockets[node] = sock
-            return self._sockets[node]
+            cache_key = (node, for_query)
+            # Check if we have a valid socket
+            if cache_key in self._sockets:
+                sock = self._sockets[cache_key]
+                # Test if socket is still connected
+                try:
+                    # Use peek to check if socket is readable (non-blocking check)
+                    # For simplicity, just try to check if it's still open
+                    if sock.fileno() >= 0:
+                        return sock
+                except (OSError, ValueError):
+                    # Socket is closed or invalid, remove it
+                    pass
+            
+            # Create new socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.config.write_timeout if not for_query else self.config.read_timeout)
+            sock.connect((node.host, port))
+            self._sockets[cache_key] = sock
+            return self._sockets[cache_key]
 
     # ====================== WRITE OPERATIONS ======================
     def write(self, records: List[Record], verbose: bool = False):
@@ -88,41 +113,54 @@ class DbClient:
         Buffer records and flush in batches.
         If the leader fails, retry on the new leader.
         """
+        nodes_to_flush = []
         with self._buffer_lock:
             for record in records:
                 node = self.router.get_node_insert(record)
 
                 self._write_buffer[node].append(record)
                 if len(self._write_buffer[node]) >= self.config.batch_size:
-                    self._flush_batch(node)
+                    nodes_to_flush.append(node)
+        
+        # Flush outside the lock to avoid deadlock
+        for node in nodes_to_flush:
+            self._flush_batch(node)
 
         if verbose:
-            return {"status": "buffered", "pending": sum(len(v) for v in self._write_buffer.values())}
+            with self._buffer_lock:
+                pending = sum(len(v) for v in self._write_buffer.values())
+            return {"status": "buffered", "pending": pending}
 
-    def _flush_batch(self, node: Node):
+    def _flush_batch(self, node: Node) -> Future:
         """
         Flush a batch of records to a node.
         If the batch request fails or timeout, try to resend.
         If the node is not connecting or after max_retries the batch
         still isnt correctly stored on server, then discover the new leader.
+        
+        Returns:
+            Future: A Future object that can be used to wait for completion
         """
         with self._buffer_lock:
             batch = self._write_buffer[node]
             self._write_buffer[node] = []
 
         if not batch:
-            return
+            # Return a completed future for empty batches
+            future = Future()
+            future.set_result(None)
+            return future
 
         def _send_batch():
             retries = 0
             current_node = node
             while retries < self.config.max_retries:
                 try:
-                    sock = self._get_socket(current_node)
+                    sock = self._get_socket(current_node, for_query=False)
                     payload = self._serialize_batch(batch)
                     sock.sendall(payload)
                     # Wait for ACKs (1 byte per record)
-                    acks = self._recv_exact(sock, len(batch))
+                    acks = self._recv_exact(sock, len(batch), timeout=self.config.write_timeout)
                     if len(acks) != len(batch):
                         raise RuntimeError(f"Incomplete ACKs from {current_node}")
                     return
@@ -147,37 +185,58 @@ class DbClient:
                     # Wait and retry on new node/leader
                     time.sleep(0.1 * retries)
 
-        self.thread_pool.submit(_send_batch)
+        return self.thread_pool.submit(_send_batch)
 
     def _serialize_batch(self, batch: List[Record]) -> bytes:
-        """Serialize a batch of records into a single payload."""
+        """Serialize a batch of records into a single payload.
+        
+        Server expects: [msg_size (4)] [record_key (16)] [record_value (variable)]
+        where msg_size = 4 + 16 + len(record_value) = total message size
+        """
         payload = bytearray()
         for record in batch:
-            # Each record: msg_size (4) + outer_payload
-            # outer_payload: key_id (8) + timestamp (8) + inner_payload
-            # inner_payload: type (1) + size (1) + content (variable)
+            # inner_payload: type (1) + content_size (4) + content (8)
             inner_payload = struct.pack("<BIQ", LSMT_TYPE_INT, 8, record.content)
+            # outer_payload: key_id (8) + timestamp (8) + inner_payload (13)
             outer_payload = struct.pack("<QQ", record.key_id, record.timestamp) + inner_payload
-            payload.extend(struct.pack("<I", len(outer_payload)) + outer_payload)
+            # msg_size = 4 (for msg_size field) + len(outer_payload)
+            msg_size = 4 + len(outer_payload)
+            payload.extend(struct.pack("<I", msg_size) + outer_payload)
         return bytes(payload)
 
-    def _recv_exact(self, sock: socket.socket, n: int) -> bytes:
-        """Receive exactly n bytes (blocking)."""
+    def _recv_exact(self, sock: socket.socket, n: int, timeout: Optional[float] = None) -> bytes:
+        """Receive exactly n bytes (blocking with timeout)."""
+        if timeout is not None:
+            sock.settimeout(timeout)
         data = bytearray()
         while len(data) < n:
-            chunk = sock.recv(n - len(data))
-            if not chunk:
-                raise ConnectionError("Socket closed")
-            data.extend(chunk)
+            try:
+                chunk = sock.recv(n - len(data))
+                if not chunk:
+                    raise ConnectionError("Socket closed")
+                data.extend(chunk)
+            except socket.timeout:
+                raise ConnectionError("Timeout waiting for data")
         return bytes(data)
 
     def flush(self):
-        """Force-flush all buffered writes."""
+        """Force-flush all buffered writes and wait for completion."""
+        futures = []
         with self._buffer_lock:
             for node, batch in self._write_buffer.items():
                 if batch:
-                    self._flush_batch(node)
+                    future = self._flush_batch(node)
+                    futures.append(future)
                     self._write_buffer[node] = []
+        
+        # Wait for all flush operations to complete
+        if futures:
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Error during flush: {e}")
+                    raise
 
     # ====================== READ OPERATIONS ======================
     def read_sync(
@@ -200,14 +259,25 @@ class DbClient:
             )
             futures.append(future)
 
+        """
+        result format:
+        {
+            clusterA: 
+                [
+                    {"id:ip:port" : (node_info, records)},
+                    {"id:ip:port" : (node_info, records)},
+                ]
+        }
+        """
         results = {}
         try:
             for future in as_completed(futures, timeout=timeout):
                 node, response = future.result()
                 if verbose:
                     if node.cluster_name not in results:
-                        results[node.cluster_name] = {}
-                    results[node.cluster_name][node] = response
+                        results[node.cluster_name] = []
+                    node_name = f"{node.id}:{node.host}:{node.port}"
+                    results[node.cluster_name].append({node_name: (node, response)})
                 else:
                     results.update(response)
         except Exception as e:
@@ -248,45 +318,66 @@ class DbClient:
     def _query_single_node(self, node: Node, query: QueryRequest) -> Tuple[Node, Dict]:
         """Query a single node and return (node, response)."""
         try:
-            sock = self._get_socket(node)
-            req_data = struct.pack(QUERY_REQ_FMT, random.randint(1, 1000000), 
-                                   query.min_id, query.min_ts, query.max_id, query.max_ts)
+            sock = self._get_socket(node, for_query=True)
+            # Pack start_key as 16 bytes (id=8 + timestamp=8)
+            start_key = struct.pack("<QQ", query.min_id, query.min_ts)
+            # Pack end_key as 16 bytes (id=8 + timestamp=8)
+            end_key = struct.pack("<QQ", query.max_id, query.max_ts)
+            req_data = struct.pack(QUERY_REQ_FMT, random.randint(1, 1000000), start_key, end_key)
             sock.sendall(req_data)
 
             # Read response header
-            header_data = self._recv_exact(sock, QUERY_RESP_HEADER_SIZE)
+            header_data = self._recv_exact(sock, QUERY_RESP_HEADER_SIZE, timeout=self.config.read_timeout)
             if not header_data:
                 raise ConnectionError(f"Node {node} closed connection")
 
             unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
             total_size = unpacked[0]
+            req_id = unpacked[1]
+            limit_reached = unpacked[2]
+            min_key_raw = unpacked[3]  # 16 bytes
+            max_key_raw = unpacked[4]  # 16 bytes
+            records_bytes = unpacked[5]
+            records_count = unpacked[6]
+            
+            # Parse min_key and max_key from raw bytes
+            min_id, min_ts = struct.unpack("<QQ", min_key_raw)
+            max_id, max_ts = struct.unpack("<QQ", max_key_raw)
+            
             body_size = total_size - QUERY_RESP_HEADER_SIZE
 
             # Read body (if any)
-            response = list(unpacked[1:])  # Exclude total_size
+            body_data = b""
             if body_size > 0:
-                body_data = self._recv_exact(sock, body_size)
-                response.extend(struct.unpack(f"<{body_size}s", body_data))
+                body_data = self._recv_exact(sock, body_size, timeout=self.config.read_timeout)
 
-            return (node, self._parse_response(response))
+            return (node, self._parse_response(req_id, limit_reached, 
+                                                  min_id, min_ts, max_id, max_ts,
+                                                  records_bytes, records_count, body_data))
         except Exception as e:
+            cache_key = (node, True)
             with self._socket_locks[node]:
-                if node in self._sockets:
+                if cache_key in self._sockets:
                     try:
-                        self._sockets[node].close()
+                        self._sockets[cache_key].close()
                     except:
                         pass
-                    del self._sockets[node]
+                    del self._sockets[cache_key]
             raise RuntimeError(f"Query to {node} failed: {e}")
 
-    def _parse_response(self, unpacked_data):
+    def _parse_response(self, req_id, limit_reached, min_id, min_ts, max_id, max_ts, 
+                         records_bytes, records_count, body_data):
         """Parse raw response into a dict."""
-        return {
-            "req_id": unpacked_data[0],
-            "min_id": unpacked_data[1],
-            "min_ts": unpacked_data[2],
-            "max_id": unpacked_data[3],
-            "max_ts": unpacked_data[4],
-            "records_bytes": unpacked_data[5],
-            "records_count": unpacked_data[6],
+        result = {
+            "req_id": req_id,
+            "limit_reached": bool(limit_reached),
+            "min_id": min_id,
+            "min_ts": min_ts,
+            "max_id": max_id,
+            "max_ts": max_ts,
+            "records_bytes": records_bytes,
+            "records_count": records_count,
         }
+        if body_data:
+            result["body"] = body_data.hex()
+        return result

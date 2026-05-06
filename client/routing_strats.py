@@ -4,7 +4,7 @@ import random
 import threading
 from typing import List, Dict
 from .router import RoutingStrategy, LeaderRegistry
-from .types import Record, QueryRequest, Node
+from .db_datatypes import Record, QueryRequest, Node
 
 
 class HashRoutingStrategy(RoutingStrategy):
