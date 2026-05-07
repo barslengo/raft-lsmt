@@ -25,3 +25,4 @@ class BatchMetrics:
     send_time_ms: int
     ack_recv_time_ms: int
     record_count: int
+    batch_bytes: int

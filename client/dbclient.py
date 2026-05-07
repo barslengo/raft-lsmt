@@ -217,7 +217,8 @@ class DbClient:
                                 batch_metrics = BatchMetrics(
                                         send_time_ms=batch_send_time_ms,
                                         ack_recv_time_ms = int(time.time() * 1000),
-                                        record_count = len(batch))
+                                        record_count = len(batch),
+                                        batch_bytes = len(payload))
 
                                 self.config.write_cb(batch_metrics)
 
