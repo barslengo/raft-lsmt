@@ -19,3 +19,9 @@ class QueryRequest:
     min_ts: int
     max_id: int
     max_ts: int
+
+@dataclass(frozen=True)
+class BatchMetrics:
+    send_time_ms: int
+    ack_recv_time_ms: int
+    record_count: int

@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from collections import defaultdict
 from .router import Router
-from .db_datatypes import Node, Record, QueryRequest
+from .db_datatypes import Node, Record, QueryRequest, BatchMetrics
 
 # Protocol constants matching the server
 LSMT_TYPE_INT = 1
@@ -32,7 +32,7 @@ class DbClientConfig:
     write_timeout: float = 5.0
     read_timeout: float = 10.0
     max_retries: int = 10
-
+    write_cb: Callable[[BatchMetrics], None] = None
 
 class DbClient:
     def __init__(self, config: DbClientConfig, router: Router):
@@ -139,10 +139,7 @@ class DbClient:
         for node, batch in batches_to_send:
             futures.append(self._flush_batch(node, batch))
             
-        if verbose:
-            with self._buffer_lock:
-                pending = sum(len(v) for v in self._write_buffer.values())
-            return {"status": "buffered", "pending": pending}
+        return futures
 
     def _flush_batch(self, node: Node, batch: List[Record]) -> Future:
             """
@@ -162,7 +159,9 @@ class DbClient:
                 cluster_name = node.cluster_name
                 nodes = self.clusters.get(cluster_name,[])
                 retries = 0
-                
+
+                batch_send_time_ms = int(time.time() * 1000)
+ 
                 while retries < self.config.max_retries:
                     current_node = self.router.leader_registry.get_leader(cluster_name)
                     if not current_node:
@@ -213,6 +212,15 @@ class DbClient:
                                 self._recv_exact(sock, remaining, timeout=self.config.write_timeout)
                                 
                             self.router.leader_registry.set_leader(current_node)
+
+                            if self.config.write_cb:
+                                batch_metrics = BatchMetrics(
+                                        send_time_ms=batch_send_time_ms,
+                                        ack_recv_time_ms = int(time.time() * 1000),
+                                        record_count = len(batch))
+
+                                self.config.write_cb(batch_metrics)
+
                             return batch
                             
                     except Exception as e:
