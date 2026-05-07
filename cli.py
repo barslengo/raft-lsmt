@@ -9,6 +9,14 @@ from client import Node, Record, QueryRequest
 from client import DbClient, DbClientConfig
 from client import Router, HashRoutingStrategy, RoundRobinRoutingStrategy, LeaderRoutingStrategy
 
+from concurrent.futures import wait
+
+batch_metrics_list = []
+
+def write_batch_cb(m: BatchMetrics) -> None:
+    batch_metrics_list.append(m)
+    return
+
 class ZipfGenerator:
     """Generates keys following a Zipfian distribution."""
     def __init__(self, n: int, alpha: float = 1.0):
@@ -46,37 +54,110 @@ def bulk_records(amount: int, data_distribution: str, base_timestamp: int = 0) -
     return records
 
 
-def show(results: dict, verbose: bool = False):
+def show(results: dict, verbose: bool = False, max_depth: int = 5, max_length: int = 10):
     """Display query results."""
-    max_str_len = 100
-
-    def node_to_dict(node):
-        """Convert Node dataclass to dict for JSON serialization."""
-        if hasattr(node, 'cluster_name'):
-            return {'cluster_name': node.cluster_name, 'id': node.id, 'host': node.host, 'port': node.port}
-        return node
     
-    def convert_for_json(obj):
-        """Convert objects for JSON serialization."""
-
+    def convert_and_truncate(obj, depth=0):
+        """Recursively convert objects for JSON serialization and truncate long lists/depth."""
+        if depth > max_depth:
+            return "<Max Depth Reached>"
+            
+        # Convert dataclasses (like Node, Record) to dicts
         if hasattr(obj, '__dataclass_fields__'):
-            return { k: convert_for_json(v) for k, v in obj.__dict__.items() }
+            obj = obj.__dict__
+            
+        if isinstance(obj, dict):
+            return {str(k): convert_and_truncate(v, depth + 1) for k, v in obj.items()}
+            
+        elif isinstance(obj, (list, tuple)):
+            if len(obj) > max_length:
+                half = max_length // 2
+                first_part =[convert_and_truncate(x, depth + 1) for x in obj[:half]]
+                last_part =[convert_and_truncate(x, depth + 1) for x in obj[-half:]]
+                return first_part +[f"... ({len(obj) - max_length} more items omitted) ..."] + last_part
+            else:
+                return [convert_and_truncate(x, depth + 1) for x in obj]
+                
         else:
-            return obj
-   
+            # Basic types returned as-is, everything else cast to string
+            if isinstance(obj, (int, float, bool, str, type(None))):
+                return obj
+            return str(obj)
+
     if verbose:
-        print(json.dumps(convert_for_json(results), indent=2, default=str))
+        truncated_results = convert_and_truncate(results)
+        print(json.dumps(truncated_results, indent=2))
     else:
-        if isinstance(results, dict):
-            for key, value in results.items():
-                if key == "records":
-                    continue
-                if (isinstance(value, str)) and len(value) > max_str_len:
-                    print(f"{key}: {value[:max_str_len]}...")
-                else:
-                    print(f"{key}: {value}")
-        else:
+        if not isinstance(results, dict):
             print(results)
+            return
+
+        for cluster_name, node_list in results.items():
+            print(f"\n=== Cluster: {cluster_name} ===")
+            
+            if not isinstance(node_list, list):
+                print(node_list)
+                continue
+
+            for node_entry in node_list:
+                if not isinstance(node_entry, dict):
+                    continue
+                
+                for node_name, node_data in node_entry.items():
+                    print(f"\n[ Node: {node_name} ]")
+                    
+                    # Unpack the (node, response) tuple returned by read()
+                    if isinstance(node_data, tuple) and len(node_data) == 2:
+                        _, response = node_data
+                    else:
+                        response = node_data
+                        
+                    if not isinstance(response, dict):
+                        print(f"    {response}")
+                        continue
+                        
+                    # Print metadata
+                    for k, v in response.items():
+                        if k == "records":
+                            continue
+                        if isinstance(v, str) and len(v) > 100:
+                            v = f"{v[:100]}..."
+                        print(f"    {k}: {v}")
+                        
+                    # Print records with length truncation
+                    records = response.get("records",[])
+                    print(f"    records ({len(records)} total items):")
+                    
+                    if len(records) > max_length:
+                        half = max_length // 2
+                        for rec in records[:half]:
+                            print(f"      - {rec}")
+                        print(f"      ... ({len(records) - max_length} records omitted) ...")
+                        for rec in records[-half:]:
+                            print(f"      - {rec}")
+                    else:
+                        for rec in records:
+                            print(f"      - {rec}")
+                            
+                    if not records:
+                        print("      (empty)")
+
+
+
+def write_sync(dbclient: DbClient, records: List[Record], verbose: bool):
+    wait(dbclient.write(records, verbose=verbose))
+    if batch_metrics_list:
+        total_records = sum(m.record_count for m in batch_metrics_list)
+        total_bytes = sum(m.batch_bytes for m in batch_metrics_list)
+        min_send_time = min(m.send_time_ms for m in batch_metrics_list)
+        max_ack_time = max(m.ack_recv_time_ms for m in batch_metrics_list)
+        total_time_sec = (max_ack_time - min_send_time) / 1000.0
+
+        if total_time_sec > 0:
+            print(f"Total throughput: {total_records // total_time_sec} ops/s")
+            print(f"Total throughput: {total_bytes // 1024 // total_time_sec} kb/s")
+    else:
+        print("No metrics recorded.") 
 
 
 def loop(dbclient: DbClient, verbose: bool = False):
@@ -104,13 +185,12 @@ def loop(dbclient: DbClient, verbose: bool = False):
                 if len(args) < 1:
                     print("Usage: GENERATE <amount> [distribution]")
                     continue
+
                 amount = int(args[0])
                 data_dist = args[1] if len(args) > 1 else "sequential"
                 records = bulk_records(amount, data_dist, int(time.time() * 1000))
                 print(f"Sending {len(records)} records to the database")
-                dbclient.write(records, verbose=verbose)
-                print(f"Queued {len(records)} records for insertion")
-                
+                write_sync(dbclient, records, verbose)
             elif cmd == "INSERT":
                 if len(args) < 3:
                     print("Usage: INSERT <key_id> <timestamp> <content>")
@@ -131,8 +211,8 @@ def loop(dbclient: DbClient, verbose: bool = False):
                 max_id = int(args[2])
                 max_ts = int(args[3])
                 query = QueryRequest(min_id=min_id, min_ts=min_ts, max_id=max_id, max_ts=max_ts)
-                results = dbclient.read_sync(query, verbose=verbose)
-                show(results, verbose)
+                results = dbclient.read(query).result()
+                show(results, verbose, max_depth=10)
                 
             elif cmd == "FLUSH":
                 dbclient.flush()
@@ -186,10 +266,11 @@ def main():
     
     # 3. Setup DbClient
     client_config = DbClientConfig(
-        thread_pool_size=16,
+        thread_pool_size=32,
         batch_size=4096,
         write_timeout=5.0,
         read_timeout=10.0,
+        write_cb = write_batch_cb
     )
 
     db_client = DbClient(client_config, router)
