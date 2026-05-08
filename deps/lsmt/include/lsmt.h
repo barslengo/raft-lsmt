@@ -9,6 +9,13 @@
 #define LSMT_TYPE_INT 1
 #define LSMT_TYPE_STRING 2
 
+/* Callback types for storage events */
+typedef void (*lsmt_compaction_callback_t)(void *user_data, uint64_t start_ts, uint64_t end_ts, uint64_t duration_ms,
+    uint32_t quantity_merged_tables, uint64_t input_bytes, uint64_t output_bytes, uint8_t level);
+
+typedef void (*lsmt_memtable_flush_callback_t)(void *user_data, uint64_t start_ts, uint64_t end_ts, uint64_t duration_ms,
+    uint64_t bytes_flushed);
+
 typedef struct lsmt {
   sst_metadata_t *metadata;
   sl_t *memtable;
@@ -19,6 +26,11 @@ typedef struct lsmt {
   pthread_mutex_t metadata_lock;
   //pthread_mutex_t memtable_lock; //used when swapping memtable.
   pthread_rwlock_t memtable_rwlock;
+  
+  /* Callbacks for monitoring */
+  lsmt_compaction_callback_t compaction_callback;
+  lsmt_memtable_flush_callback_t memtable_flush_callback;
+  void *callback_user_data;
 } lsmt_t;
 
 typedef struct wrapper_sl_it {
@@ -66,4 +78,9 @@ void lsmt_iterator_close(lsmt_iterator_t *it);
 
 /* The iterator fetches the records in ascending order within the provided key range. */
 kv_raw_record_t lsmt_iterator_next(lsmt_iterator_t *it);
+
+/* Set callbacks for monitoring storage events */
+void lsmt_set_compaction_callback(lsmt_t *lsmt, lsmt_compaction_callback_t callback, void *user_data);
+void lsmt_set_memtable_flush_callback(lsmt_t *lsmt, lsmt_memtable_flush_callback_t callback, void *user_data);
+
 #endif

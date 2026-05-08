@@ -12,6 +12,7 @@
 #define APPLY_RATE 100 /* Store new statistic entry every 100 ms. */
 #define GLOBAL_MAX_QUERIES 8 // Limite massimo di query simultanee nel server
 #define MAX_LATENCY_SAMPLES 1000 /* Max samples for latency distribution */
+#define STORAGE_EVENT_BUFFER_SIZE 1000 /* Buffer size for storage events */
 #define Log(SERVER_ID, FORMAT) printf("%d: " FORMAT "\n", SERVER_ID)
 #define Logf(SERVER_ID, FORMAT, ...) \
   printf("%d: " FORMAT "\n", SERVER_ID, __VA_ARGS__)
@@ -42,6 +43,32 @@ typedef struct {
     size_t head;
     size_t count;
 } latency_buffer_t;
+
+/* Storage system event types */
+typedef enum {
+    STORAGE_EVENT_COMPACTION,
+    STORAGE_EVENT_MEMTABLE_FLUSH
+} storage_event_type_t;
+
+/* Buffered storage event */
+typedef struct {
+    storage_event_type_t type;
+    uint64_t timestamp;
+    uint64_t start_ts;
+    uint64_t end_ts;
+    uint64_t duration_ms;
+    union {
+        struct {
+            uint32_t quantity_merged_tables;
+            uint64_t input_bytes;
+            uint64_t output_bytes;
+            uint8_t level;
+        } compaction;
+        struct {
+            uint64_t bytes_flushed;
+        } memtable_flush;
+    } data;
+} storage_event_t;
 
 typedef struct query_response {
   bool limit_reached;
@@ -245,6 +272,11 @@ struct Server
   /* Latency distribution tracking */
   latency_buffer_t latency_buffer;
   
+  /* Storage events */
+  FILE *storage_events_file;
+  storage_event_t storage_events_buffer[STORAGE_EVENT_BUFFER_SIZE];
+  size_t storage_events_count;
+  
   struct {
     FILE *f;
     uint64_t total_requests;
@@ -289,6 +321,70 @@ static double calculate_percentile(uint64_t *sorted_samples, size_t count, doubl
   
   double weight = index - lower;
   return (1.0 - weight) * sorted_samples[lower] + weight * sorted_samples[upper];
+}
+
+/* Callback for compaction events from lsmt */
+static void on_compaction_event(void *user_data, uint64_t start_ts, uint64_t end_ts, uint64_t duration_ms,
+    uint32_t quantity_merged_tables, uint64_t input_bytes, uint64_t output_bytes, uint8_t level) {
+  struct Server *s = (struct Server *)user_data;
+  if (s && s->storage_events_count < STORAGE_EVENT_BUFFER_SIZE) {
+    storage_event_t *evt = &s->storage_events_buffer[s->storage_events_count++];
+    evt->type = STORAGE_EVENT_COMPACTION;
+    evt->timestamp = uv_now(s->loop);
+    evt->start_ts = start_ts;
+    evt->end_ts = end_ts;
+    evt->duration_ms = duration_ms;
+    evt->data.compaction.quantity_merged_tables = quantity_merged_tables;
+    evt->data.compaction.input_bytes = input_bytes;
+    evt->data.compaction.output_bytes = output_bytes;
+    evt->data.compaction.level = level;
+  }
+}
+
+/* Callback for memtable flush events from lsmt */
+static void on_memtable_flush_event(void *user_data, uint64_t start_ts, uint64_t end_ts, uint64_t duration_ms,
+    uint64_t bytes_flushed) {
+  struct Server *s = (struct Server *)user_data;
+  if (s && s->storage_events_count < STORAGE_EVENT_BUFFER_SIZE) {
+    storage_event_t *evt = &s->storage_events_buffer[s->storage_events_count++];
+    evt->type = STORAGE_EVENT_MEMTABLE_FLUSH;
+    evt->timestamp = uv_now(s->loop);
+    evt->start_ts = start_ts;
+    evt->end_ts = end_ts;
+    evt->duration_ms = duration_ms;
+    evt->data.memtable_flush.bytes_flushed = bytes_flushed;
+  }
+}
+
+/* Flush storage events buffer to CSV file */
+static void storage_events_flush(struct Server *s) {
+  if (!s->storage_events_file || s->storage_events_count == 0) {
+    return;
+  }
+  
+  for (size_t i = 0; i < s->storage_events_count; i++) {
+    storage_event_t *evt = &s->storage_events_buffer[i];
+    if (evt->type == STORAGE_EVENT_COMPACTION) {
+      fprintf(s->storage_events_file, "compaction,%lu,%lu,%lu,%lu,%u,%lu,%lu,%u,0\n",
+          evt->timestamp,
+          evt->start_ts,
+          evt->end_ts,
+          evt->duration_ms,
+          evt->data.compaction.quantity_merged_tables,
+          evt->data.compaction.input_bytes,
+          evt->data.compaction.output_bytes,
+          evt->data.compaction.level);
+    } else if (evt->type == STORAGE_EVENT_MEMTABLE_FLUSH) {
+      fprintf(s->storage_events_file, "memtable_flush,%lu,%lu,%lu,%lu,0,0,0,0,%lu\n",
+          evt->timestamp,
+          evt->start_ts,
+          evt->end_ts,
+          evt->duration_ms,
+          evt->data.memtable_flush.bytes_flushed);
+    }
+  }
+  fflush(s->storage_events_file);
+  s->storage_events_count = 0;
 }
 
 
@@ -1337,6 +1433,23 @@ static void setup_batch_level_stats(struct Server *s, const char *path) {
   }
 }
 
+static void setup_storage_events_file(struct Server *s, const char *path) {
+  s->storage_events_file = fopen(path, "w");
+  if (!s->storage_events_file) {
+    printf("Failed to open storage events file %s\n", path);
+    exit(1);
+  }
+  
+  /* Write header */
+  fprintf(s->storage_events_file, "event_type,timestamp,start_ts,end_ts,duration_ms");
+  fprintf(s->storage_events_file, ",quantity_merged_tables,input_bytes,output_bytes,level");
+  fprintf(s->storage_events_file, ",bytes_flushed\n");
+  fflush(s->storage_events_file);
+  
+  /* Initialize buffer */
+  s->storage_events_count = 0;
+}
+
 /* Initialize the example server struct, without starting it yet. */
 static int ServerInit(struct Server *s,
     struct uv_loop_s *loop,
@@ -1473,6 +1586,15 @@ static int ServerInit(struct Server *s,
 
   sprintf(stats_file_path, "%s/stats_batch_%d_%lu.bin", dir, s->id, file_ts);  
   setup_batch_level_stats(s, stats_file_path);
+  
+  /* Setup storage events file */
+  sprintf(stats_file_path, "%s/storage_events_%d_%lu.csv", dir, s->id, file_ts);
+  setup_storage_events_file(s, stats_file_path);
+  
+  /* Register storage event callbacks with lsmt */
+  lsmt_set_compaction_callback(s->db, on_compaction_event, s);
+  lsmt_set_memtable_flush_callback(s->db, on_memtable_flush_event, s);
+  
   return 0;
 
 err_after_configuration_init:
@@ -1714,6 +1836,13 @@ static void statsTimerCb(uv_timer_t *timer)
   /* Reset read counters */
   s->read_stats.prev_queries = s->read_stats.total_queries;
   s->read_stats.prev_bytes_read = s->read_stats.total_bytes_read;
+  
+  /* Flush storage events periodically (every 10 seconds = 100 * 100ms) */
+  static uint64_t last_storage_flush = 0;
+  if (now - last_storage_flush >= 10000) {
+    storage_events_flush(s);
+    last_storage_flush = now;
+  }
 }
 
 /* Called periodically every APPLY_RATE milliseconds. */
@@ -1767,6 +1896,13 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
     fflush(s->batch_log_file);
     fclose(s->batch_log_file);
     s->batch_log_file = NULL;
+  }
+  
+  /* Flush and close storage events file */
+  if (s->storage_events_file) {
+    storage_events_flush(s);
+    fclose(s->storage_events_file);
+    s->storage_events_file = NULL;
   }
 
   /* Close TCP Listening Sockets */
