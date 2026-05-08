@@ -11,6 +11,7 @@
 
 #define APPLY_RATE 100 /* Store new statistic entry every 100 ms. */
 #define GLOBAL_MAX_QUERIES 8 // Limite massimo di query simultanee nel server
+#define MAX_LATENCY_SAMPLES 1000 /* Max samples for latency distribution */
 #define Log(SERVER_ID, FORMAT) printf("%d: " FORMAT "\n", SERVER_ID)
 #define Logf(SERVER_ID, FORMAT, ...) \
   printf("%d: " FORMAT "\n", SERVER_ID, __VA_ARGS__)
@@ -34,6 +35,13 @@ typedef struct __attribute__((packed)) {
     uint64_t t_consensus;
     uint64_t t_total;
 } batch_log_t;
+
+/* Circular buffer for latency samples */
+typedef struct {
+    uint64_t samples[MAX_LATENCY_SAMPLES];
+    size_t head;
+    size_t count;
+} latency_buffer_t;
 
 typedef struct query_response {
   bool limit_reached;
@@ -225,6 +233,18 @@ struct Server
   int active_queries_count;
 
   FILE *batch_log_file;
+  
+  /* Read metrics */
+  struct {
+    uint64_t total_queries;
+    uint64_t total_bytes_read;
+    uint64_t prev_queries;
+    uint64_t prev_bytes_read;
+  } read_stats;
+  
+  /* Latency distribution tracking */
+  latency_buffer_t latency_buffer;
+  
   struct {
     FILE *f;
     uint64_t total_requests;
@@ -240,6 +260,37 @@ struct Server
   } stats;
 
 };
+
+/* Initialize latency buffer */
+static void latency_buffer_init(latency_buffer_t *buf) {
+  buf->head = 0;
+  buf->count = 0;
+}
+
+/* Add a latency sample to the buffer */
+static void latency_buffer_add(latency_buffer_t *buf, uint64_t latency_ms) {
+  buf->samples[buf->head] = latency_ms;
+  buf->head = (buf->head + 1) % MAX_LATENCY_SAMPLES;
+  if (buf->count < MAX_LATENCY_SAMPLES) {
+    buf->count++;
+  }
+}
+
+/* Calculate percentile from sorted samples (caller must ensure samples are sorted) */
+static double calculate_percentile(uint64_t *sorted_samples, size_t count, double percentile) {
+  if (count == 0) return 0.0;
+  if (percentile >= 100.0) return (double)sorted_samples[count - 1];
+  if (percentile <= 0.0) return (double)sorted_samples[0];
+  
+  double index = percentile / 100.0 * (count - 1);
+  size_t lower = (size_t)index;
+  size_t upper = lower + 1;
+  if (upper >= count) upper = lower;
+  
+  double weight = index - lower;
+  return (1.0 - weight) * sorted_samples[lower] + weight * sorted_samples[upper];
+}
+
 
 typedef struct {
   uv_work_t work_req;
@@ -473,6 +524,12 @@ static void on_query_resp_complete(uv_write_t *req, int status) {
 }
 
 static int send_response(client_t *c, uint8_t *data, uint64_t payload_size) {
+  struct Server *s = c->server;
+  
+  /* Track read metrics */
+  s->read_stats.total_queries++;
+  s->read_stats.total_bytes_read += payload_size;
+  
   ack_write_t *wr = malloc(sizeof(ack_write_t));
   if (!wr) {
     free(data); 
@@ -1250,7 +1307,7 @@ static void setup_high_level_stats(struct Server * s, const char *path) {
     exit(1);
   } 
 
-  fprintf(s->stats.f, "Timestamp_ms,Role,OPS,Throughput_MBps,PendingRequests,PendingBytes,Backlog,Avg_Latency_ms,Raft_Idx_Local,Raft_Idx_Applied,Raft_Idx_Commit\n"); 
+  fprintf(s->stats.f, "Timestamp_ms,Role,Term,Write_OPS,Write_MBps,Read_OPS,Read_MBps,PendingRequests,PendingBytes,Backlog,Avg_Latency_ms,P50_Latency_ms,P95_Latency_ms,P99_Latency_ms,Max_Latency_ms,Raft_Idx_Local,Raft_Idx_Applied,Raft_Idx_Commit\n"); 
   fflush(s->stats.f);
 
   s->stats.total_requests = 0;
@@ -1261,6 +1318,15 @@ static void setup_high_level_stats(struct Server * s, const char *path) {
   s->stats.last_run_time = 0;
   s->stats.period_latency_sum = 0;
   s->stats.period_batches_count = 0; 
+  
+  /* Initialize read stats */
+  s->read_stats.total_queries = 0;
+  s->read_stats.total_bytes_read = 0;
+  s->read_stats.prev_queries = 0;
+  s->read_stats.prev_bytes_read = 0;
+  
+  /* Initialize latency buffer */
+  latency_buffer_init(&s->latency_buffer);
 }
 
 static void setup_batch_level_stats(struct Server *s, const char *path) {
@@ -1433,6 +1499,9 @@ static void update_batch_metrics(struct Server *s, apply_ctx_t *ctx) {
 
   uint64_t batch_time = now - ctx->batch_creation_ts;
 
+  /* Store latency in buffer for distribution calculation */
+  latency_buffer_add(&s->latency_buffer, batch_time);
+
   if (s->batch_log_file) {
     batch_log_t entry;
     entry.timestamp = now;
@@ -1497,6 +1566,7 @@ static void statsTimerCb(uv_timer_t *timer)
   struct Server *s = timer->data;
   uint64_t now = uv_now(s->loop);
   int current_state = s->raft.state;
+  raft_term term = raft_current_term(&s->raft);
 
   /* -----------------------------------------------------------------------
    * Calculate Time Delta 
@@ -1509,7 +1579,7 @@ static void statsTimerCb(uv_timer_t *timer)
   if (dt == 0) dt = 1;
 
   /* -----------------------------------------------------------------------
-   * Calculate Rates (OPS & MB/s)
+   * Calculate Write Rates (OPS & MB/s)
    * ----------------------------------------------------------------------- */
   uint64_t current_reqs = s->stats.total_requests;
   uint64_t current_bytes = s->stats.total_bytes;
@@ -1518,8 +1588,20 @@ static void statsTimerCb(uv_timer_t *timer)
   uint64_t delta_bytes = current_bytes - s->stats.prev_bytes;
 
   /* Normalize to Seconds */
-  uint64_t ops_sec = (delta_reqs * 1000) / dt;
-  double mb_sec = ((double)delta_bytes / (1024.0 * 1024.0)) * (1000.0 / dt);
+  uint64_t write_ops_sec = (delta_reqs * 1000) / dt;
+  double write_mb_sec = ((double)delta_bytes / (1024.0 * 1024.0)) * (1000.0 / dt);
+
+  /* -----------------------------------------------------------------------
+   * Calculate Read Rates (OPS & MB/s)
+   * ----------------------------------------------------------------------- */
+  uint64_t current_queries = s->read_stats.total_queries;
+  uint64_t current_bytes_read = s->read_stats.total_bytes_read;
+
+  uint64_t delta_queries = current_queries - s->read_stats.prev_queries;
+  uint64_t delta_bytes_read = current_bytes_read - s->read_stats.prev_bytes_read;
+
+  uint64_t read_ops_sec = (delta_queries * 1000) / dt;
+  double read_mb_sec = ((double)delta_bytes_read / (1024.0 * 1024.0)) * (1000.0 / dt);
 
   /* -----------------------------------------------------------------------
    * Calculate Average Latency (From previous step)
@@ -1527,6 +1609,41 @@ static void statsTimerCb(uv_timer_t *timer)
   double avg_latency_ms = 0.0;
   if (s->stats.period_batches_count > 0) {
     avg_latency_ms = (double)s->stats.period_latency_sum / (double)s->stats.period_batches_count;
+  }
+
+  /* -----------------------------------------------------------------------
+   * Calculate Latency Distribution (p50, p95, p99, MAX)
+   * ----------------------------------------------------------------------- */
+  double p50_latency_ms = 0.0;
+  double p95_latency_ms = 0.0;
+  double p99_latency_ms = 0.0;
+  double max_latency_ms = 0.0;
+  
+  if (s->latency_buffer.count > 0) {
+    /* Copy and sort samples */
+    uint64_t sorted_samples[MAX_LATENCY_SAMPLES];
+    size_t count = s->latency_buffer.count;
+    size_t start = (s->latency_buffer.head + MAX_LATENCY_SAMPLES - count) % MAX_LATENCY_SAMPLES;
+    
+    for (size_t i = 0; i < count; i++) {
+      sorted_samples[i] = s->latency_buffer.samples[(start + i) % MAX_LATENCY_SAMPLES];
+    }
+    
+    /* Insertion sort for small arrays */
+    for (size_t i = 1; i < count; i++) {
+      uint64_t key = sorted_samples[i];
+      size_t j = i;
+      while (j > 0 && sorted_samples[j - 1] > key) {
+        sorted_samples[j] = sorted_samples[j - 1];
+        j--;
+      }
+      sorted_samples[j] = key;
+    }
+    
+    p50_latency_ms = calculate_percentile(sorted_samples, count, 50.0);
+    p95_latency_ms = calculate_percentile(sorted_samples, count, 95.0);
+    p99_latency_ms = calculate_percentile(sorted_samples, count, 99.0);
+    max_latency_ms = (double)sorted_samples[count - 1];
   }
 
   raft_index idx_current = raft_last_index(&s->raft);
@@ -1565,26 +1682,38 @@ static void statsTimerCb(uv_timer_t *timer)
   else if (current_state == RAFT_CANDIDATE) role_name = "CANDIDATE";
 
   if (s->stats.f) {
-    fprintf(s->stats.f, "%lu,%s,%lu,%.2f,%lu,%lu,%lu,%.2f,%llu,%llu,%llu\n",
+    fprintf(s->stats.f, "%lu,%s,%llu,%lu,%.2f,%lu,%.2f,%lu,%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,%llu,%llu\n",
         now, 
         role_name, 
-        ops_sec, 
-        mb_sec,
+        term,
+        write_ops_sec, 
+        write_mb_sec,
+        read_ops_sec,
+        read_mb_sec,
         pending_client_reqs, 
         total_pending_bytes, 
         backlog,
         avg_latency_ms,
+        p50_latency_ms,
+        p95_latency_ms,
+        p99_latency_ms,
+        max_latency_ms,
         idx_current,
         idx_applied,
         idx_commit
         );
   }
+  
   // Reset Counters
   s->stats.prev_requests = s->stats.total_requests;
   s->stats.prev_bytes = s->stats.total_bytes;
   s->stats.period_latency_sum = 0;
   s->stats.period_batches_count = 0;
   s->stats.last_run_time = now;
+  
+  /* Reset read counters */
+  s->read_stats.prev_queries = s->read_stats.total_queries;
+  s->read_stats.prev_bytes_read = s->read_stats.total_bytes_read;
 }
 
 /* Called periodically every APPLY_RATE milliseconds. */
