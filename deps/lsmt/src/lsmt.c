@@ -47,7 +47,7 @@ void lsmt_set_memtable_flush_callback(lsmt_t *lsmt, lsmt_memtable_flush_callback
 
 #define SIZE_THRESHOLD (2 * 1024 * 1024)
 
-#define POOL_SIZE 4 
+#define POOL_SIZE 8 
 #define ZERO_LEVEL_MAX_SIZE (8 * 1024 * 1024) //maximum size for level 0 sstables.
 #define SSTABLE_MERGE_LIMIT 4 //maximum number of sstable to merge
 
@@ -120,7 +120,14 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t
     perror("Failed to open new sst file");
     exit(1);
   }
-  setvbuf(new_file, NULL, _IOFBF, 128 * 1024);
+
+  uint64_t input_bytes = 0;
+  for (int k = 0; k < length; k++) {
+    input_bytes += records[k]->total_bytes;
+  }
+
+  posix_fallocate(fileno(new_file), 0, input_bytes);
+  setvbuf(new_file, NULL, _IOFBF, 1024 * 1024);
 
   index_t *index = index_init(1024);
   uint64_t offset = 0;
@@ -415,7 +422,6 @@ static void *dump_to_disk(void *arg) {
 
   index_flush(index, files.index_file); 
   index_free(index);
-  sl_release(memtable);
 
   sst_metadata_record_t metadata = create_sst_metadata(0, 0, offset, min_key, max_key, files.sst_file, files.index_file);
   free(files.sst_file);
@@ -428,6 +434,21 @@ static void *dump_to_disk(void *arg) {
   sst_metadata_flush(lsmt->metadata);
 
   pthread_mutex_unlock(&lsmt->metadata_lock);
+
+  /* Unregister the immutable memtable. */
+  pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
+  for (int i = 0; i < lsmt->immutable_count; i++) {
+    if (lsmt->immutables[i] == memtable) {
+      /* Shift remaining memtables */
+      for (int j = i; j < lsmt->immutable_count - 1; j++) {
+        lsmt->immutables[j] = lsmt->immutables[j+1];
+      }
+      lsmt->immutable_count--;
+      break;
+    }
+  }
+  pthread_rwlock_unlock(&lsmt->memtable_rwlock);
+  sl_release(memtable);
 
   sst_compact(lsmt, lsmt->metadata, lsmt->db_path, &lsmt->metadata_lock);
   
@@ -477,6 +498,11 @@ lsmt_t *lsmt_init(const char *db_path) {
   lsmt_t *db = malloc(sizeof(lsmt_t));
   db->last_index = NULL;
   db->memtable = sl_init();
+  db->immutable_count = 0;
+
+  for (int i = 0; i < MAX_IMMUTABLES; i++) {
+    db->immutables[i] = NULL;
+  }
 
   pthread_rwlockattr_t attr;
   pthread_rwlockattr_init(&attr);
@@ -551,18 +577,30 @@ void lsmt_free(lsmt_t *lsmt) {
 int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size) {
   if (lsmt == NULL || lsmt->memtable == NULL) return -1;
 
+  sl_t *memtable_to_flush = NULL;
+
   pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
   if (lsmt->memtable->size > SIZE_THRESHOLD) {
+    memtable_to_flush = lsmt->memtable;
+    lsmt->immutables[lsmt->immutable_count++] = memtable_to_flush;
+    lsmt->memtable = sl_init();
+  }
+  int rv = sl_insert(lsmt->memtable, key, content, size);
+  pthread_rwlock_unlock(&lsmt->memtable_rwlock);
+
+  if (memtable_to_flush != NULL) {
     //dump content to disk in a new thread.
     dump_task_t *task_args = malloc(sizeof(dump_task_t));
     task_args->lsmt = lsmt;
 
     /* Transfering ownership. */
-    task_args->memtable = lsmt->memtable;
+    task_args->memtable = memtable_to_flush;
 
     pthread_mutex_lock(&lsmt->thread_pool_mutex);
 
-    /* Wait until at least one thread slot is available */
+    /* Wait for a background thread slot. 
+     * Because the memtable lock is RELEASED, other clients can 
+     * keep writing to the active_memtable while we wait here! */
     while (lsmt->active_background_threads >= POOL_SIZE) {
       pthread_cond_wait(&lsmt->thread_pool_cond, &lsmt->thread_pool_mutex);
     }
@@ -576,12 +614,8 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_create(&t, &attr, dump_to_disk, task_args);
     pthread_attr_destroy(&attr);
-    
-    lsmt->memtable = sl_init();
   }
 
-  int rv = sl_insert(lsmt->memtable, key, content, size);
-  pthread_rwlock_unlock(&lsmt->memtable_rwlock);
   return rv;
 }
 

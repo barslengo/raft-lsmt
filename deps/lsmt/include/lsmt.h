@@ -8,6 +8,7 @@
 
 #define LSMT_TYPE_INT 1
 #define LSMT_TYPE_STRING 2
+#define MAX_IMMUTABLES 16
 
 /* Callback types for storage events */
 typedef void (*lsmt_compaction_callback_t)(void *user_data, uint64_t start_ts, uint64_t end_ts, uint64_t duration_ms,
@@ -19,6 +20,9 @@ typedef void (*lsmt_memtable_flush_callback_t)(void *user_data, uint64_t start_t
 typedef struct lsmt {
   sst_metadata_t *metadata;
   sl_t *memtable;
+  sl_t *immutables[MAX_IMMUTABLES];
+  uint16_t immutable_count;
+
   index_t *last_index;
   uint32_t sstable_id; //incremental id for the next sstable
   char *db_path;
