@@ -324,6 +324,12 @@ static void *dump_to_disk(void *arg) {
     exit(1);
   }
 
+  /* Preallocate SIZE_THRESHOLD file size. */
+  posix_fallocate(fileno(fp), 0, SIZE_THRESHOLD);
+
+  /* 1MB buffer for fwrite */
+  setvbuf(fp, NULL, _IOFBF, 1024 * 1024);
+
   uint64_t offset = 0;
   sl_uint128_t min_key = node->key; 
   sl_uint128_t max_key = min_key;
