@@ -31,6 +31,10 @@ typedef struct lsmt {
   lsmt_compaction_callback_t compaction_callback;
   lsmt_memtable_flush_callback_t memtable_flush_callback;
   void *callback_user_data;
+
+  pthread_mutex_t thread_pool_mutex;
+  pthread_cond_t thread_pool_cond;
+  uint16_t active_background_threads;
 } lsmt_t;
 
 typedef struct wrapper_sl_it {

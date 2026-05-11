@@ -55,10 +55,6 @@ void lsmt_set_memtable_flush_callback(lsmt_t *lsmt, lsmt_memtable_flush_callback
 #define SST_EXT ".sbrolf"
 #define SST_INDEX_EXT ".prot"
 
-/* Accrocchio temporaneo per dumpare la memtable su disco in multithreading */
-static pthread_t thread_pool[POOL_SIZE];
-static size_t thread_idx = 0;
-
 static const size_t index_block_size = 4 * 1024; // 4KB
 
 /* key + type + content_length. */
@@ -434,14 +430,13 @@ static void *dump_to_disk(void *arg) {
   if (lsmt->memtable_flush_callback) {
     lsmt->memtable_flush_callback(lsmt->callback_user_data, start_ts, end_ts, end_ts - start_ts, offset);
   }
+
+  /* Notify the pool that this thread is finished */
+  pthread_mutex_lock(&lsmt->thread_pool_mutex);
+  lsmt->active_background_threads--;
+  pthread_cond_signal(&lsmt->thread_pool_cond);
+  pthread_mutex_unlock(&lsmt->thread_pool_mutex);
   
-/*
-  size_t total_size = memtable->size + sizeof(sl_t);
-  printf("levels: %ld\n", memtable->levels);
-  printf("allocated memory: %ld bytes (~ %.3f KB, %.3f MB)\n", total_size, (double)total_size/(1 << 10), (double)total_size/(1 << 20)); 
-  printf("generated SSTable at %s; %ld bytes (~ %.3f KB, %.3f MB)\n", sst_file, offset, (double)offset/(1 << 10), (double)offset/(1 << 20));
-  printf("generated index at %s; %ld bytes (~ %.3f KB, %.3f MB)\n", idx_file, offset, (double)offset/(1 << 10), (double)offset/(1 << 20));
-  */
   return NULL;
 }
 
@@ -500,6 +495,10 @@ lsmt_t *lsmt_init(const char *db_path) {
     perror("LSMT INIT");
     exit(1);
   }
+
+  pthread_mutex_init(&db->thread_pool_mutex, NULL);
+  pthread_cond_init(&db->thread_pool_cond, NULL);
+  db->active_background_threads = 0;
   
   /* Initialize callbacks to NULL */
   db->compaction_callback = NULL;
@@ -511,17 +510,24 @@ lsmt_t *lsmt_init(const char *db_path) {
 
 void lsmt_flush(lsmt_t *lsmt) {
   pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
-  for(size_t i = 0; i < thread_idx; i++) {
-    pthread_join(thread_pool[i], NULL);
+
+  /* Wait for all background threads to finish. */
+  pthread_mutex_lock(&lsmt->thread_pool_mutex);
+  while (lsmt->active_background_threads > 0) {
+    pthread_cond_wait(&lsmt->thread_pool_cond, &lsmt->thread_pool_mutex);
   }
-  thread_idx = 0;
+
+  /* Execute final flush on main thread */
+  lsmt->active_background_threads++;
+  pthread_mutex_unlock(&lsmt->thread_pool_mutex);
 
   dump_task_t *task_args = malloc(sizeof(dump_task_t));
   task_args->lsmt = lsmt;
   task_args->memtable = lsmt->memtable;
 
-  dump_to_disk(task_args);
   lsmt->memtable = sl_init();
+  dump_to_disk(task_args);
+
   pthread_rwlock_unlock(&lsmt->memtable_rwlock);
 }
 
@@ -538,6 +544,7 @@ void lsmt_free(lsmt_t *lsmt) {
 
 int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size) {
   if (lsmt == NULL || lsmt->memtable == NULL) return -1;
+
   pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
   if (lsmt->memtable->size > SIZE_THRESHOLD) {
     //dump content to disk in a new thread.
@@ -546,21 +553,27 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
 
     /* Transfering ownership. */
     task_args->memtable = lsmt->memtable;
+
+    pthread_mutex_lock(&lsmt->thread_pool_mutex);
+
+    /* Wait until at least one thread slot is available */
+    while (lsmt->active_background_threads >= POOL_SIZE) {
+      pthread_cond_wait(&lsmt->thread_pool_cond, &lsmt->thread_pool_mutex);
+    }
+    lsmt->active_background_threads++;
+    pthread_mutex_unlock(&lsmt->thread_pool_mutex);
+
+    /* Create a detached Threads */
+    pthread_t t;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&t, &attr, dump_to_disk, task_args);
+    pthread_attr_destroy(&attr);
     
-
-    if (thread_idx < POOL_SIZE) {
-      pthread_create(&thread_pool[thread_idx++], NULL, dump_to_disk, task_args);
-    }
-    else {
-      for(size_t i = 0; i < thread_idx; i++) {
-        pthread_join(thread_pool[i], NULL);
-      }
-      thread_idx = 0;
-      pthread_create(&thread_pool[thread_idx++], NULL, dump_to_disk, task_args);
-    }
-
     lsmt->memtable = sl_init();
   }
+
   int rv = sl_insert(lsmt->memtable, key, content, size);
   pthread_rwlock_unlock(&lsmt->memtable_rwlock);
   return rv;
