@@ -11,11 +11,12 @@
 #define MAX_IMMUTABLES 16
 
 /* Callback types for storage events */
-typedef void (*lsmt_compaction_callback_t)(void *user_data, uint64_t start_ts, uint64_t end_ts, uint64_t duration_ms,
-    uint32_t quantity_merged_tables, uint64_t input_bytes, uint64_t output_bytes, uint8_t level);
+typedef void (*lsmt_compaction_callback_t)(void *user_data, uint64_t ts,
+    uint64_t duration_ms, uint32_t quantity_merged_tables,
+    uint64_t input_bytes, uint64_t output_bytes, uint8_t level);
 
-typedef void (*lsmt_memtable_flush_callback_t)(void *user_data, uint64_t start_ts, uint64_t end_ts, uint64_t duration_ms,
-    uint64_t bytes_flushed);
+typedef void (*lsmt_memtable_flush_callback_t)(void *user_data, uint64_t ts,
+    uint64_t duration_ms, uint64_t bytes_flushed);
 
 typedef struct lsmt {
   sst_metadata_t *metadata;

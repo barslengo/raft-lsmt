@@ -54,8 +54,6 @@ typedef enum {
 typedef struct {
     storage_event_type_t type;
     uint64_t timestamp;
-    uint64_t start_ts;
-    uint64_t end_ts;
     uint64_t duration_ms;
     union {
         struct {
@@ -259,7 +257,6 @@ struct Server
   struct client_t *query_clients_head;
   int active_queries_count;
 
-  FILE *batch_log_file;
   
   /* Read metrics */
   struct {
@@ -276,6 +273,7 @@ struct Server
   FILE *storage_events_file;
   storage_event_t storage_events_buffer[STORAGE_EVENT_BUFFER_SIZE];
   size_t storage_events_count;
+  uv_mutex_t storage_events_mutex;
   
   struct {
     FILE *f;
@@ -324,69 +322,78 @@ static double calculate_percentile(uint64_t *sorted_samples, size_t count, doubl
 }
 
 /* Callback for compaction events from lsmt */
-static void on_compaction_event(void *user_data, uint64_t start_ts, uint64_t end_ts, uint64_t duration_ms,
+static void on_compaction_event(void *user_data, uint64_t ts, uint64_t duration_ms,
     uint32_t quantity_merged_tables, uint64_t input_bytes, uint64_t output_bytes, uint8_t level) {
   struct Server *s = (struct Server *)user_data;
+
+  uv_mutex_lock(&s->storage_events_mutex);
+
   if (s && s->storage_events_count < STORAGE_EVENT_BUFFER_SIZE) {
     storage_event_t *evt = &s->storage_events_buffer[s->storage_events_count++];
+
     evt->type = STORAGE_EVENT_COMPACTION;
-    evt->timestamp = uv_now(s->loop);
-    evt->start_ts = start_ts;
-    evt->end_ts = end_ts;
+    evt->timestamp = ts;
     evt->duration_ms = duration_ms;
     evt->data.compaction.quantity_merged_tables = quantity_merged_tables;
     evt->data.compaction.input_bytes = input_bytes;
     evt->data.compaction.output_bytes = output_bytes;
     evt->data.compaction.level = level;
   }
+  uv_mutex_unlock(&s->storage_events_mutex);
 }
 
 /* Callback for memtable flush events from lsmt */
-static void on_memtable_flush_event(void *user_data, uint64_t start_ts, uint64_t end_ts, uint64_t duration_ms,
+static void on_memtable_flush_event(void *user_data, uint64_t ts, uint64_t duration_ms,
     uint64_t bytes_flushed) {
   struct Server *s = (struct Server *)user_data;
+  if (!s) return;
+
+  uv_mutex_lock(&s->storage_events_mutex);
+
   if (s && s->storage_events_count < STORAGE_EVENT_BUFFER_SIZE) {
     storage_event_t *evt = &s->storage_events_buffer[s->storage_events_count++];
+
     evt->type = STORAGE_EVENT_MEMTABLE_FLUSH;
-    evt->timestamp = uv_now(s->loop);
-    evt->start_ts = start_ts;
-    evt->end_ts = end_ts;
+    evt->timestamp = ts; 
     evt->duration_ms = duration_ms;
     evt->data.memtable_flush.bytes_flushed = bytes_flushed;
   }
+
+  uv_mutex_unlock(&s->storage_events_mutex);
 }
 
 /* Flush storage events buffer to CSV file */
 static void storage_events_flush(struct Server *s) {
-  if (!s->storage_events_file || s->storage_events_count == 0) {
+  if (!s->storage_events_file) return;
+
+  uv_mutex_lock(&s->storage_events_mutex);
+  if (s->storage_events_count == 0) {
+    uv_mutex_unlock(&s->storage_events_mutex);
     return;
   }
-  
+
   for (size_t i = 0; i < s->storage_events_count; i++) {
     storage_event_t *evt = &s->storage_events_buffer[i];
     if (evt->type == STORAGE_EVENT_COMPACTION) {
-      fprintf(s->storage_events_file, "compaction,%lu,%lu,%lu,%lu,%u,%lu,%lu,%u,0\n",
+      fprintf(s->storage_events_file, "compaction,%lu,%lu,%u,%lu,%lu,%u,0\n",
           evt->timestamp,
-          evt->start_ts,
-          evt->end_ts,
           evt->duration_ms,
           evt->data.compaction.quantity_merged_tables,
           evt->data.compaction.input_bytes,
           evt->data.compaction.output_bytes,
           evt->data.compaction.level);
     } else if (evt->type == STORAGE_EVENT_MEMTABLE_FLUSH) {
-      fprintf(s->storage_events_file, "memtable_flush,%lu,%lu,%lu,%lu,0,0,0,0,%lu\n",
+      fprintf(s->storage_events_file, "memtable_flush,%lu,%lu,0,0,0,0,%lu\n",
           evt->timestamp,
-          evt->start_ts,
-          evt->end_ts,
           evt->duration_ms,
           evt->data.memtable_flush.bytes_flushed);
     }
   }
   fflush(s->storage_events_file);
   s->storage_events_count = 0;
-}
 
+  uv_mutex_unlock(&s->storage_events_mutex);
+}
 
 typedef struct {
   uv_work_t work_req;
@@ -963,7 +970,6 @@ static void serverTimerCloseCb(struct uv_handle_s *handle)
 
 static void serverApplyCb(struct raft_apply *req, int status, void *result);
 
-static void on_async_close(uv_handle_t *handle);
 static bool process_insert_buffer(client_t *client);
 
 
@@ -1265,12 +1271,6 @@ static void on_insert_connection(uv_stream_t *server_handle, int status) {
   }
 }
 
-static void on_async_close(uv_handle_t *handle) {
-  client_t *client = (client_t *)handle->data;
-  client_release(client); 
-}
-
-
 static void on_client_query(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
   client_t *client = (client_t *)stream->data;
 
@@ -1385,7 +1385,7 @@ static int tcp_setup(struct Server *s, int port) {
   rv = client_uv_init(s, &s->tcp_write_handle, port, on_insert_connection);
   if (rv != 0) return rv;
 
-  rv = client_uv_init(s, &s->tcp_read_handle, port + 4000, on_read_connection);
+  rv = client_uv_init(s, &s->tcp_read_handle, port + 1000, on_read_connection);
   return rv;
 }
 
@@ -1425,14 +1425,6 @@ static void setup_high_level_stats(struct Server * s, const char *path) {
   latency_buffer_init(&s->latency_buffer);
 }
 
-static void setup_batch_level_stats(struct Server *s, const char *path) {
-  s->batch_log_file = fopen(path, "wb");
-  if (!s->batch_log_file) {
-    printf("Failed to open file %s\n", path);
-    exit(1);
-  }
-}
-
 static void setup_storage_events_file(struct Server *s, const char *path) {
   s->storage_events_file = fopen(path, "w");
   if (!s->storage_events_file) {
@@ -1441,7 +1433,7 @@ static void setup_storage_events_file(struct Server *s, const char *path) {
   }
   
   /* Write header */
-  fprintf(s->storage_events_file, "event_type,timestamp,start_ts,end_ts,duration_ms");
+  fprintf(s->storage_events_file, "event_type,timestamp,duration_ms");
   fprintf(s->storage_events_file, ",quantity_merged_tables,input_bytes,output_bytes,level");
   fprintf(s->storage_events_file, ",bytes_flushed\n");
   fflush(s->storage_events_file);
@@ -1583,14 +1575,13 @@ static int ServerInit(struct Server *s,
   char stats_file_path[256];
   sprintf(stats_file_path, "%s/stats_%d_%lu.csv", dir, s->id, file_ts); 
   setup_high_level_stats(s, stats_file_path);
-
-  sprintf(stats_file_path, "%s/stats_batch_%d_%lu.bin", dir, s->id, file_ts);  
-  setup_batch_level_stats(s, stats_file_path);
-  
+ 
   /* Setup storage events file */
   sprintf(stats_file_path, "%s/storage_events_%d_%lu.csv", dir, s->id, file_ts);
   setup_storage_events_file(s, stats_file_path);
   
+  uv_mutex_init(&s->storage_events_mutex);
+
   /* Register storage event callbacks with lsmt */
   lsmt_set_compaction_callback(s->db, on_compaction_event, s);
   lsmt_set_memtable_flush_callback(s->db, on_memtable_flush_event, s);
@@ -1613,27 +1604,10 @@ static void update_batch_metrics(struct Server *s, apply_ctx_t *ctx) {
   /* Calculate Latency */
   uint64_t now = uv_now(s->loop);
 
-  uint64_t consensus_time = now - ctx->raft_apply_ts;
-  uint64_t buffering_time = 0;
-  if (ctx->raft_apply_ts > ctx->batch_creation_ts) {
-    buffering_time = ctx->raft_apply_ts - ctx->batch_creation_ts;
-  }
-
   uint64_t batch_time = now - ctx->batch_creation_ts;
 
   /* Store latency in buffer for distribution calculation */
   latency_buffer_add(&s->latency_buffer, batch_time);
-
-  if (s->batch_log_file) {
-    batch_log_t entry;
-    entry.timestamp = now;
-    entry.batch_size = ctx->req_count;
-    entry.bytes = ctx->batch_size_bytes;
-    entry.t_accumulate = buffering_time;
-    entry.t_consensus = consensus_time;
-    entry.t_total = batch_time;
-    fwrite(&entry, sizeof(batch_log_t), 1, s->batch_log_file);
-  }
 
   s->stats.period_latency_sum += batch_time;
   s->stats.period_batches_count++;
@@ -1686,7 +1660,9 @@ static void serverApplyCb(struct raft_apply *req, int status, void *result)
 static void statsTimerCb(uv_timer_t *timer)
 {
   struct Server *s = timer->data;
+  uint64_t epoch_ms = get_unix_epoch();
   uint64_t now = uv_now(s->loop);
+
   int current_state = s->raft.state;
   raft_term term = raft_current_term(&s->raft);
 
@@ -1805,7 +1781,7 @@ static void statsTimerCb(uv_timer_t *timer)
 
   if (s->stats.f) {
     fprintf(s->stats.f, "%lu,%s,%llu,%lu,%.2f,%lu,%.2f,%lu,%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,%llu,%llu\n",
-        now, 
+        epoch_ms, 
         role_name, 
         term,
         write_ops_sec, 
@@ -1843,6 +1819,9 @@ static void statsTimerCb(uv_timer_t *timer)
     storage_events_flush(s);
     last_storage_flush = now;
   }
+
+  /* Reset the latency buffer so we don't carry over old latencies */
+  latency_buffer_init(&s->latency_buffer);
 }
 
 /* Called periodically every APPLY_RATE milliseconds. */
@@ -1892,17 +1871,13 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
     s->stats.f = NULL;
   }
 
-  if (s->batch_log_file) {
-    fflush(s->batch_log_file);
-    fclose(s->batch_log_file);
-    s->batch_log_file = NULL;
-  }
-  
+ 
   /* Flush and close storage events file */
   if (s->storage_events_file) {
     storage_events_flush(s);
     fclose(s->storage_events_file);
     s->storage_events_file = NULL;
+    uv_mutex_destroy(&s->storage_events_mutex);
   }
 
   /* Close TCP Listening Sockets */

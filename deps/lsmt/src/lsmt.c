@@ -22,29 +22,6 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Helper to get current timestamp in milliseconds */
-static uint64_t get_current_ts_ms() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
-}
-
-/* Callback setter functions */
-void lsmt_set_compaction_callback(lsmt_t *lsmt, lsmt_compaction_callback_t callback, void *user_data) {
-  if (lsmt) {
-    lsmt->compaction_callback = callback;
-    lsmt->callback_user_data = user_data;
-  }
-}
-
-void lsmt_set_memtable_flush_callback(lsmt_t *lsmt, lsmt_memtable_flush_callback_t callback, void *user_data) {
-  if (lsmt) {
-    lsmt->memtable_flush_callback = callback;
-    lsmt->callback_user_data = user_data;
-  }
-}
-
-
 #define SIZE_THRESHOLD (2 * 1024 * 1024)
 
 #define POOL_SIZE 8 
@@ -54,6 +31,24 @@ void lsmt_set_memtable_flush_callback(lsmt_t *lsmt, lsmt_memtable_flush_callback
 #define SST_FILENAME_MAX_LENGTH 256
 #define SST_EXT ".sbrolf"
 #define SST_INDEX_EXT ".prot"
+
+
+/* Callback setter functions */
+void lsmt_set_compaction_callback(lsmt_t *lsmt,
+    lsmt_compaction_callback_t callback, void *user_data) {
+  if (lsmt) {
+    lsmt->compaction_callback = callback;
+    lsmt->callback_user_data = user_data;
+  }
+}
+
+void lsmt_set_memtable_flush_callback(lsmt_t *lsmt,
+    lsmt_memtable_flush_callback_t callback, void *user_data) {
+  if (lsmt) {
+    lsmt->memtable_flush_callback = callback;
+    lsmt->callback_user_data = user_data;
+  }
+}
 
 static const size_t index_block_size = 4 * 1024; // 4KB
 
@@ -186,7 +181,7 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t
 /* Iterate over all the tiers and compact the sstables
  * whose sum of their size exceed the tier threshold. */
 static int sst_compact(lsmt_t *lsmt, sst_metadata_t *sst_meta, const char *db_path, pthread_mutex_t *mutex) {
-  uint64_t compaction_start_ts = get_current_ts_ms();
+  uint64_t compaction_start_ts = get_monotonic_time_ms();
   uint32_t total_merged = 0;
   uint64_t total_input_bytes = 0;
   uint64_t total_output_bytes = 0;
@@ -298,10 +293,13 @@ static int sst_compact(lsmt_t *lsmt, sst_metadata_t *sst_meta, const char *db_pa
     }
     
     /* Invoke compaction callback if set */
-    uint64_t end_ts = get_current_ts_ms();
+    uint64_t end_ts = get_monotonic_time_ms();
     if (lsmt && lsmt->compaction_callback && total_merged > 0) {
-      lsmt->compaction_callback(lsmt->callback_user_data, compaction_start_ts, end_ts,
-          end_ts - compaction_start_ts, total_merged, total_input_bytes, total_output_bytes, compaction_level);
+      uint64_t duration_ms = end_ts - compaction_start_ts;
+
+      lsmt->compaction_callback(lsmt->callback_user_data,
+          get_unix_epoch(), duration_ms, total_merged, total_input_bytes,
+          total_output_bytes, compaction_level);
     }
   }
   return 0;
@@ -313,7 +311,7 @@ static void *dump_to_disk(void *arg) {
   sl_t *memtable = task_args->memtable;
   free(task_args);
 
-  uint64_t start_ts = get_current_ts_ms();
+  uint64_t start_ts = get_monotonic_time_ms();
 
   if (!memtable) return NULL;
 
@@ -453,9 +451,12 @@ static void *dump_to_disk(void *arg) {
   sst_compact(lsmt, lsmt->metadata, lsmt->db_path, &lsmt->metadata_lock);
   
   /* Invoke memtable flush callback */
-  uint64_t end_ts = get_current_ts_ms();
+  uint64_t end_ts = get_monotonic_time_ms();
   if (lsmt->memtable_flush_callback) {
-    lsmt->memtable_flush_callback(lsmt->callback_user_data, start_ts, end_ts, end_ts - start_ts, offset);
+    uint64_t duration_ms = end_ts - start_ts;
+
+    lsmt->memtable_flush_callback(lsmt->callback_user_data,
+        get_unix_epoch(), duration_ms, offset);
   }
 
   /* Notify the pool that this thread is finished */
