@@ -104,7 +104,7 @@ class DbClient:
                 break
                 
         # If pool is empty, open a new parallel connection
-        port = node.port + 4000 if for_query else node.port
+        port = node.port + 1000 if for_query else node.port
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(self.config.write_timeout if not for_query else self.config.read_timeout)
         sock.connect((node.host, port))
