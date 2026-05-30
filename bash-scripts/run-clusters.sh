@@ -55,12 +55,14 @@ for CLUSTER_NAME in $CLUSTER_NAMES; do
     # Start the database node
     cd "$CLUSTER_NAME"
     mkdir -p "$NODE_ID"
-    ./build/server "./$NODE_ID" "$NODE_ID" cluster.config &
+
+    LOG_FILE="server_${NODE_ID}.log"
+    nohup ./build/server "./$NODE_ID" "$NODE_ID" cluster.config > "$LOG_FILE" 2>&1 &
     
     # Capture PID and save
     PID=$!
     echo "$PID" > .pid
-    echo "  Started with PID: $PID (data_dir: ./$NODE_ID)"
+    echo "  Started with PID: $PID (data_dir: ./$NODE_ID), log: $CLUSTER_NAME/$LOG_FILE)"
     
     cd - > /dev/null
 done

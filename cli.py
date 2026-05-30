@@ -250,7 +250,7 @@ def main():
     clusters = {}
     for cluster_name, nodes_data in config_data.items():
         clusters[cluster_name] = [
-            Node(cluster_name=cluster_name, id=n['id'], host=n['host'], port=n['port'])
+            Node(cluster_name=cluster_name, id=n['id'], host=n['host'], port=n['tcp_port'])
             for n in nodes_data
         ]
     
