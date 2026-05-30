@@ -9,10 +9,11 @@
 
 #include <lsmt/lsmt.h>
 
-#define APPLY_RATE 100 /* Store new statistic entry every 100 ms. */
+#define APPLY_RATE 1000 /* Store new statistic entry every 1000 ms. */
 #define GLOBAL_MAX_QUERIES 8 // Limite massimo di query simultanee nel server
+#define STORAGE_EVENTS_METRICS_FLUSH_TIME (16 * 1000) //dump to disk every 16 seconds.
 #define MAX_LATENCY_SAMPLES 1000 /* Max samples for latency distribution */
-#define STORAGE_EVENT_BUFFER_SIZE 1000 /* Buffer size for storage events */
+#define STORAGE_EVENT_BUFFER_SIZE 4096 /* Buffer size for storage events */
 #define Log(SERVER_ID, FORMAT) printf("%d: " FORMAT "\n", SERVER_ID)
 #define Logf(SERVER_ID, FORMAT, ...) \
   printf("%d: " FORMAT "\n", SERVER_ID, __VA_ARGS__)
@@ -262,8 +263,6 @@ struct Server
   struct {
     uint64_t total_queries;
     uint64_t total_bytes_read;
-    uint64_t prev_queries;
-    uint64_t prev_bytes_read;
   } read_stats;
   
   /* Latency distribution tracking */
@@ -280,11 +279,7 @@ struct Server
     uint64_t total_requests;
     uint64_t total_bytes;
 
-    uint64_t prev_requests;
-    uint64_t prev_bytes;
-
     //uint64_t total_received; /* Total requests received from tcp connections. */
-    uint64_t last_run_time; 
     uint64_t period_latency_sum; /* Sum of ms taken by all batches in this tick */
     uint64_t period_batches_count; /* How many batches finished in this tick */
   } stats;
@@ -1403,23 +1398,18 @@ static void setup_high_level_stats(struct Server * s, const char *path) {
     exit(1);
   } 
 
-  fprintf(s->stats.f, "Timestamp_ms,Role,Term,Write_OPS,Write_MBps,Read_OPS,Read_MBps,PendingRequests,PendingBytes,Backlog,Avg_Latency_ms,P50_Latency_ms,P95_Latency_ms,P99_Latency_ms,Max_Latency_ms,Raft_Idx_Local,Raft_Idx_Applied,Raft_Idx_Commit\n"); 
+  fprintf(s->stats.f, "Timestamp_ms,Role,Term,Total_Write_Requests,Total_Write_Bytes,Total_Read_Requests,Total_Read_Bytes,PendingRequests,PendingBytes,Backlog,Avg_Latency_ms,P50_Latency_ms,P95_Latency_ms,P99_Latency_ms,Max_Latency_ms,Raft_Idx_Local,Raft_Idx_Applied,Raft_Idx_Commit\n"); 
   fflush(s->stats.f);
 
   s->stats.total_requests = 0;
   s->stats.total_bytes = 0;
-  s->stats.prev_requests = 0;
-  s->stats.prev_bytes = 0;
   //s->stats.total_received = 0;
-  s->stats.last_run_time = 0;
   s->stats.period_latency_sum = 0;
   s->stats.period_batches_count = 0; 
   
   /* Initialize read stats */
   s->read_stats.total_queries = 0;
   s->read_stats.total_bytes_read = 0;
-  s->read_stats.prev_queries = 0;
-  s->read_stats.prev_bytes_read = 0;
   
   /* Initialize latency buffer */
   latency_buffer_init(&s->latency_buffer);
@@ -1667,42 +1657,7 @@ static void statsTimerCb(uv_timer_t *timer)
   raft_term term = raft_current_term(&s->raft);
 
   /* -----------------------------------------------------------------------
-   * Calculate Time Delta 
-   * ----------------------------------------------------------------------- */
-  if (s->stats.last_run_time == 0) {
-    s->stats.last_run_time = now - APPLY_RATE; 
-  }
-
-  uint64_t dt = now - s->stats.last_run_time;
-  if (dt == 0) dt = 1;
-
-  /* -----------------------------------------------------------------------
-   * Calculate Write Rates (OPS & MB/s)
-   * ----------------------------------------------------------------------- */
-  uint64_t current_reqs = s->stats.total_requests;
-  uint64_t current_bytes = s->stats.total_bytes;
-
-  uint64_t delta_reqs = current_reqs - s->stats.prev_requests;
-  uint64_t delta_bytes = current_bytes - s->stats.prev_bytes;
-
-  /* Normalize to Seconds */
-  uint64_t write_ops_sec = (delta_reqs * 1000) / dt;
-  double write_mb_sec = ((double)delta_bytes / (1024.0 * 1024.0)) * (1000.0 / dt);
-
-  /* -----------------------------------------------------------------------
-   * Calculate Read Rates (OPS & MB/s)
-   * ----------------------------------------------------------------------- */
-  uint64_t current_queries = s->read_stats.total_queries;
-  uint64_t current_bytes_read = s->read_stats.total_bytes_read;
-
-  uint64_t delta_queries = current_queries - s->read_stats.prev_queries;
-  uint64_t delta_bytes_read = current_bytes_read - s->read_stats.prev_bytes_read;
-
-  uint64_t read_ops_sec = (delta_queries * 1000) / dt;
-  double read_mb_sec = ((double)delta_bytes_read / (1024.0 * 1024.0)) * (1000.0 / dt);
-
-  /* -----------------------------------------------------------------------
-   * Calculate Average Latency (From previous step)
+   * Calculate Average Latency
    * ----------------------------------------------------------------------- */
   double avg_latency_ms = 0.0;
   if (s->stats.period_batches_count > 0) {
@@ -1780,14 +1735,14 @@ static void statsTimerCb(uv_timer_t *timer)
   else if (current_state == RAFT_CANDIDATE) role_name = "CANDIDATE";
 
   if (s->stats.f) {
-    fprintf(s->stats.f, "%lu,%s,%llu,%lu,%.2f,%lu,%.2f,%lu,%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,%llu,%llu\n",
+    fprintf(s->stats.f, "%lu,%s,%llu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,%llu,%llu\n",
         epoch_ms, 
         role_name, 
         term,
-        write_ops_sec, 
-        write_mb_sec,
-        read_ops_sec,
-        read_mb_sec,
+        s->stats.total_requests, 
+        s->stats.total_bytes,
+        s->read_stats.total_queries,
+        s->read_stats.total_bytes_read,
         pending_client_reqs, 
         total_pending_bytes, 
         backlog,
@@ -1803,19 +1758,12 @@ static void statsTimerCb(uv_timer_t *timer)
   }
   
   // Reset Counters
-  s->stats.prev_requests = s->stats.total_requests;
-  s->stats.prev_bytes = s->stats.total_bytes;
   s->stats.period_latency_sum = 0;
   s->stats.period_batches_count = 0;
-  s->stats.last_run_time = now;
-  
-  /* Reset read counters */
-  s->read_stats.prev_queries = s->read_stats.total_queries;
-  s->read_stats.prev_bytes_read = s->read_stats.total_bytes_read;
   
   /* Flush storage events periodically (every 10 seconds = 100 * 100ms) */
   static uint64_t last_storage_flush = 0;
-  if (now - last_storage_flush >= 10000) {
+  if (now - last_storage_flush >= STORAGE_EVENTS_METRICS_FLUSH_TIME) {
     storage_events_flush(s);
     last_storage_flush = now;
   }
