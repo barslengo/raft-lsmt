@@ -40,7 +40,9 @@ class DbClientConfig:
 class DbClient:
     def __init__(self, config: DbClientConfig, router: Router):
         self.config = config
-        self.thread_pool = ThreadPoolExecutor(max_workers=config.thread_pool_size)
+        # Aumentiamo il parallelismo e usiamo DUE pool per evitare il Deadlock
+        self.io_pool = ThreadPoolExecutor(max_workers=config.thread_pool_size)
+        self.aggregator_pool = ThreadPoolExecutor(max_workers=config.thread_pool_size // 2)
 
         self._socket_pools: Dict[Tuple[Node, bool], queue.Queue] = defaultdict(queue.Queue)
 
@@ -231,7 +233,7 @@ class DbClient:
             
             raise RuntimeError(f"Failed batch request to the cluster {cluster_name} after {retries} attemps")
 
-        return self.thread_pool.submit(_send_batch)
+        return self.io_pool.submit(_send_batch)
 
     def _serialize_batch(self, batch: List[Record]) -> bytes:
         payload = bytearray()
@@ -274,14 +276,12 @@ class DbClient:
                     raise
 
     # ====================== READ OPERATIONS ======================
-    def read(self,
-        query: QueryRequest,
-        timeout: Optional[float] = None) -> Future[Dict[str, Any]]:
-        
+    def read(self, query: QueryRequest, timeout: Optional[float] = None, skip_records: bool = False) -> Future[Dict[str, Any]]:
         nodes = self.router.get_nodes_for_read(query)
-        futures =[]
+        futures = []
         for node in nodes:
-            future = self.thread_pool.submit(self._query_single_node, node, query)
+            # Sottomettiamo le letture I/O al pool di rete
+            future = self.io_pool.submit(self._query_single_node, node, query, skip_records)
             futures.append(future)
 
         def _aggregate():
@@ -299,15 +299,48 @@ class DbClient:
                 raise TimeoutError(f"read_interval timed out: {e}") from e
 
             return results
-        return self.thread_pool.submit(_aggregate)
+            
+        # Sottomettiamo l'aggregazione a un pool separato per EVITARE STARVATION!
+        return self.aggregator_pool.submit(_aggregate)
 
-    def _query_single_node(self, node: Node, query: QueryRequest) -> Tuple[Node, Dict]:
+    def read_batch(self, queries: List[QueryRequest], timeout: Optional[float] = None, skip_records: bool = False) -> Future[Dict[str, Any]]:
+        if not queries:
+            future = Future()
+            future.set_result({})
+            return future
+            
+        nodes = self.router.get_nodes_for_read(queries[0])
+        futures = []
+        for node in nodes:
+            future = self.io_pool.submit(self._query_batch_single_node, node, queries, skip_records)
+            futures.append(future)
+
+        def _aggregate():
+            results = {}
+            try:
+                for future in as_completed(futures, timeout=timeout):
+                    node, response_list = future.result()
+                    if node.cluster_name not in results:
+                        results[node.cluster_name] = []
+                    node_name = f"{node.id}:{node.host}:{node.port}"
+                    results[node.cluster_name].append({node_name: (node, response_list)})
+            except Exception as e:
+                for f in futures:
+                    f.cancel()
+                raise TimeoutError(f"read_batch timed out: {e}") from e
+
+            return results
+            
+        return self.aggregator_pool.submit(_aggregate)
+
+
+    def _query_single_node(self, node: Node, query: QueryRequest, skip_records: bool = False) -> Tuple[Node, Dict]:
         cluster_name = node.cluster_name
         nodes = self.clusters.get(cluster_name,[])
         leader = self.router.leader_registry.get_leader(cluster_name)
         
         non_leaders = [n for n in nodes if n != leader]
-        leader_node =[n for n in nodes if n == leader]
+        leader_node = [n for n in nodes if n == leader]
         preferred_nodes = non_leaders + leader_node
         
         last_error = None
@@ -361,7 +394,8 @@ class DbClient:
 
                     response = self._parse_response(resp_req_id, limit_reached, 
                                                     min_id, min_ts, max_id, max_ts,
-                                                    records_bytes, records_count, body_data)
+                                                    records_bytes, records_count, body_data,
+                                                    skip_records=skip_records)
                     
                     all_records.extend(response["records"])
                     
@@ -401,8 +435,128 @@ class DbClient:
         
         raise RuntimeError(f"Query to cluster {cluster_name} failed after trying {len(preferred_nodes)} nodes. Last error: {last_error}")
 
+    def _query_batch_single_node(self, node: Node, queries: List[QueryRequest], skip_records: bool = False) -> Tuple[Node, List[Dict]]:
+        cluster_name = node.cluster_name
+        nodes = self.clusters.get(cluster_name, [])
+        leader = self.router.leader_registry.get_leader(cluster_name)
+        
+        non_leaders = [n for n in nodes if n != leader]
+        leader_node = [n for n in nodes if n == leader]
+        preferred_nodes = non_leaders + leader_node
+        
+        last_error = None
+        for n in preferred_nodes:
+            sock = None
+            try:
+                sock = self._get_socket(n, for_query=True)
+                
+                # Build batch payload
+                payload = bytearray()
+                req_id_to_idx = {}
+                req_id_to_query = {}
+                
+                for idx, query in enumerate(queries):
+                    req_id = random.randint(1, 10000000)
+                    while req_id in req_id_to_idx:
+                        req_id = random.randint(1, 10000000)
+                    req_id_to_idx[req_id] = idx
+                    req_id_to_query[req_id] = query
+                    
+                    start_key = struct.pack("<QQ", query.min_id, query.min_ts)
+                    end_key = struct.pack("<QQ", query.max_id, query.max_ts)
+                    req_data = struct.pack(QUERY_REQ_FMT, req_id, start_key, end_key)
+                    payload.extend(req_data)
+                
+                # Send the entire batch payload at once
+                sock.sendall(payload)
+                
+                responses = []
+                for _ in range(len(queries)):
+                    header_data = self._recv_exact(sock, QUERY_RESP_HEADER_SIZE, timeout=self.config.read_timeout)
+                    if not header_data:
+                        raise ConnectionError(f"Node {n} closed connection")
+                        
+                    unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
+                    total_size, resp_req_id, limit_reached, min_key_raw, max_key_raw, records_bytes, records_count = unpacked
+                    
+                    min_id, min_ts = struct.unpack("<QQ", min_key_raw)
+                    max_id, max_ts = struct.unpack("<QQ", max_key_raw)
+                    
+                    body_size = total_size - QUERY_RESP_HEADER_SIZE
+                    body_data = b""
+                    if body_size > 0:
+                        body_data = self._recv_exact(sock, body_size, timeout=self.config.read_timeout)
+                        
+                    resp_dict = self._parse_response(resp_req_id, limit_reached, 
+                                                    min_id, min_ts, max_id, max_ts,
+                                                    records_bytes, records_count, body_data,
+                                                    skip_records=skip_records)
+                    
+                    # Handle pagination if necessary
+                    while resp_dict["limit_reached"]:
+                        next_min_id = resp_dict["max_id"] + 1
+                        next_req_id = random.randint(1, 10000000)
+                        
+                        orig_query = req_id_to_query[resp_req_id]
+                        
+                        start_key = struct.pack("<QQ", next_min_id, 0)
+                        end_key = struct.pack("<QQ", orig_query.max_id, orig_query.max_ts)
+                        req_data = struct.pack(QUERY_REQ_FMT, next_req_id, start_key, end_key)
+                        
+                        sock.sendall(req_data)
+                        
+                        p_header_data = self._recv_exact(sock, QUERY_RESP_HEADER_SIZE, timeout=self.config.read_timeout)
+                        if not p_header_data:
+                            raise ConnectionError(f"Node {n} closed connection during pagination")
+                            
+                        p_unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, p_header_data)
+                        p_total_size, p_resp_req_id, p_limit_reached, p_min_key_raw, p_max_key_raw, p_records_bytes, p_records_count = p_unpacked
+                        
+                        p_min_id, p_min_ts = struct.unpack("<QQ", p_min_key_raw)
+                        p_max_id, p_max_ts = struct.unpack("<QQ", p_max_key_raw)
+                        
+                        p_body_size = p_total_size - QUERY_RESP_HEADER_SIZE
+                        p_body_data = b""
+                        if p_body_size > 0:
+                            p_body_data = self._recv_exact(sock, p_body_size, timeout=self.config.read_timeout)
+                            
+                        p_resp_dict = self._parse_response(p_resp_req_id, p_limit_reached,
+                                                           p_min_id, p_min_ts, p_max_id, p_max_ts,
+                                                           p_records_bytes, p_records_count, p_body_data,
+                                                           skip_records=skip_records)
+                        
+                        resp_dict["records"].extend(p_resp_dict["records"])
+                        resp_dict["records_count"] = len(resp_dict["records"])
+                        resp_dict["records_bytes"] += p_resp_dict["records_bytes"]
+                        resp_dict["limit_reached"] = p_resp_dict["limit_reached"]
+                        resp_dict["max_id"] = p_resp_dict["max_id"]
+                        resp_dict["max_ts"] = p_resp_dict["max_ts"]
+                        
+                        if p_max_id >= orig_query.max_id and p_max_ts >= orig_query.max_ts:
+                            resp_dict["limit_reached"] = False
+                            break
+                            
+                    responses.append(resp_dict)
+                
+                # Re-order responses to match the queries input order
+                ordered_responses = [None] * len(queries)
+                for resp in responses:
+                    idx = req_id_to_idx.get(resp["req_id"])
+                    if idx is not None:
+                        ordered_responses[idx] = resp
+                
+                self._return_socket(n, sock, for_query=True)
+                return (n, ordered_responses)
+                
+            except Exception as e:
+                if sock:
+                    sock.close()
+                last_error = e
+                
+        raise RuntimeError(f"Batch query to cluster {cluster_name} failed. Last error: {last_error}")
+
     def _parse_response(self, req_id, limit_reached, min_id, min_ts, max_id, max_ts, 
-                         records_bytes, records_count, body_data):
+                         records_bytes, records_count, body_data, skip_records: bool = False):
         result = {
             "req_id": req_id,
             "limit_reached": bool(limit_reached),
@@ -415,7 +569,7 @@ class DbClient:
             "records":[]
         }
         
-        if body_data and records_count > 0:
+        if not skip_records and body_data and records_count > 0:
             offset = 0
             for _ in range(records_count):
                 if offset + 21 > len(body_data):
