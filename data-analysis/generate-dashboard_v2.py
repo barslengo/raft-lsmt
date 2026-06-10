@@ -43,6 +43,77 @@ def load_client_data(client_file):
         
     return sanitize_timestamps(df, 'Timestamp_ms')
 
+def read_clean_csv(file_path):
+    import io
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+    if not lines:
+        return pd.DataFrame()
+    
+    header = lines[0].strip().split(',')
+    num_cols = len(header)
+    
+    clean_lines = [lines[0]]
+    skipped_count = 0
+    for line in lines[1:]:
+        parts = line.strip().split(',')
+        if len(parts) == num_cols:
+            clean_lines.append(line)
+        else:
+            skipped_count += 1
+            
+    if skipped_count > 0:
+        print(f"  [🛡️ SAFETY] Saltate {skipped_count} righe troncate/incomplete in {os.path.basename(file_path)}.")
+        
+    return pd.read_csv(io.StringIO("".join(clean_lines)), sep=CSV_SEP)
+
+def calculate_rates_on_raw(df):
+    # Ensure columns are numeric
+    for col in ['Total_Write_Requests', 'Total_Write_Bytes', 'Total_Read_Requests', 'Total_Read_Bytes', 'Timestamp_ms']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+    df = df.sort_values('Timestamp_ms').copy()
+    
+    # Calculate time diff in seconds
+    time_diff = df['Timestamp_ms'].diff() / 1000.0
+    time_diff = time_diff.replace(0, np.nan).fillna(1.0)
+    
+    # 1. Write OPS
+    write_req_diff = df['Total_Write_Requests'].diff().fillna(0.0)
+    non_zero_req = df[df['Total_Write_Requests'] > 0].index
+    if len(non_zero_req) > 0:
+        first_non_zero_idx = non_zero_req[0]
+        write_req_diff.loc[:first_non_zero_idx] = 0.0
+    df['Write_OPS'] = write_req_diff / time_diff
+    df['Raw_Write_OPS'] = df['Write_OPS']
+    
+    # 2. Write MBps
+    write_bytes_diff = df['Total_Write_Bytes'].diff().fillna(0.0)
+    non_zero_bytes = df[df['Total_Write_Bytes'] > 0].index
+    if len(non_zero_bytes) > 0:
+        first_non_zero_idx = non_zero_bytes[0]
+        write_bytes_diff.loc[:first_non_zero_idx] = 0.0
+    df['Write_MBps'] = (write_bytes_diff / time_diff) / (1024 * 1024)
+    
+    # 3. Read OPS
+    read_req_diff = df['Total_Read_Requests'].diff().fillna(0.0)
+    non_zero_read_req = df[df['Total_Read_Requests'] > 0].index
+    if len(non_zero_read_req) > 0:
+        first_non_zero_idx = non_zero_read_req[0]
+        read_req_diff.loc[:first_non_zero_idx] = 0.0
+    df['Read_OPS'] = read_req_diff / time_diff
+    
+    # 4. Read MBps
+    read_bytes_diff = df['Total_Read_Bytes'].diff().fillna(0.0)
+    non_zero_read_bytes = df[df['Total_Read_Bytes'] > 0].index
+    if len(non_zero_read_bytes) > 0:
+        first_non_zero_idx = non_zero_read_bytes[0]
+        read_bytes_diff.loc[:first_non_zero_idx] = 0.0
+    df['Read_MBps'] = (read_bytes_diff / time_diff) / (1024 * 1024)
+    
+    return df
+
 def load_and_resample_server_data(base_dir):
     all_dfs = []
     pattern = os.path.join(base_dir, '*', '*', 'stats_*.csv')
@@ -51,8 +122,13 @@ def load_and_resample_server_data(base_dir):
         parts = file_path.split(os.sep)
         cluster_id, node_id = parts[-3], parts[-2]
         
-        df = pd.read_csv(file_path, sep=CSV_SEP)
+        df = read_clean_csv(file_path)
+        if df.empty:
+            continue
         df.columns = df.columns.str.strip() 
+        
+        # Pre-calculate rates on the raw data
+        df = calculate_rates_on_raw(df)
         
         df['Cluster'] = cluster_id
         df['Node'] = node_id
@@ -64,12 +140,6 @@ def load_and_resample_server_data(base_dir):
     df_raw = pd.concat(all_dfs, ignore_index=True)
     df_raw = df_raw.drop_duplicates(subset=['Cluster', 'Node', 'Timestamp_ms'])
     
-    # FORZATURA NUMERICA
-    colonne_contatori = ['Total_Write_Requests', 'Total_Write_Bytes', 'Total_Read_Requests', 'Total_Read_Bytes', 'Total_Requests', 'Total_Bytes']
-    for col in colonne_contatori:
-        if col in df_raw.columns:
-            df_raw[col] = pd.to_numeric(df_raw[col], errors='coerce')
-    
     df_raw = sanitize_timestamps(df_raw, 'Timestamp_ms')
     
     timespan_s = (df_raw['Timestamp_ms'].max() - df_raw['Timestamp_ms'].min()) / 1000.0
@@ -78,46 +148,53 @@ def load_and_resample_server_data(base_dir):
         df_raw = df_raw[df_raw['Timestamp_ms'] <= df_raw['Timestamp_ms'].min() + 3600000]
 
     df_raw['Datetime'] = pd.to_datetime(df_raw['Timestamp_ms'], unit='ms')
+    global_min_dt = df_raw['Datetime'].min().floor('1s')
+    global_max_dt = df_raw['Datetime'].max().ceil('1s')
+    global_range = pd.date_range(start=global_min_dt, end=global_max_dt, freq='1s')
     resampled_nodes = []
     
     for (cluster, node), group in df_raw.groupby(['Cluster', 'Node']):
         group = group.set_index('Datetime').sort_index()
         
-        # RESAMPLE
-        res = group.resample('1s').last()
+        # Save original timestamp to detect gaps
+        group['Orig_Timestamp_ms'] = group['Timestamp_ms']
         
-        # FORWARD FILL per non perdere il totale durante i crash
-        for col in colonne_contatori:
-            if col in res.columns:
-                res[col] = res[col].ffill().fillna(0)
-                
+        # RESAMPLE and REINDEX to global range
+        res = group.resample('1s').last()
+        res = res.reindex(global_range)
+        res.index.name = 'Datetime'
+        
+        # Forward fill original timestamps to detect gaps
+        res['Last_Actual_Timestamp'] = res['Orig_Timestamp_ms'].ffill()
+        res['Resampled_Timestamp_ms'] = res.index.values.astype('datetime64[ms]').astype(np.int64)
+        
+        # Detect gaps of > 3.0s and mark as offline
+        res['Time_Since_Last_Log_ms'] = res['Resampled_Timestamp_ms'] - res['Last_Actual_Timestamp']
+        is_offline = (res['Time_Since_Last_Log_ms'] > 3000) | res['Last_Actual_Timestamp'].isna()
+        
+        # Forward fill status columns
         for col in ['Role', 'Term', 'Raft_Idx_Local', 'Raft_Idx_Applied', 'Raft_Idx_Commit']:
             if col in res.columns:
                 res[col] = res[col].ffill()
         
-        # CALCOLO DEI DELTA
-        req_col = 'Total_Write_Requests' if 'Total_Write_Requests' in res.columns else 'Total_Requests'
-        byte_col = 'Total_Write_Bytes' if 'Total_Write_Bytes' in res.columns else 'Total_Bytes'
+        # Forward fill cumulative counters (in case they are needed elsewhere)
+        colonne_contatori = ['Total_Write_Requests', 'Total_Write_Bytes', 'Total_Read_Requests', 'Total_Read_Bytes', 'Total_Requests', 'Total_Bytes']
+        for col in colonne_contatori:
+            if col in res.columns:
+                res[col] = res[col].ffill().fillna(0)
         
-        if req_col in res.columns:
-            raw_ops = res[req_col].diff().fillna(0)
-            reset_mask = raw_ops < 0
-            raw_ops.loc[reset_mask] = res.loc[reset_mask, req_col]
+        # Fill rates with 0.0 or handle NaN
+        rate_cols = ['Write_OPS', 'Write_MBps', 'Read_OPS', 'Read_MBps', 'Raw_Write_OPS']
+        for col in rate_cols:
+            if col in res.columns:
+                res[col] = res[col].fillna(0.0)
+        
+        # Reset role and throughput counters for offline nodes
+        res.loc[is_offline, 'Role'] = 'OFFLINE'
+        for col in rate_cols:
+            res.loc[is_offline, col] = 0.0
             
-            res['Raw_Write_OPS'] = raw_ops.copy()
-            res['Write_OPS'] = raw_ops.copy()
-            res.loc[res['Write_OPS'] > 1500000, 'Write_OPS'] = np.nan
-        else:
-            res['Write_OPS'] = 0
-            res['Raw_Write_OPS'] = 0
-            
-        if byte_col in res.columns:
-            res['Write_MBps'] = res[byte_col].diff().fillna(0) / (1024 * 1024)
-            reset_mask_mb = res['Write_MBps'] < 0
-            res.loc[reset_mask_mb, 'Write_MBps'] = res.loc[reset_mask_mb, byte_col] / (1024 * 1024)
-            res.loc[res['Write_MBps'] > 200.0, 'Write_MBps'] = np.nan
-        else:
-            res['Write_MBps'] = 0
+        res['Timestamp_ms'] = res['Resampled_Timestamp_ms']
         
         res['Cluster'] = cluster
         res['Node'] = node
@@ -317,6 +394,107 @@ def plot_lsm_events(base_dir, df_server, output_dir):
     plt.savefig(os.path.join(output_dir, '6_lsm_storage_events.png'))
     plt.close()
 
+def plot_cluster_leader_history(df_server, output_dir):
+    clusters = sorted(df_server['Cluster'].dropna().unique())
+    for cluster in clusters:
+        df_cluster = df_server[df_server['Cluster'] == cluster]
+        nodes = sorted(df_cluster['Node'].dropna().unique(), key=int)
+        
+        plt.figure(figsize=(12, len(nodes) * 1.5 + 2))
+        node_to_y = {node: i + 1 for i, node in enumerate(nodes)}
+        
+        for node in nodes:
+            df_node = df_cluster[df_cluster['Node'] == node].sort_values('Relative_Time_s')
+            y_val = node_to_y[node]
+            
+            is_leader = df_node['Role'].str.upper() == 'LEADER'
+            y_leader = np.where(is_leader, y_val, np.nan)
+            
+            is_follower = df_node['Role'].str.upper().isin(['FOLLOWER', 'CANDIDATE'])
+            y_follower = np.where(is_follower, y_val, np.nan)
+            
+            plt.plot(df_node['Relative_Time_s'], y_follower, color=f'C{y_val-1}', linestyle=':', linewidth=2)
+            plt.plot(df_node['Relative_Time_s'], y_leader, color=f'C{y_val-1}', linestyle='-', linewidth=4)
+            
+        plt.title(f'Leader History - Cluster {cluster}')
+        plt.xlabel('Tempo dall\'inizio del test (s)')
+        plt.ylabel('Nodi nel Cluster')
+        plt.yticks(list(node_to_y.values()), [f'Node {n}' for n in nodes])
+        plt.ylim(0.5, len(nodes) + 0.5)
+        
+        from matplotlib.lines import Line2D
+        custom_lines = [
+            Line2D([0], [0], color='black', linestyle='-', linewidth=4),
+            Line2D([0], [0], color='black', linestyle=':', linewidth=2)
+        ]
+        plt.legend(custom_lines, ['LEADER (Solid Line)', 'FOLLOWER / CANDIDATE (Dotted Line)'], loc='upper right')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'cluster-{cluster}-leader-history.png'))
+        plt.close()
+
+def plot_cluster_throughput(df_server, output_dir):
+    clusters = sorted(df_server['Cluster'].dropna().unique())
+    for cluster in clusters:
+        df_cluster = df_server[df_server['Cluster'] == cluster]
+        
+        leaders = df_cluster[df_cluster['Role'].str.upper() == 'LEADER']
+        all_times = sorted(df_cluster['Relative_Time_s'].unique())
+        cluster_throughput = leaders.groupby('Relative_Time_s')['Write_OPS'].max()
+        cluster_throughput = cluster_throughput.reindex(all_times, fill_value=0.0)
+        
+        plt.figure(figsize=(12, 5))
+        plt.plot(cluster_throughput.index, cluster_throughput.values, color='tab:blue', linewidth=2.5, label='Cluster Throughput (Leader Write OPS)')
+        
+        global_start_ms = df_server['Timestamp_ms'].min()
+        test_end_time = df_cluster['Relative_Time_s'].max()
+        
+        for i, node in enumerate(sorted(df_cluster['Node'].dropna().unique(), key=int)):
+            df_node = df_cluster[df_cluster['Node'] == node].sort_values('Relative_Time_s')
+            is_offline = df_node['Role'] == 'OFFLINE'
+            transitions = (~is_offline) & (is_offline.shift(-1) == True)
+            stop_rows = df_node[transitions]
+            
+            for _, row in stop_rows.iterrows():
+                stop_ts_ms = row['Last_Actual_Timestamp']
+                stop_ts_s = (stop_ts_ms - global_start_ms) / 1000.0
+                if stop_ts_s < test_end_time - 5.0:
+                    plt.axvline(x=stop_ts_s, color=f'C{i}', linestyle='--', alpha=0.7, linewidth=1.5)
+                    max_y = max(cluster_throughput.values) if len(cluster_throughput.values) > 0 else 1.0
+                    if pd.isna(max_y) or max_y == 0: max_y = 1.0
+                    plt.text(stop_ts_s, max_y * (0.8 - i * 0.1), f'Node {node} Stopped', color=f'C{i}', rotation=90, va='top', ha='right', fontsize=9)
+                    
+                    nearest_t_idx = np.abs(cluster_throughput.index - stop_ts_s).argmin()
+                    nearest_t = cluster_throughput.index[nearest_t_idx]
+                    y_val = cluster_throughput.loc[nearest_t]
+                    plt.scatter(stop_ts_s, y_val, color=f'C{i}', marker='X', zorder=5, s=150, label=f'Node {node} Stop Event' if i == 0 else "")
+                    
+        plt.title(f'Cluster {cluster} Throughput & Crash Events')
+        plt.xlabel('Tempo dall\'inizio del test (s)')
+        plt.ylabel('Write OPS')
+        plt.legend(loc='upper right')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'cluster-{cluster}-throughput.png'))
+        plt.close()
+
+def plot_cluster_raft_alignment(df_server, output_dir):
+    clusters = sorted(df_server['Cluster'].dropna().unique())
+    for cluster in clusters:
+        df_cluster = df_server[df_server['Cluster'] == cluster]
+        
+        plt.figure(figsize=(12, 5))
+        for node in sorted(df_cluster['Node'].dropna().unique(), key=int):
+            df_node = df_cluster[df_cluster['Node'] == node].sort_values('Relative_Time_s')
+            plt.plot(df_node['Relative_Time_s'], df_node['Raft_Idx_Local'], label=f'Node {node}')
+            
+        plt.title(f'Raft Log Alignment - Cluster {cluster}')
+        plt.xlabel('Tempo dall\'inizio del test (s)')
+        plt.ylabel('Raft Local Index')
+        plt.legend(loc='lower right')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'cluster-{cluster}-raft-alignment.png'))
+        plt.close()
+
 if __name__ == "__main__":
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -345,5 +523,10 @@ if __name__ == "__main__":
     
     print("6/6 - Generazione grafici Storage (LSM)...")
     plot_lsm_events(args.stats_dir, df_server, args.output_dir)
+    
+    print("Generazione grafici TODO.md (leader history, cluster throughput, raft alignment)...")
+    plot_cluster_leader_history(df_server, args.output_dir)
+    plot_cluster_throughput(df_server, args.output_dir)
+    plot_cluster_raft_alignment(df_server, args.output_dir)
     
     print(f"\nFinito! Dashboards salvate in: '{args.output_dir}/'")

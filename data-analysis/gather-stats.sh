@@ -1,13 +1,23 @@
 #!/bin/bash
 set -e
 
-TARGET_DIR="stats"
+# Controlla se sono stati passati entrambi gli argomenti
+if [ "$#" -lt 2 ]; then
+    echo "Errore: Argomenti mancanti."
+    echo "Uso: $0 <cartella_sorgente_dati> <cartella_destinazione_stats>"
+    echo "Esempio: $0 /home/user/my_db_tests /home/user/my_db_tests/stats"
+    exit 1
+fi
 
-echo "Creazione della cartella principale: $TARGET_DIR"
+SOURCE_DIR="$1"
+TARGET_DIR="$2"
+
+echo "Ricerca cartelle 'data-*' in: $SOURCE_DIR"
+echo "Creazione della cartella destinazione: $TARGET_DIR"
 mkdir -p "$TARGET_DIR"
 
-# Cerca tutte le cartelle che iniziano con "data-"
-for data_dir in data-*/; do
+# Cerca tutte le cartelle che iniziano con "data-" nel percorso fornito come SOURCE_DIR
+for data_dir in "$SOURCE_DIR"/data-*/; do
     # Se non ci sono cartelle che matchano, esci dal loop
     [ -e "$data_dir" ] || continue
 
@@ -25,7 +35,7 @@ for data_dir in data-*/; do
             [ -e "$node_dir" ] || continue
             node_id=$(basename "$node_dir")
             
-            # Crea il percorso di destinazione (es. stats/A/3)
+            # Crea il percorso di destinazione (es. <TARGET_DIR>/A/3)
             target_path="$TARGET_DIR/$cluster_name/$node_id"
             mkdir -p "$target_path"
             
@@ -40,4 +50,5 @@ for data_dir in data-*/; do
 done
 
 echo "=========================================="
-echo "Operazione completata! Tutti i file CSV sono stati uniti in ./$TARGET_DIR/"
+echo "Operazione completata! Tutti i file CSV sono stati uniti in $TARGET_DIR/"
+
