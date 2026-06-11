@@ -10,7 +10,7 @@
 #include <lsmt/lsmt.h>
 
 #define APPLY_RATE 1000 /* Store new statistic entry every 1000 ms. */
-#define GLOBAL_MAX_QUERIES 8 // Limite massimo di query simultanee nel server
+#define GLOBAL_MAX_QUERIES 64 // Limite massimo di query simultanee nel server
 #define STORAGE_EVENTS_METRICS_FLUSH_TIME (16 * 1000) //dump to disk every 16 seconds.
 #define MAX_LATENCY_SAMPLES 1000 /* Max samples for latency distribution */
 #define STORAGE_EVENT_BUFFER_SIZE 4096 /* Buffer size for storage events */
