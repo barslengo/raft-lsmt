@@ -5,9 +5,10 @@ import time
 import random
 import select
 import queue
+import itertools
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple, Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future, wait, FIRST_COMPLETED
 from collections import defaultdict
 from .router import Router
 from .db_datatypes import Node, Record, QueryRequest, BatchMetrics
@@ -26,6 +27,63 @@ QUERY_RESP_HEADER_SIZE = 61
 
 INSERT_CMD_FORMAT_PREFIX = "<QQ"  # Key (u64), Timestamp (u64)
 
+_local = threading.local()
+
+class PrioritizedItem:
+    def __init__(self, priority, count, item):
+        self.priority = priority
+        self.count = count
+        self.item = item
+
+    def __lt__(self, other):
+        if self.priority == other.priority:
+            return self.count < other.count
+        return self.priority < other.priority
+
+class PriorityWorkQueue:
+    def __init__(self):
+        self._pq = queue.PriorityQueue()
+        self._counter = itertools.count()
+
+    def put(self, item, block=True, timeout=None):
+        if item is None:
+            priority = float('inf')
+        else:
+            priority = getattr(_local, 'current_priority', 0)
+        
+        count = next(self._counter)
+        wrapped = PrioritizedItem(priority, count, item)
+        self._pq.put(wrapped, block=block, timeout=timeout)
+
+    def get(self, block=True, timeout=None):
+        wrapped = self._pq.get(block=block, timeout=timeout)
+        return wrapped.item
+
+    def get_nowait(self):
+        wrapped = self._pq.get_nowait()
+        return wrapped.item
+        
+    def qsize(self):
+        return self._pq.qsize()
+
+    def empty(self):
+        return self._pq.empty()
+
+class PriorityThreadPoolExecutor(ThreadPoolExecutor):
+    def __init__(self, max_workers=None, thread_name_prefix='',
+                 initializer=None, initargs=(), **ctxkwargs):
+        super().__init__(max_workers=max_workers, thread_name_prefix=thread_name_prefix,
+                         initializer=initializer, initargs=initargs, **ctxkwargs)
+        self._work_queue = PriorityWorkQueue()
+
+    def submit(self, fn, *args, priority=0, **kwargs):
+        _local.current_priority = priority
+        try:
+            return super().submit(fn, *args, **kwargs)
+        finally:
+            if hasattr(_local, 'current_priority'):
+                del _local.current_priority
+
 
 @dataclass(frozen=True)
 class DbClientConfig:
@@ -41,7 +99,7 @@ class DbClient:
     def __init__(self, config: DbClientConfig, router: Router):
         self.config = config
         # Aumentiamo il parallelismo e usiamo DUE pool per evitare il Deadlock
-        self.io_pool = ThreadPoolExecutor(max_workers=config.thread_pool_size)
+        self.io_pool = PriorityThreadPoolExecutor(max_workers=config.thread_pool_size)
         self.aggregator_pool = ThreadPoolExecutor(max_workers=config.thread_pool_size // 2)
 
         self._socket_pools: Dict[Tuple[Node, bool], queue.Queue] = defaultdict(queue.Queue)
@@ -60,12 +118,13 @@ class DbClient:
         self.clusters = clusters
         
         for cluster_name, nodes in clusters.items():
+            connected = False
             for node in nodes:
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     sock.connect((node.host, node.port))
                     
-                    readable, _, _ = select.select([sock], [],[], 0.05)
+                    readable, _, _ = select.select([sock], [], [], 0.05)
                     
                     if readable:
                         sock.close()
@@ -74,10 +133,13 @@ class DbClient:
                         self._socket_pools[(node, False)].put(sock)
                         self.router.leader_registry.set_leader(node)
                         print(f"Connected eagerly to LEADER {node.id} ({cluster_name}) on port {node.port}")
+                        connected = True
                         break
                         
                 except Exception as e:
                     pass
+            if not connected:
+                print(f"Warning: Could not eagerly connect to any leader node in cluster '{cluster_name}'.")
 
     def disconnect(self):
         """Close all sockets and clean up."""
@@ -286,18 +348,94 @@ class DbClient:
 
         def _aggregate():
             results = {}
+            min_start = float('inf')
+            max_end = 0.0
+            
+            node_to_accumulated = {}
+            pagination_tracker = {}
+            
+            active_futures = list(futures)
+            
             try:
-                for future in as_completed(futures, timeout=timeout):
-                    node, response = future.result()
-                    if node.cluster_name not in results:
-                        results[node.cluster_name] = []
-                    node_name = f"{node.id}:{node.host}:{node.port}"
-                    results[node.cluster_name].append({node_name: (node, response)})
+                while active_futures:
+                    done, pending = wait(active_futures, return_when=FIRST_COMPLETED)
+                    active_futures = list(pending)
+                    
+                    for future in done:
+                        result_tuple = future.result()
+                        
+                        if future in pagination_tracker:
+                            n, expected_req_id = pagination_tracker[future]
+                            node, page_response, net_start, net_end = result_tuple
+                            
+                            min_start = min(min_start, net_start)
+                            max_end = max(max_end, net_end)
+                            
+                            if page_response["req_id"] != expected_req_id:
+                                raise ConnectionError(f"Protocol desynchronization during pagination: expected req_id {expected_req_id}, got {page_response['req_id']}")
+                            
+                            if page_response["limit_reached"] and page_response["records_count"] == 0:
+                                raise ConnectionError("Server timeout or saturation during pagination: 0 records returned with limit_reached=True")
+
+                            resp_dict = node_to_accumulated[n]
+                            
+                            if page_response["limit_reached"] and page_response["max_id"] < resp_dict["max_id"]:
+                                raise ConnectionError(f"Server returned invalid max_id {page_response['max_id']} which is less than previous max_id {resp_dict['max_id']}")
+
+                            resp_dict["records"].extend(page_response["records"])
+                            resp_dict["records_count"] += page_response["records_count"]
+                            resp_dict["records_bytes"] += page_response["records_bytes"]
+                            resp_dict["limit_reached"] = page_response["limit_reached"]
+                            resp_dict["max_id"] = page_response["max_id"]
+                            resp_dict["max_ts"] = page_response["max_ts"]
+                            
+                            if resp_dict["limit_reached"] and resp_dict["max_id"] < query.max_id:
+                                next_min_id = resp_dict["max_id"] + 1
+                                next_req_id = random.randint(1, 1000000)
+                                page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=query.max_id, max_ts=query.max_ts)
+                                next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=1)
+                                pagination_tracker[next_fut] = (n, next_req_id)
+                                active_futures.append(next_fut)
+                            else:
+                                resp_dict["limit_reached"] = False
+                        else:
+                            # Initial query future returns (node, response, net_start, net_end)
+                            n, response, net_start, net_end = result_tuple
+                            
+                            min_start = min(min_start, net_start)
+                            max_end = max(max_end, net_end)
+                            
+                            if response["limit_reached"] and response["records_count"] == 0:
+                                raise ConnectionError("Server timeout or saturation during initial query: 0 records returned with limit_reached=True")
+
+                            if response["limit_reached"] and response["max_id"] < query.min_id:
+                                raise ConnectionError(f"Server returned invalid max_id {response['max_id']} which is less than query min_id {query.min_id}")
+
+                            node_to_accumulated[n] = dict(response)
+                            resp_dict = node_to_accumulated[n]
+                            
+                            if resp_dict["limit_reached"] and resp_dict["max_id"] < query.max_id:
+                                next_min_id = resp_dict["max_id"] + 1
+                                next_req_id = random.randint(1, 1000000)
+                                page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=query.max_id, max_ts=query.max_ts)
+                                next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=1)
+                                pagination_tracker[next_fut] = (n, next_req_id)
+                                active_futures.append(next_fut)
+                            else:
+                                resp_dict["limit_reached"] = False
+                                    
             except Exception as e:
-                for f in futures:
+                for f in active_futures:
                     f.cancel()
                 raise TimeoutError(f"read_interval timed out: {e}") from e
-
+                
+            for n, response in node_to_accumulated.items():
+                if n.cluster_name not in results:
+                    results[n.cluster_name] = []
+                node_name = f"{n.id}:{n.host}:{n.port}"
+                results[n.cluster_name].append({node_name: (n, response)})
+                
+            results["_latency_ms"] = max_end - min_start if max_end > 0 else 0.0
             return results
             
         # Sottomettiamo l'aggregazione a un pool separato per EVITARE STARVATION!
@@ -317,24 +455,108 @@ class DbClient:
 
         def _aggregate():
             results = {}
+            min_start = float('inf')
+            max_end = 0.0
+            
+            node_to_accumulated = {}
+            pagination_tracker = {}
+            
+            # Initial active futures: the batch queries per node
+            active_futures = list(futures)
+            
             try:
-                for future in as_completed(futures, timeout=timeout):
-                    node, response_list = future.result()
-                    if node.cluster_name not in results:
-                        results[node.cluster_name] = []
-                    node_name = f"{node.id}:{node.host}:{node.port}"
-                    results[node.cluster_name].append({node_name: (node, response_list)})
+                while active_futures:
+                    done, pending = wait(active_futures, return_when=FIRST_COMPLETED)
+                    active_futures = list(pending)
+                    
+                    for future in done:
+                        result_tuple = future.result()
+                        
+                        # Check if this is a pagination future or an initial batch future
+                        if future in pagination_tracker:
+                            n, idx, expected_req_id = pagination_tracker[future]
+                            # A pagination future returns (node, page_response, net_start, net_end)
+                            node, page_response, net_start, net_end = result_tuple
+                            
+                            min_start = min(min_start, net_start)
+                            max_end = max(max_end, net_end)
+                            
+                            if page_response["req_id"] != expected_req_id:
+                                raise ConnectionError(f"Protocol desynchronization during pagination: expected req_id {expected_req_id}, got {page_response['req_id']}")
+                            
+                            if page_response["limit_reached"] and page_response["records_count"] == 0:
+                                raise ConnectionError("Server timeout or saturation during pagination: 0 records returned with limit_reached=True")
+
+                            resp_dict = node_to_accumulated[n][idx]
+                            
+                            if page_response["limit_reached"] and page_response["max_id"] < resp_dict["max_id"]:
+                                raise ConnectionError(f"Server returned invalid max_id {page_response['max_id']} which is less than previous max_id {resp_dict['max_id']}")
+
+                            resp_dict["records"].extend(page_response["records"])
+                            resp_dict["records_count"] += page_response["records_count"]
+                            resp_dict["records_bytes"] += page_response["records_bytes"]
+                            resp_dict["limit_reached"] = page_response["limit_reached"]
+                            resp_dict["max_id"] = page_response["max_id"]
+                            resp_dict["max_ts"] = page_response["max_ts"]
+                            
+                            orig_query = queries[idx]
+                            # If limit is reached, spawn next page
+                            if resp_dict["limit_reached"] and resp_dict["max_id"] < orig_query.max_id:
+                                next_min_id = resp_dict["max_id"] + 1
+                                next_req_id = random.randint(1, 10000000)
+                                page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=orig_query.max_id, max_ts=orig_query.max_ts)
+                                next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=1)
+                                pagination_tracker[next_fut] = (n, idx, next_req_id)
+                                active_futures.append(next_fut)
+                            else:
+                                resp_dict["limit_reached"] = False
+                        else:
+                            # Initial batch future returns (node, responses, net_start, net_end)
+                            n, responses, net_start, net_end = result_tuple
+                            
+                            min_start = min(min_start, net_start)
+                            max_end = max(max_end, net_end)
+                            
+                            node_to_accumulated[n] = list(responses)
+                            
+                            for idx, resp_dict in enumerate(responses):
+                                orig_query = queries[idx]
+                                
+                                if resp_dict["limit_reached"] and resp_dict["records_count"] == 0:
+                                    raise ConnectionError("Server timeout or saturation during initial query: 0 records returned with limit_reached=True")
+
+                                if resp_dict["limit_reached"] and resp_dict["max_id"] < orig_query.min_id:
+                                    raise ConnectionError(f"Server returned invalid max_id {resp_dict['max_id']} which is less than query min_id {orig_query.min_id}")
+
+                                if resp_dict["limit_reached"] and resp_dict["max_id"] < orig_query.max_id:
+                                    next_min_id = resp_dict["max_id"] + 1
+                                    next_req_id = random.randint(1, 10000000)
+                                    page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=orig_query.max_id, max_ts=orig_query.max_ts)
+                                    next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=1)
+                                    pagination_tracker[next_fut] = (n, idx, next_req_id)
+                                    active_futures.append(next_fut)
+                                else:
+                                    resp_dict["limit_reached"] = False
+                                    
             except Exception as e:
-                for f in futures:
+                for f in active_futures:
                     f.cancel()
                 raise TimeoutError(f"read_batch timed out: {e}") from e
-
+                
+            # Now build the final results dictionary
+            for n, responses in node_to_accumulated.items():
+                if n.cluster_name not in results:
+                    results[n.cluster_name] = []
+                node_name = f"{n.id}:{n.host}:{n.port}"
+                results[n.cluster_name].append({node_name: (n, responses)})
+                
+            results["_latency_ms"] = max_end - min_start if max_end > 0 else 0.0
             return results
             
         return self.aggregator_pool.submit(_aggregate)
 
 
-    def _query_single_node(self, node: Node, query: QueryRequest, skip_records: bool = False) -> Tuple[Node, Dict]:
+    def _query_single_node(self, node: Node, query: QueryRequest, skip_records: bool = False, req_id: Optional[int] = None) -> Tuple[Node, Dict, float, float]:
         cluster_name = node.cluster_name
         nodes = self.clusters.get(cluster_name,[])
         leader = self.router.leader_registry.get_leader(cluster_name)
@@ -346,96 +568,59 @@ class DbClient:
         last_error = None
         for n in preferred_nodes:
             try:
-                all_records =[]
-                current_min_id = query.min_id
-                current_min_ts = query.min_ts
-                
+                net_start = time.time() * 1000
                 sock = None
-                while True:
-                    page_query = QueryRequest(
-                        min_id=current_min_id, min_ts=current_min_ts,
-                        max_id=query.max_id, max_ts=query.max_ts
-                    )
+                
+                actual_req_id = req_id if req_id is not None else random.randint(1, 1000000)
+                start_key = struct.pack("<QQ", query.min_id, query.min_ts)
+                end_key = struct.pack("<QQ", query.max_id, query.max_ts)
+                req_data = struct.pack(QUERY_REQ_FMT, actual_req_id, start_key, end_key)
+
+                try:
+                    sock = self._get_socket(n, for_query=True)
+                    sock.sendall(req_data)
+
+                    # Read response header
+                    header_data = self._recv_exact(sock, QUERY_RESP_HEADER_SIZE, timeout=self.config.read_timeout)
+                    if not header_data:
+                        raise ConnectionError(f"Node {n} closed connection")
+
+                    unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
+                    total_size, resp_req_id, limit_reached, min_key_raw, max_key_raw, records_bytes, records_count = unpacked
                     
-                    req_id = random.randint(1, 1000000)
-                    start_key = struct.pack("<QQ", page_query.min_id, page_query.min_ts)
-                    end_key = struct.pack("<QQ", page_query.max_id, page_query.max_ts)
-                    req_data = struct.pack(QUERY_REQ_FMT, req_id, start_key, end_key)
+                    if resp_req_id != actual_req_id:
+                        raise ConnectionError(f"Protocol desynchronization: expected req_id {actual_req_id}, got {resp_req_id}")
 
-                    try:
-                        if sock is None:
-                            sock = self._get_socket(n, for_query=True)
+                    min_id, min_ts = struct.unpack("<QQ", min_key_raw)
+                    max_id, max_ts = struct.unpack("<QQ", max_key_raw)
+                    
+                    body_size = total_size - QUERY_RESP_HEADER_SIZE
 
-                        sock.sendall(req_data)
-
-                        # Read response header
-                        header_data = self._recv_exact(sock, QUERY_RESP_HEADER_SIZE, timeout=self.config.read_timeout)
-                        if not header_data:
-                            raise ConnectionError(f"Node {n} closed connection")
-
-                        unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
-                        total_size, resp_req_id, limit_reached, min_key_raw, max_key_raw, records_bytes, records_count = unpacked
+                    # Read body
+                    body_data = b""
+                    if body_size > 0:
+                        body_data = self._recv_exact(sock, body_size, timeout=self.config.read_timeout)
                         
-                        min_id, min_ts = struct.unpack("<QQ", min_key_raw)
-                        max_id, max_ts = struct.unpack("<QQ", max_key_raw)
-                        
-                        body_size = total_size - QUERY_RESP_HEADER_SIZE
+                except Exception as e:
+                    if sock:
+                        sock.close()
+                    raise e  # re-raise to failover to next node
 
-                        # Read body
-                        body_data = b""
-                        if body_size > 0:
-                            body_data = self._recv_exact(sock, body_size, timeout=self.config.read_timeout)
-                            
-                    except Exception as e:
-                        if sock:
-                            sock.close()
-                            sock = None
-                        raise e  # re-raise to failover to next node
-
-                    response = self._parse_response(resp_req_id, limit_reached, 
-                                                    min_id, min_ts, max_id, max_ts,
-                                                    records_bytes, records_count, body_data,
-                                                    skip_records=skip_records)
-                    
-                    all_records.extend(response["records"])
-                    
-                    # Check if we have more records to fetch
-                    if not response["limit_reached"]:
-                        aggregated = {
-                            "req_id": resp_req_id, "limit_reached": False,
-                            "min_id": query.min_id, "min_ts": query.min_ts,
-                            "max_id": max_id if all_records else query.max_id,
-                            "max_ts": max_ts if all_records else query.max_ts,
-                            "records_bytes": records_bytes,
-                            "records_count": len(all_records),
-                            "records": all_records
-                        }
-                        self._return_socket(n, sock, for_query=True)
-                        return (n, aggregated)
-                    
-                    # Pagination checks
-                    if max_id >= query.max_id and max_ts >= query.max_ts:
-                        aggregated = {
-                            "req_id": resp_req_id, "limit_reached": False,
-                            "min_id": query.min_id, "min_ts": query.min_ts,
-                            "max_id": query.max_id, "max_ts": query.max_ts,
-                            "records_bytes": records_bytes,
-                            "records_count": len(all_records),
-                            "records": all_records
-                        }
-                        self._return_socket(n, sock, for_query=True)
-                        return (n, aggregated)
-                    
-                    # Next page: start from the next key
-                    current_min_id = max_id + 1
-                    current_min_ts = 0
-                    
+                response = self._parse_response(resp_req_id, limit_reached, 
+                                                min_id, min_ts, max_id, max_ts,
+                                                records_bytes, records_count, body_data,
+                                                skip_records=skip_records)
+                
+                net_end = time.time() * 1000
+                self._return_socket(n, sock, for_query=True)
+                return (n, response, net_start, net_end)
+                
             except Exception as e:
                 last_error = e
         
         raise RuntimeError(f"Query to cluster {cluster_name} failed after trying {len(preferred_nodes)} nodes. Last error: {last_error}")
 
-    def _query_batch_single_node(self, node: Node, queries: List[QueryRequest], skip_records: bool = False) -> Tuple[Node, List[Dict]]:
+    def _query_batch_single_node(self, node: Node, queries: List[QueryRequest], skip_records: bool = False) -> Tuple[Node, List[Dict], float, float]:
         cluster_name = node.cluster_name
         nodes = self.clusters.get(cluster_name, [])
         leader = self.router.leader_registry.get_leader(cluster_name)
@@ -448,19 +633,18 @@ class DbClient:
         for n in preferred_nodes:
             sock = None
             try:
+                net_start = time.time() * 1000
                 sock = self._get_socket(n, for_query=True)
                 
                 # Build batch payload
                 payload = bytearray()
                 req_id_to_idx = {}
-                req_id_to_query = {}
                 
                 for idx, query in enumerate(queries):
                     req_id = random.randint(1, 10000000)
                     while req_id in req_id_to_idx:
                         req_id = random.randint(1, 10000000)
                     req_id_to_idx[req_id] = idx
-                    req_id_to_query[req_id] = query
                     
                     start_key = struct.pack("<QQ", query.min_id, query.min_ts)
                     end_key = struct.pack("<QQ", query.max_id, query.max_ts)
@@ -479,6 +663,9 @@ class DbClient:
                     unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, header_data)
                     total_size, resp_req_id, limit_reached, min_key_raw, max_key_raw, records_bytes, records_count = unpacked
                     
+                    if resp_req_id not in req_id_to_idx:
+                        raise ConnectionError(f"Received response with unknown req_id: {resp_req_id}")
+
                     min_id, min_ts = struct.unpack("<QQ", min_key_raw)
                     max_id, max_ts = struct.unpack("<QQ", max_key_raw)
                     
@@ -492,50 +679,6 @@ class DbClient:
                                                     records_bytes, records_count, body_data,
                                                     skip_records=skip_records)
                     
-                    # Handle pagination if necessary
-                    while resp_dict["limit_reached"]:
-                        next_min_id = resp_dict["max_id"] + 1
-                        next_req_id = random.randint(1, 10000000)
-                        
-                        orig_query = req_id_to_query[resp_req_id]
-                        
-                        start_key = struct.pack("<QQ", next_min_id, 0)
-                        end_key = struct.pack("<QQ", orig_query.max_id, orig_query.max_ts)
-                        req_data = struct.pack(QUERY_REQ_FMT, next_req_id, start_key, end_key)
-                        
-                        sock.sendall(req_data)
-                        
-                        p_header_data = self._recv_exact(sock, QUERY_RESP_HEADER_SIZE, timeout=self.config.read_timeout)
-                        if not p_header_data:
-                            raise ConnectionError(f"Node {n} closed connection during pagination")
-                            
-                        p_unpacked = struct.unpack(QUERY_RESP_HEADER_FMT, p_header_data)
-                        p_total_size, p_resp_req_id, p_limit_reached, p_min_key_raw, p_max_key_raw, p_records_bytes, p_records_count = p_unpacked
-                        
-                        p_min_id, p_min_ts = struct.unpack("<QQ", p_min_key_raw)
-                        p_max_id, p_max_ts = struct.unpack("<QQ", p_max_key_raw)
-                        
-                        p_body_size = p_total_size - QUERY_RESP_HEADER_SIZE
-                        p_body_data = b""
-                        if p_body_size > 0:
-                            p_body_data = self._recv_exact(sock, p_body_size, timeout=self.config.read_timeout)
-                            
-                        p_resp_dict = self._parse_response(p_resp_req_id, p_limit_reached,
-                                                           p_min_id, p_min_ts, p_max_id, p_max_ts,
-                                                           p_records_bytes, p_records_count, p_body_data,
-                                                           skip_records=skip_records)
-                        
-                        resp_dict["records"].extend(p_resp_dict["records"])
-                        resp_dict["records_count"] = len(resp_dict["records"])
-                        resp_dict["records_bytes"] += p_resp_dict["records_bytes"]
-                        resp_dict["limit_reached"] = p_resp_dict["limit_reached"]
-                        resp_dict["max_id"] = p_resp_dict["max_id"]
-                        resp_dict["max_ts"] = p_resp_dict["max_ts"]
-                        
-                        if p_max_id >= orig_query.max_id and p_max_ts >= orig_query.max_ts:
-                            resp_dict["limit_reached"] = False
-                            break
-                            
                     responses.append(resp_dict)
                 
                 # Re-order responses to match the queries input order
@@ -545,8 +688,9 @@ class DbClient:
                     if idx is not None:
                         ordered_responses[idx] = resp
                 
+                net_end = time.time() * 1000
                 self._return_socket(n, sock, for_query=True)
-                return (n, ordered_responses)
+                return (n, ordered_responses, net_start, net_end)
                 
             except Exception as e:
                 if sock:

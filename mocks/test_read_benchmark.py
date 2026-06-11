@@ -93,14 +93,14 @@ class TestReadBenchmark(unittest.TestCase):
         self.assertGreater(len(lines), 0, "Generated CSV is empty")
         header = lines[0].strip()
         
-        # Expected header: Timestamp,Total_ACKed_Records,Total_ACKed_Bytes,QPS,MBps
-        expected_header = "Timestamp,Total_ACKed_Records,Total_ACKed_Bytes,QPS,MBps"
+        # Expected header: Timestamp,Total_ACKed_Records,Total_ACKed_Bytes,QPS,MBps,Avg_Latency_ms,P50_Latency_ms,P95_Latency_ms
+        expected_header = "Timestamp,Total_ACKed_Records,Total_ACKed_Bytes,QPS,MBps,Avg_Latency_ms,P50_Latency_ms,P95_Latency_ms"
         self.assertEqual(header, expected_header, f"CSV header does not match. Expected '{expected_header}', got '{header}'")
         
         # Check that we have some data rows and they contain numeric values
         if len(lines) > 1:
             data_row = lines[1].strip().split(",")
-            self.assertEqual(len(data_row), 5, "Data row must have exactly 5 values")
+            self.assertEqual(len(data_row), 8, "Data row must have exactly 8 values")
             # Verify they are convertible to numeric types
             try:
                 int(data_row[0])  # Timestamp
@@ -108,8 +108,86 @@ class TestReadBenchmark(unittest.TestCase):
                 int(data_row[2])  # Total_ACKed_Bytes
                 int(data_row[3])  # QPS
                 float(data_row[4])  # MBps
+                float(data_row[5])  # Avg_Latency_ms
+                float(data_row[6])  # P50_Latency_ms
+                float(data_row[7])  # P95_Latency_ms
             except ValueError as e:
                 self.fail(f"Failed to parse CSV data values: {e}")
+
+    def test_benchmark_pagination_execution(self):
+        # Execute the read_benchmark.py script with range-size 25 (exceeds mock page limit of 10)
+        # to force pagination to occur.
+        cmd = [
+            "python3",
+            "read_benchmark.py",
+            "--config", self.config_file,
+            "--requests", "50",
+            "--routing-strategy", "hash",
+            "--data-dist", "uniform",
+            "--max-key", "1000",
+            "--range-size", "25",
+            "--batch-size", "8"
+        ]
+        
+        print(f"Running pagination command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        
+        print("Subprocess STDOUT:")
+        print(result.stdout)
+        print("Subprocess STDERR:")
+        print(result.stderr)
+        
+        self.assertEqual(result.returncode, 0, f"Pagination benchmark failed with code {result.returncode}")
+        self.assertIn("READ BENCHMARK COMPLETED", result.stdout)
+        self.assertIn("Total Records read:  1,250", result.stdout)
+
+    def test_priority_thread_pool_executor(self):
+        from client.dbclient import PriorityThreadPoolExecutor
+        import threading
+        
+        # We start an executor with 1 worker thread
+        executor = PriorityThreadPoolExecutor(max_workers=1)
+        
+        # We will submit a block task that sleeps for a bit
+        start_evt = threading.Event()
+        block_evt = threading.Event()
+        completed = []
+        
+        def blocking_task():
+            start_evt.set()
+            block_evt.wait()
+            completed.append("block")
+            
+        def low_priority_task(idx):
+            completed.append(f"low_{idx}")
+            
+        def high_priority_task(idx):
+            completed.append(f"high_{idx}")
+            
+        # Submit the blocking task first. This runs immediately on the 1 worker thread.
+        executor.submit(blocking_task)
+        
+        # Wait for the blocking task to actually start running on the worker thread
+        start_evt.wait()
+        
+        # Now submit low priority tasks (priority=1)
+        for i in range(3):
+            executor.submit(low_priority_task, i, priority=1)
+            
+        # Now submit high priority tasks (priority=0)
+        for i in range(3):
+            executor.submit(high_priority_task, i, priority=0)
+            
+        # Let the blocking task finish
+        block_evt.set()
+        
+        # Shutdown executor and wait for all tasks to finish
+        executor.shutdown(wait=True)
+        
+        # The expected completion order (excluding "block") should have all "high_*" before all "low_*" tasks!
+        tasks_order = [x for x in completed if x != "block"]
+        expected_order = ["high_0", "high_1", "high_2", "low_0", "low_1", "low_2"]
+        self.assertEqual(tasks_order, expected_order, f"Execution order did not match priority. Got {tasks_order}")
 
 if __name__ == "__main__":
     unittest.main()

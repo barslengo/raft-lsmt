@@ -539,7 +539,7 @@ static void background_query_cb(uv_work_t *req) {
    * If the request has been idle for more than 8 seconds, then skip the search
    * and respond back.
    */
-  if (t_iter_start - task->t_start_ns > 8000000000ULL) {
+  if (t_iter_start - task->t_start_ns > 32000000000ULL) {
     limit_reached = true;
     goto finalize_response;
   }
