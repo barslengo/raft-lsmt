@@ -63,14 +63,8 @@ def throughput_reporter(stop_event: threading.Event):
     """
     Background thread that collects metrics and reports throughput/latency.
     - Writes to the CSV file every 1 second.
-    - Prints the average throughput every 60 seconds.
+    - Prints the cumulative counter of completed queries every second.
     """
-    prev_queries_1s = 0
-    prev_bytes_1s = 0
-
-    prev_queries_60s = 0
-    prev_bytes_60s = 0
-
     seconds_elapsed = 0
     csv_filename = f"read_throughput_{int(time.time())}.csv"
 
@@ -86,28 +80,13 @@ def throughput_reporter(stop_event: threading.Event):
                 curr_bytes = total_bytes_read
                 curr_records = total_records_read
 
-            delta_qps_1s = curr_queries - prev_queries_1s
-            delta_mb_1s = (curr_bytes - prev_bytes_1s) / (1024.0 * 1024.0)
+            # Write UNIX timestamp and cumulative records, bytes, queries under QPS, and MBs under MBps
+            f.write(f"{int(time.time())},{curr_records},{curr_bytes},{curr_queries},{curr_bytes / (1024.0 * 1024.0):.2f}\n")
+            f.flush()
 
-            # Write UNIX timestamp and cumulative records and bytes, along with QPS and MBps delta
-            f.write(f"{int(time.time())},{curr_records},{curr_bytes},{delta_qps_1s},{delta_mb_1s:.2f}\n")
-
-            prev_queries_1s = curr_queries
-            prev_bytes_1s = curr_bytes
-
-            if seconds_elapsed % 60 == 0:
-                delta_qps_60s = curr_queries - prev_queries_60s
-                delta_mb_60s = (curr_bytes - prev_bytes_60s) / (1024.0 * 1024.0)
-
-                qps_sec_avg = delta_qps_60s / 60.0
-                mb_sec_avg = delta_mb_60s / 60.0
-
-                timestamp_str = time.strftime('%H:%M:%S')
-                print(f"[{timestamp_str}] ⚡ LAST MINUTE AVG: {qps_sec_avg:,.0f} QPS | {mb_sec_avg:.2f} MB/s (Total Queries: {curr_queries:,})")
-                f.flush()
-
-                prev_queries_60s = curr_queries
-                prev_bytes_60s = curr_bytes
+            # Every time we add a row, print the counter
+            print(f"[{time.strftime('%H:%M:%S')}] Elapsed: {seconds_elapsed}s | Total Queries: {curr_queries:,} | Total Records: {curr_records:,} | Total Bytes: {curr_bytes:,}")
+            sys.stdout.flush()
 
 class ZipfGenerator:
     """Highly optimized Zipfian generator with O(1) time and memory complexity."""
