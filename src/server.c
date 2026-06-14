@@ -13,13 +13,13 @@
 #define GLOBAL_MAX_QUERIES 64 // Limite massimo di query simultanee nel server
 #define STORAGE_EVENTS_METRICS_FLUSH_TIME (16 * 1000) //dump to disk every 16 seconds.
 #define MAX_LATENCY_SAMPLES 1000 /* Max samples for latency distribution */
-#define STORAGE_EVENT_BUFFER_SIZE 4096 /* Buffer size for storage events */
+#define STORAGE_EVENT_BUFFER_SIZE 8192 /* Buffer size for storage events */
 #define Log(SERVER_ID, FORMAT) printf("%d: " FORMAT "\n", SERVER_ID)
 #define Logf(SERVER_ID, FORMAT, ...) \
   printf("%d: " FORMAT "\n", SERVER_ID, __VA_ARGS__)
 
 
-#define BATCH_SIZE 4096 //1024 //128
+#define BATCH_SIZE 8192 //4096 //1024 //128
 #define CONTENT_MAX_SIZE 255
 #define QUERY_BYTES_LIMIT (512 * 1024) //512 KB 
 #define QUERY_REQ_SIZE (sizeof(uint64_t) + 2 * sizeof(sl_uint128_t)) //40 bytes.
@@ -1547,7 +1547,7 @@ static int ServerInit(struct Server *s,
 
   /* Allow more data in flight to fill. 
    * With 4KB batches, 256 entries = 1MB of in-flight data. */
-  raft_set_max_inflight_entries(&s->raft, 256);
+  raft_set_max_inflight_entries(&s->raft, 128);
 
   s->transfer.data = s;
 
