@@ -3,20 +3,27 @@
 # Interrompe lo script in caso di errori critici
 set -e
 
-# --- PARAMETRI FISSI ---
-CONFIG_FILE="servers.json"
-REQUESTS=30000000
-ROUTING_STRATEGY="hash"
+# --- CONFIGURAZIONE (con defaults) ---
+CONFIG_FILE="${1:-servers.json}"
+REQUESTS="${2:-30000000}"
+ROUTING_STRATEGY="${3:-hash}"
 
 # --- DISTRIBUZIONI DA TESTARE ---
 DISTRIBUTIONS=("sequential" "uniform" "zipfian")
 
 echo "=========================================================="
-echo "🚀 Avvio della suite di Benchmark in Scrittura"
+echo "🚀 Avvio della suite di Benchmark in Scrittura (Multi-Process)"
 echo "Configurazione     : $CONFIG_FILE"
 echo "Richieste per test : $REQUESTS"
 echo "Routing strategy   : $ROUTING_STRATEGY"
 echo "=========================================================="
+
+# Rileva il percorso corretto per lo script multi-processo
+if [ -f "bash-scripts/run_bench_multi.sh" ]; then
+    MULTI_SCRIPT="./bash-scripts/run_bench_multi.sh"
+else
+    MULTI_SCRIPT="./run_bench_multi.sh"
+fi
 
 for DIST in "${DISTRIBUTIONS[@]}"; do
     echo ""
@@ -24,12 +31,12 @@ for DIST in "${DISTRIBUTIONS[@]}"; do
     echo "▶️ INIZIO TEST: Data Distribution -> [ $DIST ]"
     echo "----------------------------------------------------------"
     
-    # Esecuzione dello script Python
-    python3 write-bench.py \
+    # Esecuzione dello script multi-processo
+    "$MULTI_SCRIPT" \
         --config "$CONFIG_FILE" \
         --requests $REQUESTS \
-        --routing-strategy "$ROUTING_STRATEGY" \
-        --data-dist "$DIST"
+        --strategy "$ROUTING_STRATEGY" \
+        --dist "$DIST"
         
     echo "✅ Test con distribuzione '$DIST' completato!"
     
