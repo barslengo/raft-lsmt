@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -118,7 +119,8 @@ def throughput_reporter(stop_event: threading.Event):
     - Prints the cumulative counter of completed queries every second.
     """
     seconds_elapsed = 0
-    csv_filename = f"read_throughput_{int(time.time())}.csv"
+    csv_filename = f"read_throughput_{int(time.time())}_{os.getpid()}.csv"
+    prev_queries = 0
 
     with open(csv_filename, "w") as f:
         # Crucial header format compatible with generating dashboards
@@ -142,6 +144,19 @@ def throughput_reporter(stop_event: threading.Event):
             print(f"[{time.strftime('%H:%M:%S')}] Elapsed: {seconds_elapsed}s | Total Queries: {curr_queries:,} | Total Records: {curr_records:,} | Total Bytes: {curr_bytes:,} | Avg Latency: {avg_l:.2f} ms | P50: {p50_l:.2f} ms | P95: {p95_l:.2f} ms")
             sys.stdout.flush()
 
+            prev_queries = curr_queries
+
+        # Write final remaining records if any, or if no data row has been written yet
+        with metrics_lock:
+            curr_queries = total_queries
+            curr_bytes = total_bytes_read
+            curr_records = total_records_read
+
+        if curr_queries > prev_queries or seconds_elapsed == 0:
+            avg_l, p50_l, p95_l = get_latency_stats()
+            f.write(f"{int(time.time())},{curr_records},{curr_bytes},{curr_queries},{curr_bytes / (1024.0 * 1024.0):.2f},{avg_l:.2f},{p50_l:.2f},{p95_l:.2f}\n")
+            f.flush()
+
 class ZipfGenerator:
     """Highly optimized Zipfian generator with O(1) time and memory complexity."""
     def __init__(self, n: int, alpha: float = 1.0):
@@ -162,32 +177,32 @@ class ZipfGenerator:
             val = (u * self.c * (1.0 - self.alpha) + 1.0) ** (1.0 / (1.0 - self.alpha))
         return min(self.n, max(1, int(val)))
 
-def query_stream(amount: int, data_distribution: str, max_key: int, range_size: int) -> Iterator[QueryRequest]:
+def query_stream(amount: int, data_distribution: str, max_key: int, range_size: int, key_start: int, key_end: int) -> Iterator[QueryRequest]:
     """Generate a stream of QueryRequest objects according to the specified distribution."""
-    print(f"Initializing {amount} queries stream (Data Dist: {data_distribution}, Max Key: {max_key}, Range Size: {range_size})...")
+    print(f"Initializing {amount} queries stream (Data Dist: {data_distribution}, Max Key: {max_key}, Key Range: [{key_start}, {key_end}], Range Size: {range_size})...")
     
     max_ts = (2**64) - 1
+    range_width = key_end - key_start + 1
 
     if data_distribution == 'sequential':
         for i in range(amount):
-            start_id = (i * range_size) % max_key
-            if start_id == 0: start_id = 1
+            start_id = key_start + (i * range_size) % range_width
             yield QueryRequest(min_id=start_id, min_ts=0, max_id=start_id + range_size - 1, max_ts=max_ts)
             
     elif data_distribution == 'uniform':
         for _ in range(amount):
-            start_id = random.randint(1, max_key)
+            start_id = random.randint(key_start, key_end)
             yield QueryRequest(min_id=start_id, min_ts=0, max_id=start_id + range_size - 1, max_ts=max_ts)
             
     elif data_distribution == 'zipfian':
-        zipf = ZipfGenerator(max_key)
+        zipf = ZipfGenerator(range_width)
         for _ in range(amount):
-            start_id = zipf.next()
+            start_id = key_start + zipf.next() - 1
             yield QueryRequest(min_id=start_id, min_ts=0, max_id=start_id + range_size - 1, max_ts=max_ts)
     else:
         raise ValueError(f"Unknown distribution: {data_distribution}")
 
-def bench(dbclient: DbClient, data_dist: str, requests: int, max_key: int, range_size: int, batch_size: int):
+def bench(dbclient: DbClient, data_dist: str, requests: int, max_key: int, range_size: int, batch_size: int, key_start: int, key_end: int):
     """
     Query benchmark loop with batching. Uses the client's internal ThreadPoolExecutor.
     """
@@ -198,7 +213,7 @@ def bench(dbclient: DbClient, data_dist: str, requests: int, max_key: int, range
     reporter_thread = threading.Thread(target=throughput_reporter, args=(stop_event,), daemon=True)
     reporter_thread.start()
 
-    stream = query_stream(requests, data_dist, max_key, range_size)
+    stream = query_stream(requests, data_dist, max_key, range_size, key_start, key_end)
     total_processed = 0
     batch_buffer = []
     
@@ -280,7 +295,13 @@ def main():
     parser.add_argument("--thread-pool-size", type=int, default=64, help="Thread pool size for concurrent I/O requests")
     parser.add_argument("--batch-size", type=int, default=32, help="Number of query requests to batch together")
     
+    parser.add_argument("--key-start", type=int, default=1, help="Start of the key range (inclusive)")
+    parser.add_argument("--key-end", type=int, default=None, help="End of the key range (inclusive)")
+    
     args = parser.parse_args()
+
+    if args.key_end is None:
+        args.key_end = args.max_key
 
     with open(args.config, 'r') as f:
         config_data = json.load(f)
@@ -316,7 +337,7 @@ def main():
     print(f"Batch size: {args.batch_size}")
     
     try:
-        bench(db_client, args.data_dist, args.requests, args.max_key, args.range_size, args.batch_size)
+        bench(db_client, args.data_dist, args.requests, args.max_key, args.range_size, args.batch_size, args.key_start, args.key_end)
     except Exception as e:
         print(f"Error: {e}")
         db_client.disconnect()
