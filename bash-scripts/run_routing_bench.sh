@@ -45,8 +45,8 @@ for DIST in "${DISTRIBUTIONS[@]}"; do
     
     # Pausa di raffreddamento solo se non siamo all'ultimo ciclo
     if [ "$DIST" != "${DISTRIBUTIONS[-1]}" ]; then
-        echo "⏳ Pausa di 15 secondi per stabilizzare l'LSM-Tree e Raft..."
-        sleep 15
+        echo "⏳ Pausa di 30 secondi per stabilizzare l'LSM-Tree e Raft..."
+        sleep 30
     fi
 done
 

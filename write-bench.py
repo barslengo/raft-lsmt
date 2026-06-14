@@ -154,7 +154,7 @@ def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key
     """
     futures = []
     batch_buffer = []
-    buffer_size = 4096
+    buffer_size = 8192
 
     stop_event = threading.Event()
     reporter_thread = threading.Thread(target=throughput_reporter, args=(stop_event,), daemon=True)
