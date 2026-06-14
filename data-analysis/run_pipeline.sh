@@ -26,10 +26,15 @@ echo "Fase 1/2: Raccolta statistiche dai nodi..."
 ./gather-stats.sh "$SOURCE_DIR" "$STATS_DIR"
 
 # 2. Genera la dashboard con Python
-echo "Fase 2/2: Generazione dashboard e grafici..."
+echo "Fase 2/3: Generazione dashboard e grafici..."
 python3 generate-dashboard_v2.py -s "$STATS_DIR" -c "$CLIENT_CSV" -o "$OUTPUT_DIR"
+
+# 3. Genera il report di recovery in HTML e grafici dedicati
+echo "Fase 3/3: Generazione report di failure recovery e grafici dedicati..."
+python3 generate_recovery_report.py -s "$STATS_DIR" -c "$CLIENT_CSV" -o "$OUTPUT_DIR" -r "$(dirname "$OUTPUT_DIR")/recovery_report.html"
 
 echo "=========================================="
 echo "Pipeline completata con successo!"
 echo "I risultati sono disponibili in: $OUTPUT_DIR"
+echo "Report recovery: $(dirname "$OUTPUT_DIR")/recovery_report.html"
 echo "=========================================="

@@ -7,6 +7,7 @@ set -e
 CONFIG_FILE="${1:-servers.json}"
 REQUESTS="${2:-30000000}"
 ROUTING_STRATEGY="${3:-hash}"
+JITTER="${4:-0.0}"
 
 # --- DISTRIBUZIONI DA TESTARE ---
 DISTRIBUTIONS=("sequential" "uniform" "zipfian")
@@ -16,6 +17,7 @@ echo "🚀 Avvio della suite di Benchmark in Scrittura (Multi-Process)"
 echo "Configurazione     : $CONFIG_FILE"
 echo "Richieste per test : $REQUESTS"
 echo "Routing strategy   : $ROUTING_STRATEGY"
+echo "Batch Jitter       : $JITTER"
 echo "=========================================================="
 
 # Rileva il percorso corretto per lo script multi-processo
@@ -36,7 +38,8 @@ for DIST in "${DISTRIBUTIONS[@]}"; do
         --config "$CONFIG_FILE" \
         --requests $REQUESTS \
         --strategy "$ROUTING_STRATEGY" \
-        --dist "$DIST"
+        --dist "$DIST" \
+        --jitter "$JITTER"
         
     echo "✅ Test con distribuzione '$DIST' completato!"
     
