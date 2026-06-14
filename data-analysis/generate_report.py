@@ -150,6 +150,12 @@ def load_and_resample_server_data(base_dir):
             if col in res.columns:
                 res[col] = res[col].ffill().fillna(0)
                 
+        # Ensure Raft indices are monotonically ascending
+        for col in ['Raft_Idx_Local', 'Raft_Idx_Applied', 'Raft_Idx_Commit']:
+            if col in res.columns:
+                res[col] = res[col].cummax()
+
+                
         rate_cols = ['Write_OPS', 'Write_MBps', 'Read_OPS', 'Read_MBps']
         for col in rate_cols:
             if col in res.columns:
@@ -781,8 +787,13 @@ def run_recovery_mode(args):
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Load and resample server data
-    df_server, global_start_ms = load_and_resample_server_data(args.stats_dir)
+    try:
+        df_server, global_start_ms = load_and_resample_server_data(args.stats_dir)
+    except ValueError as e:
+        print(f"  [⚠️ WARNING] Server stats not found: {e}. Skipping Recovery Analysis.")
+        return
     df_server['Relative_Time_s'] = (df_server['Timestamp_ms'] - global_start_ms) / 1000.0
+
     client_dir = args.client_csv if os.path.isdir(args.client_csv) else os.path.dirname(args.client_csv)
     client_files = sorted(glob.glob(os.path.join(client_dir, 'client_throughput_*.csv')))
     if not client_files and os.path.isfile(args.client_csv):
@@ -1144,7 +1155,12 @@ def run_write_mode(args):
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Load server stats
-    df_server, global_start_ms = load_and_resample_server_data(args.stats_dir)
+    try:
+        df_server, global_start_ms = load_and_resample_server_data(args.stats_dir)
+    except ValueError as e:
+        print(f"  [⚠️ WARNING] Server stats not found: {e}. Skipping Write Performance Analysis.")
+        return
+
     client_dir = args.client_csv if os.path.isdir(args.client_csv) else os.path.dirname(args.client_csv)
     client_files = sorted(glob.glob(os.path.join(client_dir, 'client_throughput_*.csv')))
     if not client_files and os.path.isfile(args.client_csv):
@@ -1502,13 +1518,19 @@ def run_read_mode(args):
     
     if not client_files:
         # Fallback to single read file matching client_csv
-        client_files = [args.client_csv] if os.path.exists(args.client_csv) else []
+        client_files = [args.client_csv] if os.path.isfile(args.client_csv) else []
         
     if not client_files:
-        raise ValueError(f"No read_throughput_*.csv or client CSV files found!")
+        print("  [⚠️ WARNING] No read_throughput_*.csv or client CSV files found. Skipping Read Performance Analysis.")
+        return
         
     print(f"Loading server stats...")
-    df_server, global_start_ms = load_and_resample_server_data(args.stats_dir)
+    try:
+        df_server, global_start_ms = load_and_resample_server_data(args.stats_dir)
+    except ValueError as e:
+        print(f"  [⚠️ WARNING] Server stats not found: {e}. Skipping Read Performance Analysis.")
+        return
+
     df_server['Relative_Time_s'] = (df_server['Timestamp_ms'] - global_start_ms) / 1000.0
     
     df_events = load_storage_events(args.stats_dir)
