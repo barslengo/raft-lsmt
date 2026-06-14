@@ -118,15 +118,17 @@ class RoundRobinRoutingStrategy(RoutingStrategy):
                         record: Record,
                         leader_registry: LeaderRegistry,
                         clusters: Dict[str, List[Node]]) -> Node:
-        # Get the first cluster's nodes for round-robin
         cluster_names = sorted(list(clusters.keys()))
-        target_cluster = cluster_names[record.key_id % len(cluster_names)]
-        nodes = clusters[target_cluster]
-        
+        if not cluster_names:
+            return None
+
         with self._lock:
-            node = nodes[self._counter % len(nodes)]
+            target_cluster = cluster_names[self._counter % len(cluster_names)]
             self._counter += 1
-            return node
+
+        nodes = clusters[target_cluster]
+        leader = leader_registry.get_leader(target_cluster)
+        return leader if leader else (nodes[0] if nodes else None)
 
     def get_node_query(self,
                        query: QueryRequest,
