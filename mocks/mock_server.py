@@ -91,13 +91,30 @@ class MockDatabaseServer:
                 conn.sendall(redirect_msg)
                 conn.close()
             else:
-                # Hold connection or read incoming data to act as leader
+                # Read incoming data and send 1 success byte for each record
+                buffer = bytearray()
                 while self.running:
                     r, _, _ = select.select([conn], [], [], 0.2)
-                    if r:
-                        data = conn.recv(4096)
-                        if not data:
+                    if not r:
+                        continue
+                    data = conn.recv(65536)
+                    if not data:
+                        break
+                    buffer.extend(data)
+                    
+                    # Parse records from buffer
+                    acks_to_send = 0
+                    while len(buffer) >= 4:
+                        msg_size = struct.unpack_from("<I", buffer, 0)[0]
+                        total_record_size = msg_size
+                        if len(buffer) >= total_record_size:
+                            acks_to_send += 1
+                            del buffer[:total_record_size]
+                        else:
                             break
+                            
+                    if acks_to_send > 0:
+                        conn.sendall(b'\x00' * acks_to_send)
         except Exception:
             pass
         finally:

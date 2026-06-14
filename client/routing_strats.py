@@ -75,7 +75,7 @@ class HashRoutingStrategy(RoutingStrategy):
                         clusters: Dict[str, List[Node]]) -> Node:
 
         val = struct.pack("<QQ", record.key_id, record.timestamp)
-        h = int(hashlib.md5(val).hexdigest(), 16)
+        h = int.from_bytes(hashlib.md5(val).digest(), byteorder='big')
         cluster_names = sorted(list(clusters.keys()))
         target_cluster = cluster_names[h % len(cluster_names)]
         

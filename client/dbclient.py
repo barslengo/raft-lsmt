@@ -300,10 +300,13 @@ class DbClient:
     def _serialize_batch(self, batch: List[Record]) -> bytes:
         payload = bytearray()
         for record in batch:
-            inner_payload = struct.pack("<BIQ", LSMT_TYPE_INT, 8, record.content)
-            outer_payload = struct.pack("<QQ", record.key_id, record.timestamp) + inner_payload
-            msg_size = 4 + len(outer_payload)
-            payload.extend(struct.pack("<I", msg_size) + outer_payload)
+            if isinstance(record.content, int):
+                payload.extend(struct.pack("<IQQBIQ", 33, record.key_id, record.timestamp, LSMT_TYPE_INT, 8, record.content))
+            else:
+                inner_payload = struct.pack("<BIQ", LSMT_TYPE_INT, 8, record.content)
+                outer_payload = struct.pack("<QQ", record.key_id, record.timestamp) + inner_payload
+                msg_size = 4 + len(outer_payload)
+                payload.extend(struct.pack("<I", msg_size) + outer_payload)
         return bytes(payload)
 
     def _recv_exact(self, sock: socket.socket, n: int, timeout: Optional[float] = None) -> bytes:

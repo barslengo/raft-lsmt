@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -46,7 +47,7 @@ def throughput_reporter(stop_event: threading.Event):
 
     seconds_elapsed = 0
 
-    csv_filename = f"client_throughput_{int(time.time())}.csv"
+    csv_filename = f"client_throughput_{int(time.time())}_{os.getpid()}.csv"
 
     with open(csv_filename, "w") as f:
         f.write("Timestamp,Total_ACKed_Records,Total_ACKed_Bytes,OPS,MBps\n")
@@ -81,6 +82,17 @@ def throughput_reporter(stop_event: threading.Event):
                 prev_records_60s = curr_records
                 prev_bytes_60s = curr_bytes
 
+        # Write final remaining records if any, or if no data row has been written yet
+        with metrics_lock:
+            curr_records = total_acked_records
+            curr_bytes = total_acked_bytes
+
+        if curr_records > prev_records_1s or seconds_elapsed == 0:
+            delta_ops_1s = curr_records - prev_records_1s
+            delta_mb_1s = (curr_bytes - prev_bytes_1s) / (1024.0 * 1024.0)
+            f.write(f"{int(time.time())},{curr_records},{curr_bytes},{delta_ops_1s},{delta_mb_1s:.2f}\n")
+            f.flush()
+
 
 class ZipfGenerator:
     """
@@ -106,34 +118,35 @@ class ZipfGenerator:
         return min(self.n, max(1, int(val)))
 
 
-def record_stream(amount: int, data_distribution: str, base_timestamp: int = 0) -> Iterator[Record]:
+def record_stream(amount: int, data_distribution: str, key_start: int, key_end: int, base_timestamp: int = 0) -> Iterator[Record]:
     """Generate a stream of Record objects according to the specified distribution."""
-    print(f"Initializing {amount} records stream (Data Dist: {data_distribution})...")
+    print(f"Initializing {amount} records stream (Data Dist: {data_distribution}, Key Range: [{key_start}, {key_end}])...")
     
     current_ts = base_timestamp
     
     if data_distribution == 'sequential':
-        for key_id in range(1, amount + 1):
+        for key_id in range(key_start, key_start + amount):
             yield Record(key_id=key_id, timestamp=current_ts, content=key_id)
             current_ts += 1
     elif data_distribution == 'uniform':
         # Generating a unique shuffled space consumes O(N) memory, causing crash/OOM for large values.
         # Instead, we generate keys uniformly at random within the keyspace range, which takes O(1) memory.
         for _ in range(amount):
-            key_id = random.randint(1, amount)
+            key_id = random.randint(key_start, key_end)
             yield Record(key_id=key_id, timestamp=current_ts, content=key_id)
             current_ts += 1
     elif data_distribution == 'zipfian':
-        zipf = ZipfGenerator(amount)
+        zipf_range = key_end - key_start + 1
+        zipf = ZipfGenerator(zipf_range)
         for _ in range(amount):
-            key_id = zipf.next()
+            key_id = key_start + zipf.next() - 1
             yield Record(key_id=key_id, timestamp=current_ts, content=key_id)
             current_ts += 1
     else:
         raise ValueError(f"Unknown distribution: {data_distribution}")
 
 
-def bench(dbclient: DbClient, data_dist: str, requests: int):
+def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key_end: int):
     """
     Consumer/producer system implementation:
     Producer (record_stream) yields new records one by one.
@@ -147,7 +160,7 @@ def bench(dbclient: DbClient, data_dist: str, requests: int):
     reporter_thread = threading.Thread(target=throughput_reporter, args=(stop_event,), daemon=True)
     reporter_thread.start()
 
-    stream = record_stream(requests, data_dist, int(time.time() * 1000))
+    stream = record_stream(requests, data_dist, key_start, key_end, int(time.time() * 1000))
     total_processed = 0
     
     for record in stream:
@@ -225,7 +238,12 @@ def main():
                         choices=["sequential", "uniform", "zipfian"], 
                         default="uniform", 
                         help="Data distribution strategy")
+    parser.add_argument("--key-start", type=int, default=1, help="Start of the key range (inclusive)")
+    parser.add_argument("--key-end", type=int, default=None, help="End of the key range (inclusive)")
     args = parser.parse_args()
+
+    if args.key_end is None:
+        args.key_end = args.key_start + args.requests - 1
 
     # 1. Load Config
     with open(args.config, 'r') as f:
@@ -251,7 +269,7 @@ def main():
     # 3. Setup DbClient
     client_config = DbClientConfig(
         thread_pool_size=32,
-        batch_size=4096,
+        batch_size=8192,
         write_timeout=5.0,
         read_timeout=10.0,
         write_cb=write_batch_cb
@@ -264,7 +282,7 @@ def main():
     print(f"Routing strategy: {args.routing_strategy}")
     
     try:
-        bench(db_client, args.data_dist, args.requests)
+        bench(db_client, args.data_dist, args.requests, args.key_start, args.key_end)
     except Exception as e:
         print(f"Error: {e}")
         db_client.disconnect()
