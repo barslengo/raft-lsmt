@@ -146,7 +146,7 @@ def record_stream(amount: int, data_distribution: str, key_start: int, key_end: 
         raise ValueError(f"Unknown distribution: {data_distribution}")
 
 
-def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key_end: int):
+def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key_end: int, batch_jitter: float = 0.0):
     """
     Consumer/producer system implementation:
     Producer (record_stream) yields new records one by one.
@@ -176,6 +176,8 @@ def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key
             fs = dbclient.write(batch_buffer)
             if fs:
                 futures.extend(fs)
+                if batch_jitter > 0.0:
+                    time.sleep(random.uniform(0.0, batch_jitter))
             batch_buffer = []
             
             # Throttle if there are too many in-flight request futures
@@ -193,6 +195,8 @@ def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key
         fs = dbclient.write(batch_buffer)
         if fs:
             futures.extend(fs)
+            if batch_jitter > 0.0:
+                time.sleep(random.uniform(0.0, batch_jitter))
             
     # Flush remaining buffers from internal DbClient write queue
     dbclient.flush()
@@ -240,6 +244,7 @@ def main():
                         help="Data distribution strategy")
     parser.add_argument("--key-start", type=int, default=1, help="Start of the key range (inclusive)")
     parser.add_argument("--key-end", type=int, default=None, help="End of the key range (inclusive)")
+    parser.add_argument("--batch-jitter", type=float, default=0.0, help="Max random jitter sleep (in seconds) after sending each batch")
     args = parser.parse_args()
 
     if args.key_end is None:
@@ -282,7 +287,7 @@ def main():
     print(f"Routing strategy: {args.routing_strategy}")
     
     try:
-        bench(db_client, args.data_dist, args.requests, args.key_start, args.key_end)
+        bench(db_client, args.data_dist, args.requests, args.key_start, args.key_end, args.batch_jitter)
     except Exception as e:
         print(f"Error: {e}")
         db_client.disconnect()

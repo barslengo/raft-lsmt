@@ -153,7 +153,7 @@ class RoundRobinRoutingStrategy(RoutingStrategy):
 
 
 class LeaderRoutingStrategy(RoutingStrategy):
-    """Strategy that always returns a random node."""
+    """Strategy that always returns the leader of the target cluster determined by modulo on key_id."""
     def get_node_insert(self,
                         record: Record,
                         leader_registry: LeaderRegistry,
@@ -161,7 +161,8 @@ class LeaderRoutingStrategy(RoutingStrategy):
         cluster_names = sorted(list(clusters.keys()))
         target_cluster = cluster_names[record.key_id % len(cluster_names)]
         nodes = clusters[target_cluster]
-        return random.choice(nodes)
+        leader = leader_registry.get_leader(target_cluster)
+        return leader if leader else (nodes[0] if nodes else None)
 
     def get_node_query(self,
                        query: QueryRequest,

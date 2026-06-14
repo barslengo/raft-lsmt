@@ -9,6 +9,8 @@ TOTAL_REQUESTS=5000000
 ROUTING_STRATEGY="hash"
 DATA_DIST="uniform"
 WORKERS=$CORES
+KEY_START_BASE=1
+BATCH_JITTER=0.0
 
 show_help() {
     echo "Usage: $0 [options]"
@@ -19,6 +21,8 @@ show_help() {
     echo "  -c, --config    <path>   Path to cluster configuration file (default: servers.json)"
     echo "  -s, --strategy  <strat>  Routing strategy: hash, round-robin, leader (default: hash)"
     echo "  -d, --dist      <dist>   Data distribution: sequential, uniform, zipfian (default: uniform)"
+    echo "  -k, --key-start <num>    Start of the key range (default: 1)"
+    echo "  -j, --jitter    <sec>    Max random batch jitter sleep in seconds (default: 0.0)"
     echo "  -h, --help               Show this help message"
     echo ""
 }
@@ -66,6 +70,22 @@ while [[ "$#" -gt 0 ]]; do
             DATA_DIST="$2"
             shift 2
             ;;
+        -k|--key-start)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Option $1 requires an argument."
+                exit 1
+            fi
+            KEY_START_BASE="$2"
+            shift 2
+            ;;
+        -j|--jitter)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Option $1 requires an argument."
+                exit 1
+            fi
+            BATCH_JITTER="$2"
+            shift 2
+            ;;
         -h|--help)
             show_help
             exit 0
@@ -85,6 +105,8 @@ echo "Total Requests       : $TOTAL_REQUESTS"
 echo "Workers (Processes)  : $WORKERS"
 echo "Routing Strategy     : $ROUTING_STRATEGY"
 echo "Data Distribution    : $DATA_DIST"
+echo "Key Start Base       : $KEY_START_BASE"
+echo "Batch Jitter         : $BATCH_JITTER"
 echo "=========================================================="
 
 # Compute requests per worker
@@ -104,7 +126,7 @@ for i in $(seq 0 $((WORKERS - 1))); do
     fi
     
     # Calculate disjoint key range
-    KEY_START=$((i * REQS_PER_WORKER + 1))
+    KEY_START=$((KEY_START_BASE + i * REQS_PER_WORKER))
     KEY_END=$((KEY_START + WORKER_REQS - 1))
     
     echo "▶️ Launching Worker $i with range [$KEY_START, $KEY_END] ($WORKER_REQS requests)..."
@@ -122,7 +144,8 @@ for i in $(seq 0 $((WORKERS - 1))); do
         --routing-strategy "$ROUTING_STRATEGY" \
         --data-dist "$DATA_DIST" \
         --key-start "$KEY_START" \
-        --key-end "$KEY_END" &
+        --key-end "$KEY_END" \
+        --batch-jitter "$BATCH_JITTER" &
         
     pids+=($!)
 done

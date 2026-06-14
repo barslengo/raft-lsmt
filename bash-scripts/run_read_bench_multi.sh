@@ -9,6 +9,7 @@ MAX_KEY=5000000
 RANGE_SIZE=10
 THREAD_POOL_SIZE=64
 BATCH_SIZE=32
+KEY_START_BASE=1
 
 # Auto-detect cores
 CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
@@ -27,6 +28,7 @@ show_help() {
     echo "  -g, --range     <num>    How many keys to fetch per query (default: 10)"
     echo "  -t, --threads   <num>    Thread pool size for concurrent requests per worker (default: 64)"
     echo "  -b, --batch     <num>    Query request batch size per worker (default: 32)"
+    echo "  --key-start     <num>    Start of the key range (default: 1)"
     echo "  -h, --help               Show this help message"
     echo ""
 }
@@ -106,6 +108,14 @@ while [[ "$#" -gt 0 ]]; do
             BATCH_SIZE="$2"
             shift 2
             ;;
+        --key-start)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Option $1 requires an argument."
+                exit 1
+            fi
+            KEY_START_BASE="$2"
+            shift 2
+            ;;
         -h|--help)
             show_help
             exit 0
@@ -129,6 +139,7 @@ echo "Max Key              : $MAX_KEY"
 echo "Range Size           : $RANGE_SIZE"
 echo "Thread Pool Size     : $THREAD_POOL_SIZE"
 echo "Batch Size           : $BATCH_SIZE"
+echo "Key Start Base       : $KEY_START_BASE"
 echo "=========================================================="
 
 # Compute requests and key range per worker
@@ -151,7 +162,7 @@ for i in $(seq 0 $((WORKERS - 1))); do
     fi
     
     # Calculate disjoint key range
-    KEY_START=$((i * KEY_RANGE_PER_WORKER + 1))
+    KEY_START=$((KEY_START_BASE + i * KEY_RANGE_PER_WORKER))
     KEY_END=$((KEY_START + KEY_RANGE_PER_WORKER - 1))
     if [ $i -eq $((WORKERS - 1)) ]; then
         KEY_END=$((KEY_END + REMAINDER_KEYS))

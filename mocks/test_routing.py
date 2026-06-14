@@ -77,11 +77,53 @@ class TestRoundRobinRoutingStrategy(unittest.TestCase):
         n5 = strategy.get_node_insert(r5, leader_registry, clusters)
         self.assertEqual(n5.cluster_name, "B")
         self.assertEqual(n5.id, 6)
-        
         r6 = Record(key_id=15, timestamp=1005, content="val6")
         n6 = strategy.get_node_insert(r6, leader_registry, clusters)
         self.assertEqual(n6.cluster_name, "C")
         self.assertEqual(n6.id, 7)
+
+class TestHashRoutingStrategy(unittest.TestCase):
+    def test_hash_routing_uses_id_and_timestamp(self):
+        nodes_a = [Node("A", 1, "127.0.0.1", 18091)]
+        nodes_b = [Node("B", 2, "127.0.0.1", 18092)]
+        clusters = {"A": nodes_a, "B": nodes_b}
+        
+        leader_registry = LeaderRegistry()
+        leader_registry.set_leader(nodes_a[0])
+        leader_registry.set_leader(nodes_b[0])
+        
+        from client.routing_strats import HashRoutingStrategy
+        strategy = HashRoutingStrategy()
+        
+        # Test that same key with different timestamps can go to different clusters
+        r1 = Record(key_id=42, timestamp=1000, content="val1")
+        r2 = Record(key_id=42, timestamp=2000, content="val2")
+        
+        n1 = strategy.get_node_insert(r1, leader_registry, clusters)
+        n2 = strategy.get_node_insert(r2, leader_registry, clusters)
+        
+        self.assertIn(n1, [nodes_a[0], nodes_b[0]])
+        self.assertIn(n2, [nodes_a[0], nodes_b[0]])
+
+class TestLeaderRoutingStrategy(unittest.TestCase):
+    def test_leader_routing_returns_leader(self):
+        nodes_a = [
+            Node("A", 1, "127.0.0.1", 18091),
+            Node("A", 2, "127.0.0.1", 18092),
+        ]
+        clusters = {"A": nodes_a}
+        
+        leader_registry = LeaderRegistry()
+        # Set node 2 as leader
+        leader_registry.set_leader(nodes_a[1])
+        
+        from client.routing_strats import LeaderRoutingStrategy
+        strategy = LeaderRoutingStrategy()
+        
+        r1 = Record(key_id=10, timestamp=1000, content="val1")
+        n1 = strategy.get_node_insert(r1, leader_registry, clusters)
+        # Should return the registered leader (node 2) instead of a random node
+        self.assertEqual(n1.id, 2)
 
 if __name__ == "__main__":
     unittest.main()
