@@ -291,7 +291,10 @@ class DbClient:
                         sock.close()
 
                     retries += 1
-                    time.sleep(5)
+                    # Exponential backoff with jitter to recover faster from transient errors or election phases
+                    backoff_delay = min(0.1 * (2 ** (retries - 1)), 2.0)
+                    sleep_time = backoff_delay + random.uniform(0, 0.1 * backoff_delay)
+                    time.sleep(sleep_time)
             
             raise RuntimeError(f"Failed batch request to the cluster {cluster_name} after {retries} attemps")
 
