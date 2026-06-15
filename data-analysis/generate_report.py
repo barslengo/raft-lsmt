@@ -114,6 +114,7 @@ def load_and_resample_server_data(base_dir):
         df = calculate_rates_on_raw(df)
         df['Cluster'] = cluster_id
         df['Node'] = node_id
+        df['File_Path'] = file_path
         all_dfs.append(df)
         
     if not all_dfs:
@@ -130,6 +131,15 @@ def load_and_resample_server_data(base_dir):
     
     resampled_nodes = []
     for (cluster, node), group in df_raw.groupby(['Cluster', 'Node']):
+        node_files = group['File_Path'].dropna().unique() if 'File_Path' in group.columns else []
+        file_ranges = []
+        for fp in node_files:
+            file_df = group[group['File_Path'] == fp]
+            if not file_df.empty:
+                f_min = file_df['Timestamp_ms'].min()
+                f_max = file_df['Timestamp_ms'].max()
+                file_ranges.append((f_min, f_max))
+
         group = group.set_index('Datetime').sort_index()
         group['Orig_Timestamp_ms'] = group['Timestamp_ms']
         
@@ -140,7 +150,10 @@ def load_and_resample_server_data(base_dir):
         res['Last_Actual_Timestamp'] = res['Orig_Timestamp_ms'].ffill()
         res['Resampled_Timestamp_ms'] = res.index.values.astype('datetime64[ms]').astype(np.int64)
         
-        is_offline = ((res['Resampled_Timestamp_ms'] - res['Last_Actual_Timestamp']) > 3000) | res['Last_Actual_Timestamp'].isna()
+        ts_series = res['Resampled_Timestamp_ms']
+        is_offline = pd.Series(True, index=res.index)
+        for f_min, f_max in file_ranges:
+            is_offline = is_offline & ~((ts_series >= f_min) & (ts_series <= f_max))
         
         cols_to_fill = ['Role', 'Term', 'Raft_Idx_Local', 'Raft_Idx_Applied', 'Raft_Idx_Commit',
                         'Total_Write_Requests', 'Total_Write_Bytes', 'Total_Read_Requests', 'Total_Read_Bytes',
@@ -806,13 +819,30 @@ def run_recovery_mode(args):
     
     # 1. Extract crash events
     crash_events = []
+    global_max_ts = df_server['Timestamp_ms'].max()
+    stats_dir_lower = args.stats_dir.lower()
+    is_performance_test = 'writes' in stats_dir_lower or 'reads' in stats_dir_lower
+
     for (cluster, node), group in df_server.groupby(['Cluster', 'Node']):
         group = group.sort_values('Relative_Time_s')
+        non_offline_group = group[group['Role'] != 'OFFLINE']
+        if non_offline_group.empty:
+            continue
+        last_file_max_ts = non_offline_group['Timestamp_ms'].max()
+        
         role_prev = group['Role'].shift(1)
         is_transition = (group['Role'] == 'OFFLINE') & (role_prev != 'OFFLINE') & (role_prev.notna())
         transitions = group[is_transition]
         for idx, row in transitions.iterrows():
             prev_role = role_prev.loc[idx]
+            t_crash_ms = row['Timestamp_ms']
+            is_end_of_last_file = t_crash_ms >= last_file_max_ts
+            if is_end_of_last_file:
+                if is_performance_test:
+                    continue
+                if (global_max_ts - t_crash_ms) <= 15000:
+                    continue
+                    
             crash_events.append({
                 'Cluster': cluster,
                 'Node': node,
