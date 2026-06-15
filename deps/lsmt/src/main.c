@@ -28,7 +28,7 @@ void test(size_t n_entries) {
   //size_t total_size = db->memtable->size + sizeof(sl_t);
   //printf("allocated memory: %ld bytes (~ %.3f KB, %.3f MB)\n", total_size, (double)total_size/(1 << 10), (double)total_size/(1 << 20)); 
 
-  //lsmt_free(db);
+  lsmt_free(db);
 } 
 int main(int argc, char *argv[]) {
   srand(time(NULL));

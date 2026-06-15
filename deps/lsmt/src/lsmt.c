@@ -22,10 +22,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SIZE_THRESHOLD (2 * 1024 * 1024)
+#define SIZE_THRESHOLD (16 * 1024 * 1024)
 
-#define POOL_SIZE 8 
-#define ZERO_LEVEL_MAX_SIZE (8 * 1024 * 1024) //maximum size for level 0 sstables.
+#define POOL_SIZE 2 
+#define ZERO_LEVEL_MAX_SIZE (4 * 16 * 1024 * 1024) //maximum size for level 0 sstables.
 #define SSTABLE_MERGE_LIMIT 4 //maximum number of sstable to merge
 
 #define SST_FILENAME_MAX_LENGTH 256
@@ -56,6 +56,7 @@ static const size_t index_block_size = 4 * 1024; // 4KB
 static const uint8_t RECORD_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t) + sizeof(uint32_t);
 
 static void *dump_to_disk(void *arg);
+static void *compaction_daemon(void *arg);
 
 typedef struct dump_task {
   lsmt_t *lsmt;
@@ -133,6 +134,8 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t
   bool first = true;
 
   kv_raw_record_t *rec;
+  size_t bytes_written_since_sleep = 0; 
+
   while ((rec = sst_k_iterators_next(&set_it)) != NULL) {
     if (first) {
       min_key = rec->key;
@@ -151,7 +154,15 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t
 
     offset += rec->total_size;
     current_block_size += rec->total_size;
+    bytes_written_since_sleep += rec->total_size;
+
     if (current_block_size >= index_block_size) current_block_size = 0;
+
+    /* Micro-sleep to throttle CPU and I/O, allowing main thread to regain control */
+    if (bytes_written_since_sleep >= 1024 * 1024) { // Every 1 Megabyte written.
+      usleep(1000);
+      bytes_written_since_sleep = 0;
+    }
   }
 
   if (fflush(new_file) != 0 || fsync(fileno(new_file)) != 0) {
@@ -448,7 +459,11 @@ static void *dump_to_disk(void *arg) {
   pthread_rwlock_unlock(&lsmt->memtable_rwlock);
   sl_release(memtable);
 
-  sst_compact(lsmt, lsmt->metadata, lsmt->db_path, &lsmt->metadata_lock);
+  /* Signal the compaction daemon thread to run compaction */
+  pthread_mutex_lock(&lsmt->compaction_mutex);
+  lsmt->compaction_needed = true;
+  pthread_cond_signal(&lsmt->compaction_cond);
+  pthread_mutex_unlock(&lsmt->compaction_mutex);
   
   /* Invoke memtable flush callback */
   uint64_t end_ts = get_monotonic_time_ms();
@@ -467,6 +482,28 @@ static void *dump_to_disk(void *arg) {
   
   return NULL;
 }
+
+static void *compaction_daemon(void *arg) {
+  lsmt_t *lsmt = (lsmt_t *)arg;
+  while (1) {
+    pthread_mutex_lock(&lsmt->compaction_mutex);
+    while (!lsmt->compaction_needed && !lsmt->stop_compaction) {
+      pthread_cond_wait(&lsmt->compaction_cond, &lsmt->compaction_mutex);
+    }
+
+    if (lsmt->stop_compaction) {
+      pthread_mutex_unlock(&lsmt->compaction_mutex);
+      break;
+    }
+
+    lsmt->compaction_needed = false;
+    pthread_mutex_unlock(&lsmt->compaction_mutex);
+
+    sst_compact(lsmt, lsmt->metadata, lsmt->db_path, &lsmt->metadata_lock);
+  }
+  return NULL;
+}
+
 
 
 static int ensureDir(const char *dir)
@@ -538,11 +575,30 @@ lsmt_t *lsmt_init(const char *db_path) {
   db->memtable_flush_callback = NULL;
   db->callback_user_data = NULL;
 
+  /* Initialize compaction daemon thread and synchronization primitives */
+  db->stop_compaction = false;
+  db->compaction_needed = false;
+  if (pthread_mutex_init(&db->compaction_mutex, NULL) != 0) {
+    perror("LSMT INIT compaction_mutex");
+    exit(1);
+  }
+  if (pthread_cond_init(&db->compaction_cond, NULL) != 0) {
+    perror("LSMT INIT compaction_cond");
+    exit(1);
+  }
+  if (pthread_create(&db->compaction_thread, NULL, compaction_daemon, db) != 0) {
+    perror("LSMT INIT compaction_thread");
+    exit(1);
+  }
+
   return db;
 }
 
 void lsmt_flush(lsmt_t *lsmt) {
   pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
+  sl_t *memtable_to_flush = lsmt->memtable;
+  lsmt->memtable = sl_init();
+  pthread_rwlock_unlock(&lsmt->memtable_rwlock);
 
   /* Wait for all background threads to finish. */
   pthread_mutex_lock(&lsmt->thread_pool_mutex);
@@ -556,16 +612,24 @@ void lsmt_flush(lsmt_t *lsmt) {
 
   dump_task_t *task_args = malloc(sizeof(dump_task_t));
   task_args->lsmt = lsmt;
-  task_args->memtable = lsmt->memtable;
+  task_args->memtable = memtable_to_flush;
 
-  lsmt->memtable = sl_init();
   dump_to_disk(task_args);
-
-  pthread_rwlock_unlock(&lsmt->memtable_rwlock);
 }
 
 void lsmt_free(lsmt_t *lsmt) {
   if (lsmt == NULL) return;
+
+  /* Stop compaction daemon thread */
+  pthread_mutex_lock(&lsmt->compaction_mutex);
+  lsmt->stop_compaction = true;
+  pthread_cond_signal(&lsmt->compaction_cond);
+  pthread_mutex_unlock(&lsmt->compaction_mutex);
+
+  pthread_join(lsmt->compaction_thread, NULL);
+  pthread_mutex_destroy(&lsmt->compaction_mutex);
+  pthread_cond_destroy(&lsmt->compaction_cond);
+
   if (lsmt->last_index != NULL) index_free(lsmt->last_index);
   if (lsmt->metadata) sst_metadata_free(lsmt->metadata); 
   if (lsmt->db_path) free(lsmt->db_path);

@@ -40,6 +40,13 @@ typedef struct lsmt {
   pthread_mutex_t thread_pool_mutex;
   pthread_cond_t thread_pool_cond;
   uint16_t active_background_threads;
+
+  /* Compaction daemon thread and synchronization primitives */
+  pthread_t compaction_thread;
+  pthread_mutex_t compaction_mutex;
+  pthread_cond_t compaction_cond;
+  bool compaction_needed;
+  bool stop_compaction;
 } lsmt_t;
 
 typedef struct wrapper_sl_it {
