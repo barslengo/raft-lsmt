@@ -182,6 +182,7 @@ def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key
             
             # Throttle if there are too many in-flight request futures
             if len(futures) > 256:
+                print("Throttling ...")
                 done, not_done = wait(futures, return_when=FIRST_COMPLETED)
                 for f in done:
                     try:
@@ -273,9 +274,9 @@ def main():
     
     # 3. Setup DbClient
     client_config = DbClientConfig(
-        thread_pool_size=16,
+        thread_pool_size=3,
         batch_size=8192,
-        write_timeout=5.0,
+        write_timeout=10.0,
         read_timeout=10.0,
         write_cb=write_batch_cb
     )
