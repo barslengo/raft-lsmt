@@ -1880,6 +1880,8 @@ static void mainSigintCb(struct uv_signal_s *handle, int signum)
 
 int main(int argc, char *argv[])
 {
+  setvbuf(stdout, NULL, _IOLBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
   memset(ACK_BUFFER, 1, BATCH_SIZE);
 
   struct uv_loop_s loop;
