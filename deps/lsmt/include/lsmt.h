@@ -103,4 +103,6 @@ kv_raw_record_t lsmt_iterator_next(lsmt_iterator_t *it);
 void lsmt_set_compaction_callback(lsmt_t *lsmt, lsmt_compaction_callback_t callback, void *user_data);
 void lsmt_set_memtable_flush_callback(lsmt_t *lsmt, lsmt_memtable_flush_callback_t callback, void *user_data);
 
+const char *lsmt_version(void);
+
 #endif

@@ -4,7 +4,6 @@
 #include <string.h>
 #define _GNU_SOURCE
 #include <pthread.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -122,7 +121,7 @@ static sst_metadata_record_t sst_merge(lsmt_t *lsmt, sst_metadata_record_t *reco
     input_bytes += records[k]->total_bytes;
   }
 
-  while (lsmt->flush_active) {
+  while (lsmt->flush_active || lsmt->immutable_count > 0) {
     usleep(10000);
   }
   posix_fallocate(fileno(new_file), 0, input_bytes);
@@ -140,7 +139,7 @@ static sst_metadata_record_t sst_merge(lsmt_t *lsmt, sst_metadata_record_t *reco
   size_t bytes_written_since_sleep = 0; 
 
   while ((rec = sst_k_iterators_next(&set_it)) != NULL) {
-    while (lsmt->flush_active) {
+    while (lsmt->flush_active || lsmt->immutable_count > 0) {
       usleep(10000);
     }
     if (first) {
@@ -522,7 +521,6 @@ static void *dump_to_disk(void *arg) {
   lsmt->active_background_threads--;
   pthread_cond_broadcast(&lsmt->thread_pool_cond);
   pthread_mutex_unlock(&lsmt->thread_pool_mutex);
-  
   return NULL;
 }
 
@@ -960,3 +958,8 @@ kv_raw_record_t lsmt_iterator_next(lsmt_iterator_t *it) {
 
   return result;
 }
+
+const char *lsmt_version(void) {
+  return "v1.2.0-20260615";
+}
+

@@ -798,7 +798,7 @@ static int FsmApply(struct raft_fsm *fsm,
         f->insert_cmd.record_value, 
         record_value_size);
 
-    if (count % 100000 == 0) {
+    if (count % 1000000 == 0) {
       printf("%lu\n", count);
     }
     count++;
@@ -1899,6 +1899,7 @@ int main(int argc, char *argv[])
   dir = argv[1];
   id = (uint32_t)atoi(argv[2]);
   conf_path = argv[3];
+  Logf(id, "Server starting. Code versions: server.c v1.2.0-20260615, lsmt.c %s", lsmt_version());
   cluster_config_t cluster_conf = {0};
 
   if (load_cluster_config(conf_path, &cluster_conf) != 0) {
