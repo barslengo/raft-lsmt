@@ -32,6 +32,7 @@ typedef struct lsmt {
   pthread_mutex_t metadata_write_lock;
   uint64_t metadata_generation;
   uint64_t disk_generation;
+  volatile bool flush_active;
   //pthread_mutex_t memtable_lock; //used when swapping memtable.
   pthread_rwlock_t memtable_rwlock;
   

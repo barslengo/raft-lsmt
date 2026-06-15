@@ -24,7 +24,7 @@
 
 #define SIZE_THRESHOLD (16 * 1024 * 1024)
 
-#define POOL_SIZE 2 
+#define POOL_SIZE 1 
 #define ZERO_LEVEL_MAX_SIZE (4 * 16 * 1024 * 1024) //maximum size for level 0 sstables.
 #define SSTABLE_MERGE_LIMIT 4 //maximum number of sstable to merge
 
@@ -99,7 +99,7 @@ static sst_file_paths_t new_sstable_filename(const char *dir) {
   return files;
 }
 
-static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t length, const char *db_path) {
+static sst_metadata_record_t sst_merge(lsmt_t *lsmt, sst_metadata_record_t *records[], uint8_t length, const char *db_path) {
   sst_file_paths_t file_paths = new_sstable_filename(db_path);
 
   // 1. Setup the Set Iterator (Handles all reading, merging, and sorting)
@@ -122,6 +122,9 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t
     input_bytes += records[k]->total_bytes;
   }
 
+  while (lsmt->flush_active) {
+    usleep(10000);
+  }
   posix_fallocate(fileno(new_file), 0, input_bytes);
   setvbuf(new_file, NULL, _IOFBF, 1024 * 1024);
 
@@ -137,6 +140,9 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t
   size_t bytes_written_since_sleep = 0; 
 
   while ((rec = sst_k_iterators_next(&set_it)) != NULL) {
+    while (lsmt->flush_active) {
+      usleep(10000);
+    }
     if (first) {
       min_key = rec->key;
       first = false;
@@ -255,7 +261,7 @@ static int sst_compact(lsmt_t *lsmt, sst_metadata_t *sst_meta, const char *db_pa
        * If returns any error, then i must push back the records into the metadata list. (TODO) */
       pthread_mutex_unlock(mutex);
 
-      sst_metadata_record_t new_sst = sst_merge(records, j, db_path);
+      sst_metadata_record_t new_sst = sst_merge(lsmt, records, j, db_path);
 
       pthread_mutex_lock(mutex);
       sst_metadata_add(sst_meta, new_sst); 
@@ -348,6 +354,8 @@ static void *dump_to_disk(void *arg) {
     sl_release(memtable);
     return NULL;
   }
+
+  lsmt->flush_active = true;
 
   sst_file_paths_t files = new_sstable_filename(lsmt->db_path);
   FILE *fp = fopen(files.sst_file, "wb");
@@ -492,6 +500,8 @@ static void *dump_to_disk(void *arg) {
   pthread_rwlock_unlock(&lsmt->memtable_rwlock);
   sl_release(memtable);
 
+  lsmt->flush_active = false;
+
   /* Signal the compaction daemon thread to run compaction */
   pthread_mutex_lock(&lsmt->compaction_mutex);
   lsmt->compaction_needed = true;
@@ -510,7 +520,7 @@ static void *dump_to_disk(void *arg) {
   /* Notify the pool that this thread is finished */
   pthread_mutex_lock(&lsmt->thread_pool_mutex);
   lsmt->active_background_threads--;
-  pthread_cond_signal(&lsmt->thread_pool_cond);
+  pthread_cond_broadcast(&lsmt->thread_pool_cond);
   pthread_mutex_unlock(&lsmt->thread_pool_mutex);
   
   return NULL;
@@ -570,6 +580,7 @@ lsmt_t *lsmt_init(const char *db_path) {
   db->last_index = NULL;
   db->memtable = sl_init();
   db->immutable_count = 0;
+  db->flush_active = false;
 
   for (int i = 0; i < MAX_IMMUTABLES; i++) {
     db->immutables[i] = NULL;
@@ -685,6 +696,16 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
   sl_t *memtable_to_flush = NULL;
 
   pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
+  while (lsmt->memtable->size > SIZE_THRESHOLD && lsmt->immutable_count >= MAX_IMMUTABLES) {
+    pthread_rwlock_unlock(&lsmt->memtable_rwlock);
+    pthread_mutex_lock(&lsmt->thread_pool_mutex);
+    if (lsmt->immutable_count >= MAX_IMMUTABLES) {
+      pthread_cond_wait(&lsmt->thread_pool_cond, &lsmt->thread_pool_mutex);
+    }
+    pthread_mutex_unlock(&lsmt->thread_pool_mutex);
+    pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
+  }
+
   if (lsmt->memtable->size > SIZE_THRESHOLD) {
     memtable_to_flush = lsmt->memtable;
     lsmt->immutables[lsmt->immutable_count++] = memtable_to_flush;
