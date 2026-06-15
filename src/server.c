@@ -10,9 +10,9 @@
 #include <lsmt/lsmt.h>
 
 #define APPLY_RATE 1000 /* Store new statistic entry every 1000 ms. */
-#define GLOBAL_MAX_QUERIES 64 // Limite massimo di query simultanee nel server
-#define STORAGE_EVENTS_METRICS_FLUSH_TIME (16 * 1000) //dump to disk every 16 seconds.
-#define MAX_LATENCY_SAMPLES 1000 /* Max samples for latency distribution */
+#define GLOBAL_MAX_QUERIES 128 // Limite massimo di query simultanee nel server
+#define STORAGE_EVENTS_METRICS_FLUSH_TIME (8 * 1000) //dump to disk every 8 seconds.
+#define MAX_LATENCY_SAMPLES 2000 /* Max samples for latency distribution */
 #define STORAGE_EVENT_BUFFER_SIZE 8192 /* Buffer size for storage events */
 #define Log(SERVER_ID, FORMAT) printf("%d: " FORMAT "\n", SERVER_ID)
 #define Logf(SERVER_ID, FORMAT, ...) \
@@ -1541,9 +1541,10 @@ static int ServerInit(struct Server *s,
   raft_set_snapshot_threshold(&s->raft, UINT32_MAX); //64);
   raft_set_snapshot_trailing(&s->raft, 16);
   raft_set_pre_vote(&s->raft, true);
+  raft_set_capacity_threshold(&s->raft, 0);
 
-  //raft_set_election_timeout(&s->raft, 5000);   // 5 Seconds
-  //raft_set_heartbeat_timeout(&s->raft, 500);   // 0.5 Seconds
+  raft_set_election_timeout(&s->raft, 4000);   // 5 Seconds
+  raft_set_heartbeat_timeout(&s->raft, 500);   // 0.5 Seconds
 
   /* Allow more data in flight to fill. 
    * With 4KB batches, 256 entries = 1MB of in-flight data. */
