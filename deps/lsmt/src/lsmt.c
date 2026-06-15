@@ -158,9 +158,10 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t
 
     if (current_block_size >= index_block_size) current_block_size = 0;
 
-    /* Micro-sleep to throttle CPU and I/O, allowing main thread to regain control */
+    /* Micro-sleep to throttle CPU and I/O, allowing main thread to regain control.
+     * Throttled to 5ms to give higher priority to memtable flushes. */
     if (bytes_written_since_sleep >= 1024 * 1024) { // Every 1 Megabyte written.
-      usleep(1000);
+      usleep(5000);
       bytes_written_since_sleep = 0;
     }
   }
@@ -289,13 +290,28 @@ static int sst_compact(lsmt_t *lsmt, sst_metadata_t *sst_meta, const char *db_pa
   }
 
   if (must_flush == true) {
-    pthread_mutex_lock(mutex);
+    sst_metadata_record_t *records = NULL;
+    int count = 0;
+    uint8_t version = 0;
+    uint8_t highest_tier = 0;
+    uint64_t my_generation = 0;
 
-    if (sst_metadata_flush(sst_meta) != 0) {
-      fprintf(stderr, "Critical Error: Failed to flush metadata. Cannot delete old files.\n");
-      exit(1);
-    }
+    pthread_mutex_lock(mutex);
+    lsmt->metadata_generation++;
+    my_generation = lsmt->metadata_generation;
+    sst_metadata_copy_records(sst_meta, &records, &count, &version, &highest_tier);
     pthread_mutex_unlock(mutex);
+
+    pthread_mutex_lock(&lsmt->metadata_write_lock);
+    if (my_generation > lsmt->disk_generation) {
+      if (sst_metadata_write_records(sst_meta, records, count, version, highest_tier) != 0) {
+        fprintf(stderr, "Critical Error: Failed to flush metadata. Cannot delete old files.\n");
+        exit(1);
+      }
+      lsmt->disk_generation = my_generation;
+    }
+    pthread_mutex_unlock(&lsmt->metadata_write_lock);
+    free(records);
 
     /* Delete merged sst tables. */
     for (int k = 0; k < delete_count; k++) {
@@ -436,13 +452,30 @@ static void *dump_to_disk(void *arg) {
   free(files.sst_file);
   free(files.index_file);
  
+  sst_metadata_record_t *records = NULL;
+  int count = 0;
+  uint8_t version = 0;
+  uint8_t highest_tier = 0;
+  uint64_t my_generation = 0;
+
   pthread_mutex_lock(&lsmt->metadata_lock);
   metadata.id = lsmt->sstable_id++;
-
   sst_metadata_add(lsmt->metadata, metadata);
-  sst_metadata_flush(lsmt->metadata);
-
+  lsmt->metadata_generation++;
+  my_generation = lsmt->metadata_generation;
+  sst_metadata_copy_records(lsmt->metadata, &records, &count, &version, &highest_tier);
   pthread_mutex_unlock(&lsmt->metadata_lock);
+
+  pthread_mutex_lock(&lsmt->metadata_write_lock);
+  if (my_generation > lsmt->disk_generation) {
+    if (sst_metadata_write_records(lsmt->metadata, records, count, version, highest_tier) != 0) {
+      fprintf(stderr, "Critical Error: Failed to flush metadata in dump_to_disk\n");
+      exit(1);
+    }
+    lsmt->disk_generation = my_generation;
+  }
+  pthread_mutex_unlock(&lsmt->metadata_write_lock);
+  free(records);
 
   /* Unregister the immutable memtable. */
   pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
@@ -565,6 +598,12 @@ lsmt_t *lsmt_init(const char *db_path) {
     perror("LSMT INIT");
     exit(1);
   }
+  if (pthread_mutex_init(&db->metadata_write_lock, NULL) != 0) {
+    perror("LSMT INIT metadata_write_lock");
+    exit(1);
+  }
+  db->metadata_generation = 0;
+  db->disk_generation = 0;
 
   pthread_mutex_init(&db->thread_pool_mutex, NULL);
   pthread_cond_init(&db->thread_pool_cond, NULL);
@@ -634,6 +673,7 @@ void lsmt_free(lsmt_t *lsmt) {
   if (lsmt->metadata) sst_metadata_free(lsmt->metadata); 
   if (lsmt->db_path) free(lsmt->db_path);
   pthread_mutex_destroy(&lsmt->metadata_lock);
+  pthread_mutex_destroy(&lsmt->metadata_write_lock);
   pthread_rwlock_destroy(&lsmt->memtable_rwlock);
 
   free(lsmt);

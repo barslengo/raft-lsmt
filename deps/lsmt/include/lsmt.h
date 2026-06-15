@@ -29,6 +29,9 @@ typedef struct lsmt {
   char *db_path;
 
   pthread_mutex_t metadata_lock;
+  pthread_mutex_t metadata_write_lock;
+  uint64_t metadata_generation;
+  uint64_t disk_generation;
   //pthread_mutex_t memtable_lock; //used when swapping memtable.
   pthread_rwlock_t memtable_rwlock;
   

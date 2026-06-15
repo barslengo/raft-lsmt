@@ -116,6 +116,8 @@ void sst_metadata_record_retain(sst_metadata_record_t *meta);
 
 int sst_metadata_free(sst_metadata_t *sst_meta);
 int sst_metadata_flush(sst_metadata_t *sst_meta);
+int sst_metadata_copy_records(sst_metadata_t *sst_meta, sst_metadata_record_t **records_out, int *count_out, uint8_t *version_out, uint8_t *highest_tier_out);
+int sst_metadata_write_records(sst_metadata_t *sst_meta, sst_metadata_record_t *records, int count, uint8_t version, uint8_t highest_tier);
 int sst_metadata_add(sst_metadata_t *sst_meta, sst_metadata_record_t record); 
 sst_metadata_record_t *sst_metadata_pop(sst_metadata_t *sst_meta, uint8_t tier);
 sst_metadata_record_t create_sst_metadata(uint64_t id, uint32_t level, uint64_t size, sl_uint128_t min_key, sl_uint128_t max_key, char* sst_path, char *index_path);

@@ -230,6 +230,100 @@ int sst_metadata_flush(sst_metadata_t *sst_meta) {
   return 0;
 }
 
+int sst_metadata_copy_records(sst_metadata_t *sst_meta, sst_metadata_record_t **records_out, int *count_out, uint8_t *version_out, uint8_t *highest_tier_out) {
+  if (sst_meta == NULL) return -1;
+  int count = 0;
+  sst_node_t *node = sst_meta->list;
+  while (node != NULL) {
+    count++;
+    node = node->next;
+  }
+
+  sst_metadata_record_t *records = NULL;
+  if (count > 0) {
+    records = malloc(sizeof(sst_metadata_record_t) * count);
+    if (records == NULL) {
+      return -1;
+    }
+    node = sst_meta->list;
+    for (int i = 0; i < count; i++) {
+      records[i] = *node->content;
+      node = node->next;
+    }
+  }
+
+  *records_out = records;
+  *count_out = count;
+  *version_out = sst_meta->version;
+  *highest_tier_out = sst_meta->highest_tier;
+  return 0;
+}
+
+int sst_metadata_write_records(sst_metadata_t *sst_meta, sst_metadata_record_t *records, int count, uint8_t version, uint8_t highest_tier) {
+  if (sst_meta == NULL) return -1;
+  char temp_path[256];
+  snprintf(temp_path, sizeof(temp_path), "%s.tmp", sst_meta->disk_path);
+
+  FILE *fp = fopen(temp_path, "w");
+  if (!fp) {
+    perror("FAILED WRITING METADATA RECORDS");
+    return -1;
+  }
+
+  fwrite(&version, sizeof(version), 1, fp);
+  fwrite(&highest_tier, sizeof(highest_tier), 1, fp);
+
+  size_t meta_max_size = sizeof(sst_metadata_record_t);
+  for (int i = 0; i < count; i++) {
+    uint8_t buf[meta_max_size];
+    uint32_t off = 0;
+    sst_metadata_record_t data = records[i];
+
+    memcpy(buf + off, data.sstable_filename, sizeof(data.sstable_filename));
+    off += sizeof(data.sstable_filename);
+    memcpy(buf + off, data.sst_index_filename, sizeof(data.sst_index_filename));
+    off += sizeof(data.sst_index_filename);
+    memcpy(buf + off, &data.id, sizeof(data.id));
+    off += sizeof(data.id);
+    memcpy(buf + off, &data.level, sizeof(data.level));
+    off += sizeof(data.level);
+    memcpy(buf + off, &data.created_at, sizeof(data.created_at));
+    off += sizeof(data.created_at);
+    memcpy(buf + off, &data.total_bytes, sizeof(data.total_bytes));
+    off += sizeof(data.total_bytes);
+    memcpy(buf + off, &data.min_key, sizeof(data.min_key));
+    off += sizeof(data.min_key);
+    memcpy(buf + off, &data.max_key, sizeof(data.max_key));
+    off += sizeof(data.max_key);
+
+    if (fwrite(buf, off, 1, fp) != 1) {
+      perror("Error writing record in sst_metadata_write_records");
+      fclose(fp);
+      return -1;
+    }
+  }
+
+  if (fflush(fp) != 0) {
+    perror("Failed to flush buffer in sst_metadata_write_records");
+    fclose(fp);
+    return -1;
+  }
+
+  if (fsync(fileno(fp)) != 0) {
+    perror("Failed to sync in sst_metadata_write_records");
+    fclose(fp);
+    return -1;
+  }
+
+  fclose(fp);
+
+  if (rename(temp_path, sst_meta->disk_path) != 0) {
+    perror("Failed to rename file in sst_metadata_write_records");
+    return -1;
+  }
+  return 0;
+}
+
 int sst_metadata_add(sst_metadata_t *sst_meta, sst_metadata_record_t record) {
   sst_node_t *node = new_node(record);
   sst_meta->list = node_add(sst_meta->list, node);
