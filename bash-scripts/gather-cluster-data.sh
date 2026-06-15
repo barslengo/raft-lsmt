@@ -45,14 +45,14 @@ for CLUSTER_NAME in $CLUSTER_NAMES; do
     DEST_DIR="$DATA_DIR/$CLUSTER_NAME"
     mkdir -p "$DEST_DIR"
     
-    # Find and copy all CSV files, preserving relative path within cluster folder
-    find "$CLUSTER_NAME" -name '*.csv' | while read -r csv_file; do
+    # Find and copy all CSV files and server logs, preserving relative path within cluster folder
+    find "$CLUSTER_NAME" \( -name '*.csv' -o -name 'server_*.log' \) | while read -r src_file; do
         # Get relative path from cluster folder
-        rel_path="${csv_file#$CLUSTER_NAME/}"
+        rel_path="${src_file#$CLUSTER_NAME/}"
         # Create destination path
         dest="$DEST_DIR/$rel_path"
         mkdir -p "$(dirname "$dest")"
-        cp "$csv_file" "$dest"
+        cp "$src_file" "$dest"
     done
     
     echo "  Gathered data from cluster '$CLUSTER_NAME'"
