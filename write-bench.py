@@ -9,7 +9,7 @@ from typing import Iterator
 
 from client import Node, Record, BatchMetrics
 from client import DbClient, DbClientConfig
-from client import Router, HashRoutingStrategy, RoundRobinRoutingStrategy, LeaderRoutingStrategy
+from client import Router, HashRoutingStrategy, RoundRobinRoutingStrategy, RangeRoutingStrategy
 
 from concurrent.futures import wait, FIRST_COMPLETED
 import threading
@@ -127,26 +127,26 @@ def record_stream(amount: int, data_distribution: str, key_start: int, key_end: 
     if data_distribution == 'sequential':
         for key_id in range(key_start, key_start + amount):
             yield Record(key_id=key_id, timestamp=current_ts, content=key_id)
-            current_ts += 1
+            current_ts += 100
     elif data_distribution == 'uniform':
         # Generating a unique shuffled space consumes O(N) memory, causing crash/OOM for large values.
         # Instead, we generate keys uniformly at random within the keyspace range, which takes O(1) memory.
         for _ in range(amount):
             key_id = random.randint(key_start, key_end)
             yield Record(key_id=key_id, timestamp=current_ts, content=key_id)
-            current_ts += 1
+            current_ts += 100
     elif data_distribution == 'zipfian':
         zipf_range = key_end - key_start + 1
         zipf = ZipfGenerator(zipf_range)
         for _ in range(amount):
             key_id = key_start + zipf.next() - 1
             yield Record(key_id=key_id, timestamp=current_ts, content=key_id)
-            current_ts += 1
+            current_ts += 100
     else:
         raise ValueError(f"Unknown distribution: {data_distribution}")
 
 
-def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key_end: int, batch_jitter: float = 0.0):
+def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key_end: int, batch_jitter: float = 0.0, worker_id: int = 0):
     """
     Consumer/producer system implementation:
     Producer (record_stream) yields new records one by one.
@@ -160,7 +160,8 @@ def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key
     reporter_thread = threading.Thread(target=throughput_reporter, args=(stop_event,), daemon=True)
     reporter_thread.start()
 
-    stream = record_stream(requests, data_dist, key_start, key_end, int(time.time() * 1000))
+    base_ts = int(time.time() * 1000) * 100 + (worker_id % 100)
+    stream = record_stream(requests, data_dist, key_start, key_end, base_ts)
     total_processed = 0
     
     for record in stream:
@@ -236,7 +237,7 @@ def main():
     parser.add_argument("--config", required=True, help="Path to cluster_conf.json")
     parser.add_argument("--requests", type=int, default=5000000, help="Number of write requests to send")
     parser.add_argument("--routing-strategy", 
-                        choices=["hash", "round-robin", "leader"], 
+                        choices=["hash", "round-robin", "range"], 
                         default="hash", 
                         help="Routing strategy to use")
     parser.add_argument("--data-dist", 
@@ -245,11 +246,16 @@ def main():
                         help="Data distribution strategy")
     parser.add_argument("--key-start", type=int, default=1, help="Start of the key range (inclusive)")
     parser.add_argument("--key-end", type=int, default=None, help="End of the key range (inclusive)")
+    parser.add_argument("--max-key", type=int, default=None, help="The maximum key ID in the global keyspace (for range routing)")
+    parser.add_argument("--worker-id", type=int, default=0, help="Unique worker process ID to avoid timestamp collisions")
     parser.add_argument("--batch-jitter", type=float, default=0.0, help="Max random jitter sleep (in seconds) after sending each batch")
     args = parser.parse_args()
 
     if args.key_end is None:
         args.key_end = args.key_start + args.requests - 1
+
+    if args.max_key is None:
+        args.max_key = args.key_end
 
     # 1. Load Config
     with open(args.config, 'r') as f:
@@ -266,7 +272,7 @@ def main():
     strategy_map = {
         "hash": HashRoutingStrategy(),
         "round-robin": RoundRobinRoutingStrategy(),
-        "leader": LeaderRoutingStrategy()
+        "range": RangeRoutingStrategy(max_keyspace=args.max_key)
     }
     strategy = strategy_map[args.routing_strategy]
     router = Router(strategy)
@@ -288,7 +294,7 @@ def main():
     print(f"Routing strategy: {args.routing_strategy}")
     
     try:
-        bench(db_client, args.data_dist, args.requests, args.key_start, args.key_end, args.batch_jitter)
+        bench(db_client, args.data_dist, args.requests, args.key_start, args.key_end, args.batch_jitter, args.worker_id)
     except Exception as e:
         print(f"Error: {e}")
         db_client.disconnect()

@@ -10,6 +10,7 @@ RANGE_SIZE=10
 THREAD_POOL_SIZE=16
 BATCH_SIZE=32
 KEY_START_BASE=1
+GLOBAL_KEYSPACE="false"
 
 # Auto-detect cores
 CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
@@ -29,6 +30,7 @@ show_help() {
     echo "  -t, --threads   <num>    Thread pool size for concurrent requests per worker (default: 16)"
     echo "  -b, --batch     <num>    Query request batch size per worker (default: 32)"
     echo "  --key-start     <num>    Start of the key range (default: 1)"
+    echo "  --global-keyspace        All workers share the same global key range (default: false)"
     echo "  -h, --help               Show this help message"
     echo ""
 }
@@ -116,6 +118,10 @@ while [[ "$#" -gt 0 ]]; do
             KEY_START_BASE="$2"
             shift 2
             ;;
+        --global-keyspace)
+            GLOBAL_KEYSPACE="true"
+            shift 1
+            ;;
         -h|--help)
             show_help
             exit 0
@@ -140,6 +146,7 @@ echo "Range Size           : $RANGE_SIZE"
 echo "Thread Pool Size     : $THREAD_POOL_SIZE"
 echo "Batch Size           : $BATCH_SIZE"
 echo "Key Start Base       : $KEY_START_BASE"
+echo "Global Keyspace      : $GLOBAL_KEYSPACE"
 echo "=========================================================="
 
 # Compute requests and key range per worker
@@ -161,11 +168,16 @@ for i in $(seq 0 $((WORKERS - 1))); do
         WORKER_REQS=$((REQS_PER_WORKER + REMAINDER_REQS))
     fi
     
-    # Calculate disjoint key range
-    KEY_START=$((KEY_START_BASE + i * KEY_RANGE_PER_WORKER))
-    KEY_END=$((KEY_START + KEY_RANGE_PER_WORKER - 1))
-    if [ $i -eq $((WORKERS - 1)) ]; then
-        KEY_END=$((KEY_END + REMAINDER_KEYS))
+    # Calculate key range
+    if [ "$GLOBAL_KEYSPACE" = "true" ]; then
+        KEY_START=$KEY_START_BASE
+        KEY_END=$MAX_KEY
+    else
+        KEY_START=$((KEY_START_BASE + i * KEY_RANGE_PER_WORKER))
+        KEY_END=$((KEY_START + KEY_RANGE_PER_WORKER - 1))
+        if [ $i -eq $((WORKERS - 1)) ]; then
+            KEY_END=$((KEY_END + REMAINDER_KEYS))
+        fi
     fi
     
     echo "▶️ Launching Worker $i with range [$KEY_START, $KEY_END] ($WORKER_REQS requests)..."

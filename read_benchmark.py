@@ -9,7 +9,7 @@ from typing import Iterator
 
 from client import Node, QueryRequest
 from client import DbClient, DbClientConfig
-from client import Router, HashRoutingStrategy, RoundRobinRoutingStrategy, LeaderRoutingStrategy
+from client import Router, HashRoutingStrategy, RoundRobinRoutingStrategy, LeaderRoutingStrategy, RangeRoutingStrategy
 
 from concurrent.futures import wait, FIRST_COMPLETED
 import threading
@@ -283,7 +283,7 @@ def main():
     parser.add_argument("--config", required=True, help="Path to cluster_conf.json")
     parser.add_argument("--requests", type=int, default=1000000, help="Number of read queries to execute")
     parser.add_argument("--routing-strategy", 
-                        choices=["hash", "round-robin", "leader"], 
+                        choices=["hash", "round-robin", "leader", "range"], 
                         default="hash", 
                         help="Routing strategy to use")
     parser.add_argument("--data-dist", 
@@ -316,7 +316,8 @@ def main():
     strategy_map = {
         "hash": HashRoutingStrategy(),
         "round-robin": RoundRobinRoutingStrategy(),
-        "leader": LeaderRoutingStrategy()
+        "leader": LeaderRoutingStrategy(),
+        "range": RangeRoutingStrategy(max_keyspace=args.max_key)
     }
     strategy = strategy_map[args.routing_strategy]
     router = Router(strategy)

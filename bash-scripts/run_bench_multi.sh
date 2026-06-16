@@ -11,6 +11,7 @@ DATA_DIST="uniform"
 WORKERS=$CORES
 KEY_START_BASE=1
 BATCH_JITTER=0.0
+GLOBAL_KEYSPACE="false"
 
 show_help() {
     echo "Usage: $0 [options]"
@@ -19,10 +20,11 @@ show_help() {
     echo "  -w, --workers   <num>    Number of worker processes (default: $CORES)"
     echo "  -r, --requests  <num>    Total number of write requests to distribute (default: 5000000)"
     echo "  -c, --config    <path>   Path to cluster configuration file (default: servers.json)"
-    echo "  -s, --strategy  <strat>  Routing strategy: hash, round-robin, leader (default: hash)"
+    echo "  -s, --strategy  <strat>  Routing strategy: hash, round-robin, range (default: hash)"
     echo "  -d, --dist      <dist>   Data distribution: sequential, uniform, zipfian (default: uniform)"
     echo "  -k, --key-start <num>    Start of the key range (default: 1)"
     echo "  -j, --jitter    <sec>    Max random batch jitter sleep in seconds (default: 0.0)"
+    echo "  --global-keyspace        All workers share the same global key range (default: false)"
     echo "  -h, --help               Show this help message"
     echo ""
 }
@@ -86,6 +88,10 @@ while [[ "$#" -gt 0 ]]; do
             BATCH_JITTER="$2"
             shift 2
             ;;
+        --global-keyspace)
+            GLOBAL_KEYSPACE="true"
+            shift 1
+            ;;
         -h|--help)
             show_help
             exit 0
@@ -107,11 +113,13 @@ echo "Routing Strategy     : $ROUTING_STRATEGY"
 echo "Data Distribution    : $DATA_DIST"
 echo "Key Start Base       : $KEY_START_BASE"
 echo "Batch Jitter         : $BATCH_JITTER"
+echo "Global Keyspace      : $GLOBAL_KEYSPACE"
 echo "=========================================================="
 
 # Compute requests per worker
 REQS_PER_WORKER=$((TOTAL_REQUESTS / WORKERS))
 REMAINDER=$((TOTAL_REQUESTS % WORKERS))
+MAX_KEY=$((KEY_START_BASE + TOTAL_REQUESTS - 1))
 
 pids=()
 
@@ -125,9 +133,14 @@ for i in $(seq 0 $((WORKERS - 1))); do
         WORKER_REQS=$((REQS_PER_WORKER + REMAINDER))
     fi
     
-    # Calculate disjoint key range
-    KEY_START=$((KEY_START_BASE + i * REQS_PER_WORKER))
-    KEY_END=$((KEY_START + WORKER_REQS - 1))
+    # Calculate key range
+    if [ "$GLOBAL_KEYSPACE" = "true" ]; then
+        KEY_START=$KEY_START_BASE
+        KEY_END=$MAX_KEY
+    else
+        KEY_START=$((KEY_START_BASE + i * REQS_PER_WORKER))
+        KEY_END=$((KEY_START + WORKER_REQS - 1))
+    fi
     
     echo "▶️ Launching Worker $i with range [$KEY_START, $KEY_END] ($WORKER_REQS requests)..."
     
@@ -145,6 +158,8 @@ for i in $(seq 0 $((WORKERS - 1))); do
         --data-dist "$DATA_DIST" \
         --key-start "$KEY_START" \
         --key-end "$KEY_END" \
+        --max-key "$MAX_KEY" \
+        --worker-id "$i" \
         --batch-jitter "$BATCH_JITTER" &
         
     pids+=($!)
