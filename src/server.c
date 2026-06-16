@@ -1,32 +1,29 @@
-/*
- * TODO: FIX Backlogs underflows in stats.
- * TODO: Reorganize folder structure (Raft logs, sstables, etc..).
- */
-
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
-
+#include <sys/resource.h>
 #include <raft/raft.h>
 #include <raft/raft/uv.h>
 
 #include <lsmt/lsmt.h>
 
-#define APPLY_RATE 100 /* Store new statistic entry every 100 ms. */
-
+#define APPLY_RATE 1000 /* Store new statistic entry every 1000 ms. */
+#define GLOBAL_MAX_QUERIES 128 // Limite massimo di query simultanee nel server
+#define STORAGE_EVENTS_METRICS_FLUSH_TIME (8 * 1000) //dump to disk every 8 seconds.
+#define MAX_LATENCY_SAMPLES 2000 /* Max samples for latency distribution */
+#define STORAGE_EVENT_BUFFER_SIZE 8192 /* Buffer size for storage events */
 #define Log(SERVER_ID, FORMAT) printf("%d: " FORMAT "\n", SERVER_ID)
 #define Logf(SERVER_ID, FORMAT, ...) \
   printf("%d: " FORMAT "\n", SERVER_ID, __VA_ARGS__)
 
 
-#define BATCH_SIZE 4096 //1024 //128
+#define BATCH_SIZE 8192 //4096 //1024 //128
 #define CONTENT_MAX_SIZE 255
-#define QUERY_BYTES_LIMIT (128 * 1024) //512 KB 
+#define QUERY_BYTES_LIMIT (512 * 1024) //512 KB 
 #define QUERY_REQ_SIZE (sizeof(uint64_t) + 2 * sizeof(sl_uint128_t)) //40 bytes.
 #define QUERY_BUDGET_NS (30 * 1000 * 1000)  // 30ms 
-#define CACHE_TTL_MS (5 * 1000) //5 seconds
 
 static char ACK_BUFFER[BATCH_SIZE];
 const uint8_t CONTENT_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t); 
@@ -40,6 +37,37 @@ typedef struct __attribute__((packed)) {
     uint64_t t_consensus;
     uint64_t t_total;
 } batch_log_t;
+
+/* Circular buffer for latency samples */
+typedef struct {
+    uint64_t samples[MAX_LATENCY_SAMPLES];
+    size_t head;
+    size_t count;
+} latency_buffer_t;
+
+/* Storage system event types */
+typedef enum {
+    STORAGE_EVENT_COMPACTION,
+    STORAGE_EVENT_MEMTABLE_FLUSH
+} storage_event_type_t;
+
+/* Buffered storage event */
+typedef struct {
+    storage_event_type_t type;
+    uint64_t timestamp;
+    uint64_t duration_ms;
+    union {
+        struct {
+            uint32_t quantity_merged_tables;
+            uint64_t input_bytes;
+            uint64_t output_bytes;
+            uint8_t level;
+        } compaction;
+        struct {
+            uint64_t bytes_flushed;
+        } memtable_flush;
+    } data;
+} storage_event_t;
 
 typedef struct query_response {
   bool limit_reached;
@@ -149,6 +177,7 @@ typedef struct {
 typedef struct {
   uint64_t active_query_start_ts; /* Timestamp (ms) of current processing query */
   uint64_t total_queries;         /* Total queries processed by this client */
+  bool is_paused;
 } client_query_ctx_t;
 
 typedef enum {
@@ -174,9 +203,6 @@ typedef struct client_t {
     client_query_ctx_t query;
   } ctx; 
 
-  /* For query client reschedule. */
-  uv_async_t query_async;
-  bool query_async_pending;
 
   /* Linked List. */
   struct client_t *prev;
@@ -230,22 +256,158 @@ struct Server
 
   struct client_t *insert_clients_head;
   struct client_t *query_clients_head;
-  FILE *batch_log_file;
+  int active_queries_count;
+
+  
+  /* Read metrics */
+  struct {
+    uint64_t total_queries;
+    uint64_t total_bytes_read;
+  } read_stats;
+  
+  /* Latency distribution tracking */
+  latency_buffer_t latency_buffer;
+  
+  /* Storage events */
+  FILE *storage_events_file;
+  storage_event_t storage_events_buffer[STORAGE_EVENT_BUFFER_SIZE];
+  size_t storage_events_count;
+  uv_mutex_t storage_events_mutex;
+  
   struct {
     FILE *f;
     uint64_t total_requests;
     uint64_t total_bytes;
 
-    uint64_t prev_requests;
-    uint64_t prev_bytes;
-
     //uint64_t total_received; /* Total requests received from tcp connections. */
-    uint64_t last_run_time; 
     uint64_t period_latency_sum; /* Sum of ms taken by all batches in this tick */
     uint64_t period_batches_count; /* How many batches finished in this tick */
   } stats;
+
 };
 
+/* Initialize latency buffer */
+static void latency_buffer_init(latency_buffer_t *buf) {
+  buf->head = 0;
+  buf->count = 0;
+}
+
+/* Add a latency sample to the buffer */
+static void latency_buffer_add(latency_buffer_t *buf, uint64_t latency_ms) {
+  buf->samples[buf->head] = latency_ms;
+  buf->head = (buf->head + 1) % MAX_LATENCY_SAMPLES;
+  if (buf->count < MAX_LATENCY_SAMPLES) {
+    buf->count++;
+  }
+}
+
+/* Calculate percentile from sorted samples (caller must ensure samples are sorted) */
+static double calculate_percentile(uint64_t *sorted_samples, size_t count, double percentile) {
+  if (count == 0) return 0.0;
+  if (percentile >= 100.0) return (double)sorted_samples[count - 1];
+  if (percentile <= 0.0) return (double)sorted_samples[0];
+  
+  double index = percentile / 100.0 * (count - 1);
+  size_t lower = (size_t)index;
+  size_t upper = lower + 1;
+  if (upper >= count) upper = lower;
+  
+  double weight = index - lower;
+  return (1.0 - weight) * sorted_samples[lower] + weight * sorted_samples[upper];
+}
+
+/* Callback for compaction events from lsmt */
+static void on_compaction_event(void *user_data, uint64_t ts, uint64_t duration_ms,
+    uint32_t quantity_merged_tables, uint64_t input_bytes, uint64_t output_bytes, uint8_t level) {
+  struct Server *s = (struct Server *)user_data;
+
+  uv_mutex_lock(&s->storage_events_mutex);
+
+  if (s && s->storage_events_count < STORAGE_EVENT_BUFFER_SIZE) {
+    storage_event_t *evt = &s->storage_events_buffer[s->storage_events_count++];
+
+    evt->type = STORAGE_EVENT_COMPACTION;
+    evt->timestamp = ts;
+    evt->duration_ms = duration_ms;
+    evt->data.compaction.quantity_merged_tables = quantity_merged_tables;
+    evt->data.compaction.input_bytes = input_bytes;
+    evt->data.compaction.output_bytes = output_bytes;
+    evt->data.compaction.level = level;
+  }
+  uv_mutex_unlock(&s->storage_events_mutex);
+}
+
+/* Callback for memtable flush events from lsmt */
+static void on_memtable_flush_event(void *user_data, uint64_t ts, uint64_t duration_ms,
+    uint64_t bytes_flushed) {
+  struct Server *s = (struct Server *)user_data;
+  if (!s) return;
+
+  uv_mutex_lock(&s->storage_events_mutex);
+
+  if (s && s->storage_events_count < STORAGE_EVENT_BUFFER_SIZE) {
+    storage_event_t *evt = &s->storage_events_buffer[s->storage_events_count++];
+
+    evt->type = STORAGE_EVENT_MEMTABLE_FLUSH;
+    evt->timestamp = ts; 
+    evt->duration_ms = duration_ms;
+    evt->data.memtable_flush.bytes_flushed = bytes_flushed;
+  }
+
+  uv_mutex_unlock(&s->storage_events_mutex);
+}
+
+/* Flush storage events buffer to CSV file */
+static void storage_events_flush(struct Server *s) {
+  if (!s->storage_events_file) return;
+
+  uv_mutex_lock(&s->storage_events_mutex);
+  if (s->storage_events_count == 0) {
+    uv_mutex_unlock(&s->storage_events_mutex);
+    return;
+  }
+
+  for (size_t i = 0; i < s->storage_events_count; i++) {
+    storage_event_t *evt = &s->storage_events_buffer[i];
+    if (evt->type == STORAGE_EVENT_COMPACTION) {
+      fprintf(s->storage_events_file, "compaction,%lu,%lu,%u,%lu,%lu,%u,0\n",
+          evt->timestamp,
+          evt->duration_ms,
+          evt->data.compaction.quantity_merged_tables,
+          evt->data.compaction.input_bytes,
+          evt->data.compaction.output_bytes,
+          evt->data.compaction.level);
+    } else if (evt->type == STORAGE_EVENT_MEMTABLE_FLUSH) {
+      fprintf(s->storage_events_file, "memtable_flush,%lu,%lu,0,0,0,0,%lu\n",
+          evt->timestamp,
+          evt->duration_ms,
+          evt->data.memtable_flush.bytes_flushed);
+    }
+  }
+  fflush(s->storage_events_file);
+  s->storage_events_count = 0;
+
+  uv_mutex_unlock(&s->storage_events_mutex);
+}
+
+typedef struct {
+  uv_work_t work_req;
+  client_t *client;
+
+  // Request data
+  uint64_t req_id;
+  sl_uint128_t start_key;
+  sl_uint128_t end_key;
+
+  // Response data
+  uint8_t *response_msg;
+  uint64_t total_msg_size;
+
+  // Profiling metrics
+  uint64_t t_start_ns;
+  uint64_t t_iter_us;
+  uint64_t records_count;
+} query_task_t;
 
 void client_retain(client_t *c) {
   c->ref_count++;
@@ -288,9 +450,11 @@ static void remove_client(struct Server *s, client_t *c) {
 
   if (c->prev) {
     c->prev->next = c->next;
-  } else {
+  }
+  else if (*head_ptr == c) {
     *head_ptr = c->next;
   }
+
   if (c->next) {
     c->next->prev = c->prev;
   }
@@ -299,7 +463,259 @@ static void remove_client(struct Server *s, client_t *c) {
   c->prev = NULL;
 }
 
+static void set_query_response_header(uint8_t *out, query_response_t response) {
+  uint64_t offset = 0;
+  // Header Serialization
+  memcpy(out, &response.total_msg_size, sizeof(response.total_msg_size));
+  offset += sizeof(response.total_msg_size);
 
+  memcpy(out + offset, &response.req_id, sizeof(response.req_id));
+  offset += sizeof(response.req_id);
+
+  memcpy(out + offset, &response.limit_reached, sizeof(response.limit_reached));
+  offset += sizeof(response.limit_reached);
+
+  memcpy(out + offset, &response.min_key, sizeof(response.min_key));
+  offset += sizeof(response.min_key);
+  memcpy(out + offset, &response.max_key, sizeof(response.max_key));
+  offset += sizeof(response.max_key);
+
+  /* Body header. */
+  memcpy(out + offset, &response.records_bytes, sizeof(response.records_bytes));
+  offset += sizeof(response.records_bytes);
+  memcpy(out + offset, &response.records_count, sizeof(response.records_count));
+  offset += sizeof(response.records_count);
+
+  if (offset != Q_RESP_HEADER_SIZE) exit(1); 
+  //printf("------ %lu ------\n", offset);
+}
+
+/* 
+ *  Query request format:
+ * [REQ_ID (8 Bytes) | START_KEY (16 Bytes) | END_KEY (16 bytes)]
+ * For the response format consult the 'serialize_response' function.
+ *
+ * Query Response format: 
+ * Header: [TOTAL_MSG_SIZE (8 Bytes) | REQ_ID (8 Bytes) | LIMIT (1 Byte) | MIN_KEY (16 bytes) | MAX_KEY (16 bytes)]
+ * Body: [PAYLOAD_SIZE (8 Bytes) | RECORDS_COUNT (4 Bytes) | RECORDS]
+ *
+ *
+ * For each query request:
+ * Lookup into the lsmt database for the key range provided, the lookup
+ * is bounded to a fixed amount of bytes. The response returns the fetched
+ * records, a flag indicating whether the byte limit has been reached
+ * and the last fetched key.
+ *
+ * This function has a time budget in order to set an upper time limit
+ * for a each event client-query, thus avoiding blocking the whole system
+ * if the are too much requests buffered.
+ */
+static void background_query_cb(uv_work_t *req) {
+  query_task_t *task = (query_task_t *)req->data;
+
+  uint64_t t_iter_start = uv_hrtime();
+  uint64_t deadline = t_iter_start + QUERY_BUDGET_NS;
+
+  lsmt_iterator_t it = lsmt_iterator_create(db);
+
+  size_t max_buffer_cap = Q_RESP_HEADER_SIZE + QUERY_BYTES_LIMIT + 4096;
+  task->response_msg = malloc(max_buffer_cap);
+
+  if (!task->response_msg) {
+    lsmt_iterator_close(&it);
+    fprintf(stderr, "OOM allocating response buffer\n");
+    return;
+  }
+
+  uint64_t msg_offset = Q_RESP_HEADER_SIZE;
+  uint32_t records_count = 0;
+  size_t records_bytes = 0;
+  bool limit_reached = false;
+
+  sl_uint128_t min_key = { .id = UINT64_MAX, .timestamp = UINT64_MAX };
+  sl_uint128_t max_key = { .id = 1, .timestamp = 0 };
+
+  /*
+   * If the request has been idle for more than 32 seconds, then skip the search
+   * and respond back.
+   */
+  if (t_iter_start - task->t_start_ns > 32000000000ULL) {
+    limit_reached = true;
+    goto finalize_response;
+  }
+
+  lsmt_iterator_seek(&it, task->start_key, task->end_key);
+
+  while (it.active) {
+    if (records_count > 0 && uv_hrtime() > deadline) {
+      limit_reached = true;
+      break;
+    }
+
+    kv_raw_record_t record = lsmt_iterator_next(&it);
+    if (!it.active) break;
+
+    if (records_bytes + record.total_size > QUERY_BYTES_LIMIT) {
+      limit_reached = true;
+      if (records_count > 0) break;
+    }
+
+    if (records_count == 0) {
+      min_key = record.key;
+    }
+    max_key = record.key;
+
+    memcpy(task->response_msg + msg_offset, record.raw_data, record.total_size);
+    msg_offset += record.total_size;
+    records_bytes += record.total_size;
+    records_count++;
+  }
+
+finalize_response:
+  lsmt_iterator_close(&it);
+
+  task->t_iter_us = (uv_hrtime() - t_iter_start) / 1000;
+  task->records_count = records_count;
+
+  if (records_count == 0) {
+    min_key.id = UINT64_MAX; min_key.timestamp = UINT64_MAX;
+    max_key.id = 1; max_key.timestamp = 0;
+    records_bytes = 0;
+  }
+
+  query_response_t msg_header = {0};
+  msg_header.total_msg_size = Q_RESP_HEADER_SIZE + records_bytes; 
+  msg_header.req_id = task->req_id;
+  msg_header.limit_reached = limit_reached;
+  msg_header.min_key = min_key;
+  msg_header.max_key = max_key;
+  msg_header.records_bytes = records_bytes;
+  msg_header.records_count = records_count;
+
+  set_query_response_header(task->response_msg, msg_header);
+  task->total_msg_size = msg_header.total_msg_size;
+}
+
+static void on_client_close(uv_handle_t *handle);
+
+static void close_and_free_client(client_t *client) {
+  if (client->closing) return;
+  client->closing = true;
+
+  remove_client(client->server, client);
+  uv_close((uv_handle_t *)&client->handle, on_client_close);
+}
+
+static void on_query_resp_complete(uv_write_t *req, int status) {
+  ack_write_t *wr = (ack_write_t *)req;
+  //printf("Write sent\n");
+  if (status) {
+    close_and_free_client(wr->client);
+  }
+
+  if (wr->buf.base) {
+    free(wr->buf.base);
+  }
+
+  client_release(wr->client);
+  free(wr);
+}
+
+static int send_response(client_t *c, uint8_t *data, uint64_t payload_size) {
+  struct Server *s = c->server;
+  
+  /* Track read metrics */
+  s->read_stats.total_queries++;
+  s->read_stats.total_bytes_read += payload_size;
+  
+  ack_write_t *wr = malloc(sizeof(ack_write_t));
+  if (!wr) {
+    free(data); 
+    exit(1);
+  }
+
+  wr->req.data = wr;
+  wr->client = c;
+
+  // Retain client so it isn't freed while write is pending
+  client_retain(c);
+
+  wr->buf = uv_buf_init((char*)data, (unsigned int)payload_size);
+
+  //printf("Writing back %u bytes.\n", payload_size);
+  int r = uv_write(&wr->req, (uv_stream_t*)&c->handle, &wr->buf, 1, on_query_resp_complete);
+
+  if (r != 0) {
+    // Write failed immediately (didn't queue).
+    free(data); 
+    client_release(c);
+    free(wr);
+    close_and_free_client(c);
+    return -1;
+  }
+  return 0;
+}
+
+static void after_query_cb(uv_work_t *req, int status);
+
+static void dispatch_queries(client_t *client) {
+  struct Server *s = client->server;
+  size_t offset = 0;
+
+  // Process all fully buffered queries in the pipeline
+  while (client->buffer_len - offset >= QUERY_REQ_SIZE) {
+
+    if (s->active_queries_count >= GLOBAL_MAX_QUERIES) {
+      if (!client->ctx.query.is_paused) {
+        uv_read_stop((uv_stream_t *)&client->handle);
+        client->ctx.query.is_paused = true;
+        // printf("Server saturo: Lettura TCP dal client in pausa.\n");
+      }
+      break;
+    }
+
+    uint64_t req_id;
+    sl_uint128_t start_key;
+    sl_uint128_t end_key;
+
+    memcpy(&req_id, client->buffer + offset, sizeof(uint64_t)); 
+    offset += sizeof(uint64_t);
+    memcpy(&start_key, client->buffer + offset, sizeof(sl_uint128_t)); 
+    offset += sizeof(sl_uint128_t);
+    memcpy(&end_key, client->buffer + offset, sizeof(sl_uint128_t)); 
+    offset += sizeof(sl_uint128_t);
+
+    query_task_t *task = calloc(1, sizeof(query_task_t));
+    task->work_req.data = task;
+    task->client = client;
+
+    // Retain client so it isn't destroyed while the thread is running
+    client_retain(client);
+
+    task->req_id = req_id;
+    task->start_key = start_key;
+    task->end_key = end_key;
+    task->t_start_ns = uv_hrtime();
+
+    s->active_queries_count++;
+
+    if (uv_queue_work(client->server->loop, &task->work_req, background_query_cb, after_query_cb) != 0) {
+      s->active_queries_count--;
+      client_release(client);
+      free(task);
+    }
+    //uv_queue_work(client->server->loop, &task->work_req, background_query_cb, after_query_cb);
+  }
+
+  // Shift remaining partial bytes back to the start of the buffer
+  if (offset > 0) {
+    size_t remaining = client->buffer_len - offset;
+    if (remaining > 0) {
+      memmove(client->buffer, client->buffer + offset, remaining);
+    }
+    client->buffer_len = remaining;
+  }
+}
 
 static int FsmApply(struct raft_fsm *fsm,
     const struct raft_buffer *buf,
@@ -361,34 +777,18 @@ static int FsmApply(struct raft_fsm *fsm,
         data_ptr + sizeof(uint32_t) + sizeof(sl_uint128_t), 
         record_value_size);
 
-    /*
-       uint32_t value_size = *((uint32_t *)(f->insert_cmd.record_value + sizeof(uint8_t)));
-       printf("insert: key=%lu %lu, record_length=%u, value_type=%u, value_size=%u, value_content: \n[",
-       f->insert_cmd.record_key.id,
-       f->insert_cmd.record_key.timestamp,
-       record_value_size,
-       f->insert_cmd.record_value[0],
-       value_size);
-
-       uint32_t value_offset = record_value_size - value_size;
-       for (uint32_t i = record_value_size-1; i >= value_offset; i--) {
-       printf(" %02x", f->insert_cmd.record_value[i]);
-       }
-       printf("]\n\n");
-       fflush(stdout);
-       */
-
     int e = lsmt_insert(db, f->insert_cmd.record_key,
         f->insert_cmd.record_value, 
         record_value_size);
 
-    if (count % 100000 == 0) {
+    if (count % 1000000 == 0) {
       printf("%lu\n", count);
     }
     count++;
 
     if (e != 0) {
-      return RAFT_INVALID;
+      Logf(s->id, "Warning: lsmt_insert failed with %d.", e);
+      //return RAFT_INVALID;
     }
     /* Advance the offset to the next message in the batch */
     offset += msg_size;
@@ -414,6 +814,7 @@ static int FsmSnapshot(struct raft_fsm *fsm,
   (*bufs)[0].len = sizeof(insert_cmd_t); //sizeof(uint64_t);
   (*bufs)[0].base = raft_malloc((*bufs)[0].len);
   if ((*bufs)[0].base == NULL) {
+    raft_free(*bufs);
     return RAFT_NOMEM;
   }
   //*(uint64_t *)(*bufs)[0].base = f->count;
@@ -427,7 +828,7 @@ static int FsmRestore(struct raft_fsm *fsm, struct raft_buffer *buf)
     return RAFT_MALFORMED;
   }
   //f->count = *(uint64_t *)buf->base;
-  raft_free(buf->base);
+  //raft_free(buf->base);
   return 0;
 }
 
@@ -476,6 +877,57 @@ static void serverTransferCb(struct raft_transfer *req)
   raft_close(&s->raft, serverRaftCloseCb);
 }
 
+static void on_redirect_write_complete(uv_write_t *req, int status) {
+  ack_write_t *wr = (ack_write_t *)req;
+
+  close_and_free_client(wr->client);
+  client_release(wr->client);
+  free(wr->buf.base);
+  free(wr);
+}
+
+static void redirect_to_leader_and_close(client_t *client) {
+  struct Server *s = client->server;
+  raft_id leader_id;
+  const char *leader_addr;
+
+  raft_leader(&s->raft, &leader_id, &leader_addr);
+
+  char *msg = malloc(256);
+  if (!msg) {
+    close_and_free_client(client);
+    return;
+  }
+
+  int len = snprintf(msg, 256, "REDIRECT %llu %s\n", 
+      (unsigned long long)leader_id, 
+      leader_addr ? leader_addr : "UNKNOWN");
+
+  printf("%s\n", msg);
+
+  ack_write_t *wr = malloc(sizeof(ack_write_t));
+  if (!wr) {
+    free(msg);
+    close_and_free_client(client);
+    return;
+  }
+
+  uv_read_stop((uv_stream_t*)&client->handle);
+
+  wr->req.data = wr;
+  wr->client = client;
+  client_retain(client);
+  wr->buf = uv_buf_init(msg, len);
+
+  int r = uv_write(&wr->req, (uv_stream_t*)&client->handle, &wr->buf, 1, on_redirect_write_complete);
+  if (r != 0) {
+    free(msg);
+    client_release(client);
+    free(wr);
+    close_and_free_client(client);
+  }
+}
+
 
 /* Final callback in the shutdown sequence, invoked after the timer handle has
  * been closed. */
@@ -495,44 +947,12 @@ static void serverTimerCloseCb(struct uv_handle_s *handle)
 }
 
 static void serverApplyCb(struct raft_apply *req, int status, void *result);
-
-static void on_client_close(uv_handle_t *handle);
-static void on_async_close(uv_handle_t *handle);
 static bool process_insert_buffer(client_t *client);
-
-
-// Helper function to safely close and free a client's resources
-static void close_and_free_client(client_t *client) {
-  if (client->closing) return;
-  client->closing = true;
-
-  remove_client(client->server, client);
-  uv_close((uv_handle_t *)&client->handle, on_client_close);
-
-  if (client->type == CLIENT_TYPE_QUERY) {
-    uv_close((uv_handle_t *)&client->query_async, on_async_close);
-  }
-}
 
 // Callback that fires after a client's handle is fully closed
 static void on_client_close(uv_handle_t *handle) {
   client_t *client = (client_t *)handle->data;
   client_release(client);
-}
-
-static void on_query_resp_complete(uv_write_t *req, int status) {
-  ack_write_t *wr = (ack_write_t *)req;
-  //printf("Write sent\n");
-  if (status) {
-    close_and_free_client(wr->client);
-  }
-
-  if (wr->buf.base) {
-    free(wr->buf.base);
-  }
-
-  client_release(wr->client);
-  free(wr);
 }
 
 static void on_ack_write_complete(uv_write_t *req, int status) {
@@ -605,7 +1025,7 @@ static void batch_buffer_flush(struct Server *s, client_t *c) {
   /* Reset Batch State */
   ins_ctx->batch_offset = 0;
   ins_ctx->batched_req_count = 0;
-  memset(ins_ctx->batch_buffer, 0, ins_ctx->buffer_capacity); // Optional: clear buffer for debug
+  memset(ins_ctx->batch_buffer, 0, ins_ctx->buffer_capacity);
 }
 
 // Libuv callback to allocate memory for an incoming client read
@@ -710,7 +1130,9 @@ static bool process_insert_buffer(client_t *client) {
 
     if (s->raft.state != RAFT_LEADER) {
       Log(s->id, "TCP: Rejecting command, not the leader.");
-      close_and_free_client(client);
+      //sendback the current leader ip:port.
+      redirect_to_leader_and_close(client);
+      //close_and_free_client(client);
       return false;
     } else {
 
@@ -725,11 +1147,6 @@ static bool process_insert_buffer(client_t *client) {
             total_msg_len);
         ins_ctx->batch_offset += total_msg_len;
         ins_ctx->batched_req_count++;
-
-        /* Stats. */
-        //s->stats.total_received++;
-
-        //printf("[MSG BATCHED] payload_len=%u\n", total_msg_len);
       } else {
         Logf(s->id, "Error: Message too large for batch buffer (%u > %u)", 
             total_msg_len, ins_ctx->buffer_capacity);
@@ -770,6 +1187,8 @@ static bool process_insert_buffer(client_t *client) {
   }
   return true;
 }
+
+
 // Libuv callback for when a new client connects to our server
 static void on_insert_connection(uv_stream_t *server_handle, int status) {
   if (status < 0) {
@@ -795,17 +1214,17 @@ static void on_insert_connection(uv_stream_t *server_handle, int status) {
 
   uv_tcp_init(s->loop, &client->handle);
 
+
   if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
+    client_retain(client);
 
     if (s->raft.state != RAFT_LEADER) {
       Log(s->id, "TCP: Rejecting insert client (Not Leader).");
-      client_retain(client);
-      uv_close((uv_handle_t *)&client->handle, on_client_close);
+      redirect_to_leader_and_close(client);
       return;
     }
 
     Log(s->id, "TCP: New insert client connected.");
-    client_retain(client);
     add_client(s, client, CLIENT_TYPE_INSERT);
 
     uv_tcp_keepalive(&client->handle, 1, 60);
@@ -813,294 +1232,16 @@ static void on_insert_connection(uv_stream_t *server_handle, int status) {
     uv_read_start((uv_stream_t *)&client->handle, alloc_cb, on_client_read);
   }
   else {
+    client_retain(client);
     close_and_free_client(client);
   }
 }
-
-static void set_query_response_header(uint8_t *out, query_response_t response) {
-  uint64_t offset = 0;
-  // Header Serialization
-  memcpy(out, &response.total_msg_size, sizeof(response.total_msg_size));
-  offset += sizeof(response.total_msg_size);
-
-  memcpy(out + offset, &response.req_id, sizeof(response.req_id));
-  offset += sizeof(response.req_id);
-
-  memcpy(out + offset, &response.limit_reached, sizeof(response.limit_reached));
-  offset += sizeof(response.limit_reached);
-
-  memcpy(out + offset, &response.min_key, sizeof(response.min_key));
-  offset += sizeof(response.min_key);
-  memcpy(out + offset, &response.max_key, sizeof(response.max_key));
-  offset += sizeof(response.max_key);
-
-  /* Body header. */
-  memcpy(out + offset, &response.records_bytes, sizeof(response.records_bytes));
-  offset += sizeof(response.records_bytes);
-  memcpy(out + offset, &response.records_count, sizeof(response.records_count));
-  offset += sizeof(response.records_count);
-
-  if (offset != Q_RESP_HEADER_SIZE) exit(1); 
-  //printf("------ %lu ------\n", offset);
-}
-
-static int send_response(client_t *c, uint8_t *data, uint64_t payload_size) {
-  ack_write_t *wr = malloc(sizeof(ack_write_t));
-  if (!wr) {
-    free(data); 
-    exit(1);
-  }
-
-  wr->req.data = wr;
-  wr->client = c;
-
-  // Retain client so it isn't freed while write is pending
-  client_retain(c);
-
-  // Cast to char* required by libuv
-  wr->buf = uv_buf_init((char*)data, (unsigned int)payload_size);
-
-  //printf("Writing back %u bytes.\n", payload_size);
-  int r = uv_write(&wr->req, (uv_stream_t*)&c->handle, &wr->buf, 1, on_query_resp_complete);
-
-  if (r != 0) {
-    // Write failed immediately (didn't queue).
-    // We must manually perform the cleanup that the callback would have done.
-    free(data); 
-    client_release(c);
-    free(wr);
-    close_and_free_client(c);
-    return -1;
-  }
-  return 0;
-}
-
-/* Query request format:
- * [REQ_ID (8 Bytes) | START_KEY (16 Bytes) | END_KEY (16 bytes)]
- * For the response format consult the 'serialize_response' function.
- *
- * Query Response format: 
- * Header: [TOTAL_MSG_SIZE (8 Bytes) | REQ_ID (8 Bytes) | LIMIT (1 Byte) | MIN_KEY (16 bytes) | MAX_KEY (16 bytes)]
- * Body: [PAYLOAD_SIZE (8 Bytes) | RECORDS_COUNT (4 Bytes) | RECORDS]
- *
- *
- * For each query request:
- * Lookup into the lsmt database for the key range provided, the lookup
- * is bounded to a fixed amount of bytes. The response returns the fetched
- * records, a flag indicating whether the byte limit has been reached
- * and the last fetched key.
- *
- * This function has a time budget in order to set an upper time limit
- * for a each event client-query, thus avoiding blocking the whole system
- * if the are too much requests buffered.
- */
-static bool process_query_buffer(client_t *client, uint64_t budget_ns) {
-  //size_t expected_size = sizeof(uint64_t) + (sizeof(sl_uint128_t) * 2);
-  uint64_t ts_func_start = uv_hrtime();
-  uint64_t deadline = uv_hrtime() + budget_ns;
-  uint64_t dur_iter = 0;
-  uint64_t dur_ser = 0;
-  uint64_t dur_send = 0;
-
-  size_t offset = 0;
-  uint32_t requests_processed = 0;
-  uint64_t total_records = 0;
-  size_t remaining = client->buffer_len;
-
-  lsmt_iterator_t x = lsmt_iterator_create(db);
-  lsmt_iterator_t *it = &x;
-
-  while (remaining >= QUERY_REQ_SIZE) {
-    //printf("Processing query\n");
-    if (requests_processed > 0 && uv_hrtime() > deadline) {
-      break;
-    }
-
-    uint64_t req_id;
-    sl_uint128_t start_key;
-    sl_uint128_t end_key;
-
-    memcpy(&req_id, client->buffer + offset, sizeof(uint64_t)); 
-    offset += sizeof(uint64_t);
-    memcpy(&start_key, client->buffer + offset, sizeof(sl_uint128_t)); 
-    offset += sizeof(sl_uint128_t);
-    memcpy(&end_key, client->buffer + offset, sizeof(sl_uint128_t)); 
-    offset += sizeof(sl_uint128_t);
-
-    uint64_t t_iter_start = uv_hrtime();
-
-    uint32_t records_count = 0;
-    size_t records_bytes = 0;
-    bool time_limit_hit = false;
-
-    size_t buffer_cap = Q_RESP_HEADER_SIZE + 8 * 1024;
-    uint8_t *response_msg = malloc(sizeof(uint8_t) * buffer_cap); 
-    uint64_t msg_offset = Q_RESP_HEADER_SIZE;
-
-    if (!response_msg) {
-      lsmt_iterator_close(it);
-      fprintf(stderr, "OOM allocating records\n");
-      exit(1);
-    }
-
-    /*
-     * Note: the lsmt iterator fetches records in ascending order with respect
-     * to their keys.
-     * Since this function has an upper bound on bytes fetched, i need to
-     * determine the key range of successfully retrieved records in order
-     * to correctly support paging.
-     */
-    sl_uint128_t min_key = { .id = UINT64_MAX, .timestamp = UINT64_MAX };
-    // !!!id=0 is reserved for the skiplist.
-    sl_uint128_t max_key = { .id = 1, .timestamp = 0 };
-
-    //printf("Loading records..\n");
-
-    lsmt_iterator_seek(it, start_key, end_key);
-
-    while (it->active) {
-      if (records_count > 0 && uv_hrtime() > deadline) {
-        time_limit_hit = true;
-        break;
-      }
-
-      kv_raw_record_t record = lsmt_iterator_next(it);
-      if (!it->active) break;
-
-      if (records_bytes + record.total_size > QUERY_BYTES_LIMIT) {
-        if (records_count > 0) {
-          time_limit_hit = true;
-          break; 
-        }
-        /* Return atleast one record. */
-        time_limit_hit = true; 
-      }
-
-      if (msg_offset + record.total_size > buffer_cap) { 
-        size_t new_cap = buffer_cap * 2;
-        // Ensure strictly enough space
-        if (new_cap < msg_offset + record.total_size) {
-          new_cap = msg_offset + record.total_size + 4096;
-        }
-
-        uint8_t *tmp = realloc(response_msg, new_cap);
-        if (!tmp) {
-          lsmt_iterator_close(it);
-          free(response_msg);
-          fprintf(stderr, "OOM realloc response\n");
-          exit(1); 
-        }
-        response_msg = tmp;
-        buffer_cap = new_cap;
-      }
-
-      if (records_count == 0) {
-        min_key = record.key;
-      }
-
-      max_key = record.key;
-      memcpy(response_msg + msg_offset, record.raw_data, record.total_size);
-      msg_offset += record.total_size;
-      records_bytes += record.total_size;
-      records_count++;
-    }
-    //lsmt_iterator_close(it);
-    dur_iter += (uv_hrtime() - t_iter_start);
-
-    if (records_count == 0) {
-      /*if no records found, then set min_key > max_key. */
-      min_key.id = UINT64_MAX; min_key.timestamp = UINT64_MAX;
-      max_key.id = 1; max_key.timestamp = 0;
-      records_bytes = 0;
-    }
-
-    total_records += records_count;
-    uint64_t t_ser_start = uv_hrtime();
-
-    query_response_t msg_header = {0};
-    msg_header.total_msg_size = Q_RESP_HEADER_SIZE + records_bytes; 
-    msg_header.req_id = req_id;
-    msg_header.limit_reached = (records_bytes > QUERY_BYTES_LIMIT) || time_limit_hit;
-    msg_header.min_key = min_key;
-    msg_header.max_key = max_key;
-    msg_header.records_bytes = records_bytes;
-    msg_header.records_count = records_count;
-
-    set_query_response_header(response_msg, msg_header);
-
-    dur_ser += (uv_hrtime() - t_ser_start);
-
-    uint64_t t_send_start = uv_hrtime();
-
-    if (send_response(client, response_msg, msg_header.total_msg_size) != 0) {
-      lsmt_iterator_close(it);
-      printf("FAILED SEND QUERY RESPONSE.\n");
-      return false;
-    }
-    dur_send += (uv_hrtime() - t_send_start);
-
-    remaining -= QUERY_REQ_SIZE;
-    requests_processed++;
-  }
-
-  // Only move memory after we are done reading everything possible.
-  if (offset > 0) {
-    if (remaining > 0) {
-      memmove(client->buffer, client->buffer + offset, remaining);
-    }
-    client->buffer_len = remaining;
-  }
-
-  if (requests_processed > 0) {
-    uint64_t total_ns = uv_hrtime() - ts_func_start;
-
-    // Convert to milliseconds for total, microseconds for phases
-    double total_ms = total_ns / 1000000.0;
-    double iter_us  = dur_iter / 1000.0;
-    double ser_us   = dur_ser  / 1000.0;
-    double send_us  = dur_send / 1000.0;
-
-    printf("[Profile] Reqs: %d | Records: %lu | Total: %.3f ms | Iter: %.0f us | Ser: %.0f us | Send: %.0f us\n", 
-        requests_processed, total_records, total_ms, iter_us, ser_us, send_us);
-  }
-  lsmt_iterator_close(it);
-  return true;
-}
-
-static void on_query_async(uv_async_t *handle) {
-  client_t *client = handle->data;
-  if (!client || client->closing) return;
-
-  client->query_async_pending = false;
-
-  if (client->buffer_len < QUERY_REQ_SIZE) {
-    return;
-  }
-
-
-  process_query_buffer(client, QUERY_BUDGET_NS);
-
-  /* Still work left? Yield again. */
-  if (client->buffer_len >= QUERY_REQ_SIZE &&
-      !client->query_async_pending) {
-
-    client->query_async_pending = true;
-    uv_async_send(&client->query_async);
-  }
-}
-
-static void on_async_close(uv_handle_t *handle) {
-  client_t *client = (client_t *)handle->data;
-  client_release(client); 
-}
-
 
 static void on_client_query(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
   client_t *client = (client_t *)stream->data;
 
   if (nread > 0) {
     if (client->buffer_len + nread > client->buffer_cap) {
-      // Logic to prevent infinite growth or handle OOM could go here
       size_t new_cap = (client->buffer_len + nread) * 2;
       char *new_buf = realloc(client->buffer, new_cap);
       if (!new_buf) {
@@ -1115,15 +1256,7 @@ static void on_client_query(uv_stream_t *stream, ssize_t nread, const uv_buf_t *
 
     memcpy(client->buffer + client->buffer_len, buf->base, nread);
     client->buffer_len += nread;
-
-    /* Schedule processing if not already pending */
-    if (client->buffer_len >= QUERY_REQ_SIZE &&
-        !client->query_async_pending) {
-
-      client->query_async_pending = true;
-      uv_async_send(&client->query_async);
-    }
-    //process_query_buffer(client);
+    dispatch_queries(client);
   }
   else if (nread < 0) {
     // Error or EOF
@@ -1150,28 +1283,23 @@ static void on_read_connection(uv_stream_t *server_handle, int status) {
   // Allocate and initialize a new client struct
   client_t *client = calloc(1, sizeof(client_t));
   if (!client) { /* handle OOM */ return; }
+
   client->type = CLIENT_TYPE_QUERY;
   client->server = s;
   client->handle.data = client; 
   client->closing = false;
-  client->query_async_pending = false;
 
   uv_tcp_init(s->loop, &client->handle);
   if (uv_accept(server_handle, (uv_stream_t *)&client->handle) == 0) {
+    client_retain(client);
 
     if (s->raft.state == RAFT_LEADER) {
       Log(s->id, "TCP: Rejecting query client (I'm the Leader).");
-      client_retain(client);
-      uv_close((uv_handle_t *)&client->handle, on_client_close);
+      close_and_free_client(client);
       return;
     }
 
     Log(s->id, "TCP: New query client connected.");
-    uv_async_init(s->loop, &client->query_async, on_query_async);
-    client_retain(client);
-    client->query_async.data = client;
-
-    client_retain(client);
     client->ctx.query.total_queries = 0;
     client->ctx.query.active_query_start_ts = 0;
 
@@ -1181,6 +1309,7 @@ static void on_read_connection(uv_stream_t *server_handle, int status) {
     uv_tcp_nodelay(&client->handle, 1); 
     uv_read_start((uv_stream_t *)&client->handle, alloc_cb, on_client_query);
   } else {
+    client_retain(client);
     close_and_free_client(client);
   }
 }
@@ -1200,16 +1329,13 @@ static int client_uv_init(struct Server *s, uv_tcp_t *tcp_handle,
   rv = uv_tcp_bind(tcp_handle, (const struct sockaddr*)&addr, 0);
   if (rv != 0) {
     Logf(s->id, "uv_tcp_bind(): %s", uv_strerror(rv));
-    // Add proper cleanup here if other handles were init'd
     return -1;
-    //goto err;
   }
 
   rv = uv_listen((uv_stream_t*)tcp_handle, 128, on_connection);
   if (rv != 0) {
     Logf(s->id, "uv_listen(): %s", uv_strerror(rv));
     return -2;
-    //goto err;
   }
   Logf(s->id, "TCP server listening on port %d", port);
   return 0;
@@ -1221,7 +1347,7 @@ static int tcp_setup(struct Server *s, int port) {
   rv = client_uv_init(s, &s->tcp_write_handle, port, on_insert_connection);
   if (rv != 0) return rv;
 
-  rv = client_uv_init(s, &s->tcp_read_handle, port + 4000, on_read_connection);
+  rv = client_uv_init(s, &s->tcp_read_handle, port + 1000, on_read_connection);
   return rv;
 }
 
@@ -1239,25 +1365,36 @@ static void setup_high_level_stats(struct Server * s, const char *path) {
     exit(1);
   } 
 
-  fprintf(s->stats.f, "Timestamp_ms,Role,OPS,Throughput_MBps,PendingRequests,PendingBytes,Backlog,Avg_Latency_ms,Raft_Idx_Local,Raft_Idx_Applied,Raft_Idx_Commit\n"); 
+  fprintf(s->stats.f, "Timestamp_ms,Role,Term,Total_Write_Requests,Total_Write_Bytes,Total_Read_Requests,Total_Read_Bytes,PendingRequests,PendingBytes,Backlog,Avg_Latency_ms,P50_Latency_ms,P95_Latency_ms,P99_Latency_ms,Max_Latency_ms,Raft_Idx_Local,Raft_Idx_Applied,Raft_Idx_Commit\n"); 
   fflush(s->stats.f);
 
   s->stats.total_requests = 0;
   s->stats.total_bytes = 0;
-  s->stats.prev_requests = 0;
-  s->stats.prev_bytes = 0;
-  //s->stats.total_received = 0;
-  s->stats.last_run_time = 0;
   s->stats.period_latency_sum = 0;
   s->stats.period_batches_count = 0; 
+  
+  /* Initialize read stats */
+  s->read_stats.total_queries = 0;
+  s->read_stats.total_bytes_read = 0;
+  
+  /* Initialize latency buffer */
+  latency_buffer_init(&s->latency_buffer);
 }
 
-static void setup_batch_level_stats(struct Server *s, const char *path) {
-  s->batch_log_file = fopen(path, "wb");
-  if (!s->batch_log_file) {
-    printf("Failed to open file %s\n", path);
+static void setup_storage_events_file(struct Server *s, const char *path) {
+  s->storage_events_file = fopen(path, "w");
+  if (!s->storage_events_file) {
+    printf("Failed to open storage events file %s\n", path);
     exit(1);
   }
+  
+  /* Write header */
+  fprintf(s->storage_events_file, "event_type,timestamp,duration_ms");
+  fprintf(s->storage_events_file, ",quantity_merged_tables,input_bytes,output_bytes,level");
+  fprintf(s->storage_events_file, ",bytes_flushed\n");
+  fflush(s->storage_events_file);
+  
+  s->storage_events_count = 0;
 }
 
 /* Initialize the example server struct, without starting it yet. */
@@ -1291,13 +1428,6 @@ static int ServerInit(struct Server *s,
   timespec_get(&now, TIME_UTC);
   srandom((unsigned)(now.tv_nsec ^ now.tv_sec));
 
-  /* Allocate the batch request buffer. */
-  /*
-     s->batch_buffer = calloc(BATCH_SIZE, sizeof(insert_cmd_t));
-     s->batch_offset = 0;
-     s->batched_req_count = 0;
-     s->buffer_capacity = BATCH_SIZE * sizeof(insert_cmd_t);
-     */
   s->loop = loop;
   s->last_state = -1;
 
@@ -1333,8 +1463,8 @@ static int ServerInit(struct Server *s,
 
   /* Save the server ID. */
   s->id = id;
+  s->active_queries_count = 0;
 
-  /* Render the address. */
   strcpy(s->address, node_config->raft_address);
 
   /* Initialize and start the engine, using the libuv-based I/O backend. */
@@ -1368,13 +1498,12 @@ static int ServerInit(struct Server *s,
   raft_set_snapshot_threshold(&s->raft, UINT32_MAX); //64);
   raft_set_snapshot_trailing(&s->raft, 16);
   raft_set_pre_vote(&s->raft, true);
+  raft_set_capacity_threshold(&s->raft, 0);
 
-  //raft_set_election_timeout(&s->raft, 5000);   // 5 Seconds
-  //raft_set_heartbeat_timeout(&s->raft, 500);   // 0.5 Seconds
+  raft_set_election_timeout(&s->raft, 4000);  //Ms
+  raft_set_heartbeat_timeout(&s->raft, 500);  //Ms
 
-  /* Allow more data in flight to fill. 
-   * With 4KB batches, 256 entries = 1MB of in-flight data. */
-  raft_set_max_inflight_entries(&s->raft, 256);
+  raft_set_max_inflight_entries(&s->raft, 128);
 
   s->transfer.data = s;
 
@@ -1392,9 +1521,17 @@ static int ServerInit(struct Server *s,
   char stats_file_path[256];
   sprintf(stats_file_path, "%s/stats_%d_%lu.csv", dir, s->id, file_ts); 
   setup_high_level_stats(s, stats_file_path);
+ 
+  /* Setup storage events file */
+  sprintf(stats_file_path, "%s/storage_events_%d_%lu.csv", dir, s->id, file_ts);
+  setup_storage_events_file(s, stats_file_path);
+  
+  uv_mutex_init(&s->storage_events_mutex);
 
-  sprintf(stats_file_path, "%s/stats_batch_%d_%lu.bin", dir, s->id, file_ts);  
-  setup_batch_level_stats(s, stats_file_path);
+  /* Register storage event callbacks with lsmt */
+  lsmt_set_compaction_callback(s->db, on_compaction_event, s);
+  lsmt_set_memtable_flush_callback(s->db, on_memtable_flush_event, s);
+  
   return 0;
 
 err_after_configuration_init:
@@ -1413,24 +1550,10 @@ static void update_batch_metrics(struct Server *s, apply_ctx_t *ctx) {
   /* Calculate Latency */
   uint64_t now = uv_now(s->loop);
 
-  uint64_t consensus_time = now - ctx->raft_apply_ts;
-  uint64_t buffering_time = 0;
-  if (ctx->raft_apply_ts > ctx->batch_creation_ts) {
-    buffering_time = ctx->raft_apply_ts - ctx->batch_creation_ts;
-  }
-
   uint64_t batch_time = now - ctx->batch_creation_ts;
 
-  if (s->batch_log_file) {
-    batch_log_t entry;
-    entry.timestamp = now;
-    entry.batch_size = ctx->req_count;
-    entry.bytes = ctx->batch_size_bytes;
-    entry.t_accumulate = buffering_time;
-    entry.t_consensus = consensus_time;
-    entry.t_total = batch_time;
-    fwrite(&entry, sizeof(batch_log_t), 1, s->batch_log_file);
-  }
+  /* Store latency in buffer for distribution calculation */
+  latency_buffer_add(&s->latency_buffer, batch_time);
 
   s->stats.period_latency_sum += batch_time;
   s->stats.period_batches_count++;
@@ -1483,38 +1606,53 @@ static void serverApplyCb(struct raft_apply *req, int status, void *result)
 static void statsTimerCb(uv_timer_t *timer)
 {
   struct Server *s = timer->data;
+  uint64_t epoch_ms = get_unix_epoch();
   uint64_t now = uv_now(s->loop);
+
   int current_state = s->raft.state;
+  raft_term term = raft_current_term(&s->raft);
 
   /* -----------------------------------------------------------------------
-   * Calculate Time Delta 
-   * ----------------------------------------------------------------------- */
-  if (s->stats.last_run_time == 0) {
-    s->stats.last_run_time = now - APPLY_RATE; 
-  }
-
-  uint64_t dt = now - s->stats.last_run_time;
-  if (dt == 0) dt = 1;
-
-  /* -----------------------------------------------------------------------
-   * Calculate Rates (OPS & MB/s)
-   * ----------------------------------------------------------------------- */
-  uint64_t current_reqs = s->stats.total_requests;
-  uint64_t current_bytes = s->stats.total_bytes;
-
-  uint64_t delta_reqs = current_reqs - s->stats.prev_requests;
-  uint64_t delta_bytes = current_bytes - s->stats.prev_bytes;
-
-  /* Normalize to Seconds */
-  uint64_t ops_sec = (delta_reqs * 1000) / dt;
-  double mb_sec = ((double)delta_bytes / (1024.0 * 1024.0)) * (1000.0 / dt);
-
-  /* -----------------------------------------------------------------------
-   * Calculate Average Latency (From previous step)
+   * Calculate Average Latency
    * ----------------------------------------------------------------------- */
   double avg_latency_ms = 0.0;
   if (s->stats.period_batches_count > 0) {
     avg_latency_ms = (double)s->stats.period_latency_sum / (double)s->stats.period_batches_count;
+  }
+
+  /* -----------------------------------------------------------------------
+   * Calculate Latency Distribution (p50, p95, p99, MAX)
+   * ----------------------------------------------------------------------- */
+  double p50_latency_ms = 0.0;
+  double p95_latency_ms = 0.0;
+  double p99_latency_ms = 0.0;
+  double max_latency_ms = 0.0;
+  
+  if (s->latency_buffer.count > 0) {
+    /* Copy and sort samples */
+    uint64_t sorted_samples[MAX_LATENCY_SAMPLES];
+    size_t count = s->latency_buffer.count;
+    size_t start = (s->latency_buffer.head + MAX_LATENCY_SAMPLES - count) % MAX_LATENCY_SAMPLES;
+    
+    for (size_t i = 0; i < count; i++) {
+      sorted_samples[i] = s->latency_buffer.samples[(start + i) % MAX_LATENCY_SAMPLES];
+    }
+    
+    /* Insertion sort for small arrays */
+    for (size_t i = 1; i < count; i++) {
+      uint64_t key = sorted_samples[i];
+      size_t j = i;
+      while (j > 0 && sorted_samples[j - 1] > key) {
+        sorted_samples[j] = sorted_samples[j - 1];
+        j--;
+      }
+      sorted_samples[j] = key;
+    }
+    
+    p50_latency_ms = calculate_percentile(sorted_samples, count, 50.0);
+    p95_latency_ms = calculate_percentile(sorted_samples, count, 95.0);
+    p99_latency_ms = calculate_percentile(sorted_samples, count, 99.0);
+    max_latency_ms = (double)sorted_samples[count - 1];
   }
 
   raft_index idx_current = raft_last_index(&s->raft);
@@ -1553,29 +1691,43 @@ static void statsTimerCb(uv_timer_t *timer)
   else if (current_state == RAFT_CANDIDATE) role_name = "CANDIDATE";
 
   if (s->stats.f) {
-    fprintf(s->stats.f, "%lu,%s,%lu,%.2f,%lu,%lu,%lu,%.2f,%llu,%llu,%llu\n",
-        now, 
+    fprintf(s->stats.f, "%lu,%s,%llu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,%llu,%llu\n",
+        epoch_ms, 
         role_name, 
-        ops_sec, 
-        mb_sec,
+        term,
+        s->stats.total_requests, 
+        s->stats.total_bytes,
+        s->read_stats.total_queries,
+        s->read_stats.total_bytes_read,
         pending_client_reqs, 
         total_pending_bytes, 
         backlog,
         avg_latency_ms,
+        p50_latency_ms,
+        p95_latency_ms,
+        p99_latency_ms,
+        max_latency_ms,
         idx_current,
         idx_applied,
         idx_commit
         );
   }
+  
   // Reset Counters
-  s->stats.prev_requests = s->stats.total_requests;
-  s->stats.prev_bytes = s->stats.total_bytes;
   s->stats.period_latency_sum = 0;
   s->stats.period_batches_count = 0;
-  s->stats.last_run_time = now;
+  
+  /* Flush storage events periodically. */
+  static uint64_t last_storage_flush = 0;
+  if (now - last_storage_flush >= STORAGE_EVENTS_METRICS_FLUSH_TIME) {
+    storage_events_flush(s);
+    last_storage_flush = now;
+  }
+
+  /* Reset the latency buffer so we don't carry over old latencies */
+  latency_buffer_init(&s->latency_buffer);
 }
 
-/* Called periodically every APPLY_RATE milliseconds. */
 /* Start the example server. */
 static int ServerStart(struct Server *s)
 {
@@ -1606,7 +1758,6 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
 {
   s->close_cb = cb;
   Log(s->id, "stopping");
-  //lsmt_free(s->db);
 
   /* Close the timer asynchronously if it was successfully
    * initialized. Otherwise invoke the callback immediately. */
@@ -1622,10 +1773,13 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
     s->stats.f = NULL;
   }
 
-  if (s->batch_log_file) {
-    fflush(s->batch_log_file);
-    fclose(s->batch_log_file);
-    s->batch_log_file = NULL;
+ 
+  /* Flush and close storage events file */
+  if (s->storage_events_file) {
+    storage_events_flush(s);
+    fclose(s->storage_events_file);
+    s->storage_events_file = NULL;
+    uv_mutex_destroy(&s->storage_events_mutex);
   }
 
   /* Close TCP Listening Sockets */
@@ -1654,12 +1808,6 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
   Log(s->id, "Shutted down.");
 }
 
-/********************************************************************
- *
- * Top-level main loop.
- *
- ********************************************************************/
-
 static void mainServerCloseCb(struct Server *server)
 {
   struct uv_signal_s *sigint = server->data;
@@ -1679,6 +1827,8 @@ static void mainSigintCb(struct uv_signal_s *handle, int signum)
 
 int main(int argc, char *argv[])
 {
+  setvbuf(stdout, NULL, _IOLBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
   memset(ACK_BUFFER, 1, BATCH_SIZE);
 
   struct uv_loop_s loop;
@@ -1698,6 +1848,7 @@ int main(int argc, char *argv[])
   dir = argv[1];
   id = (uint32_t)atoi(argv[2]);
   conf_path = argv[3];
+  Logf(id, "Server starting. Code versions: server.c v1.2.0-20260615, lsmt.c %s", lsmt_version());
   cluster_config_t cluster_conf = {0};
 
   if (load_cluster_config(conf_path, &cluster_conf) != 0) {
@@ -1758,4 +1909,51 @@ err_after_server_init:
   uv_loop_close(&loop);
 err:
   return rv;
+}
+
+/* 
+ * RUNS ON MAIN EVENT LOOP WHEN THREAD IS DONE
+ * Safely sends the memory buffer via the TCP socket.
+ */
+static void after_query_cb(uv_work_t *req, int status) {
+  query_task_t *task = (query_task_t *)req->data;
+  client_t *client = task->client;
+  struct Server *s = task->client->server;
+
+  if (status == 0 && !client->closing && task->response_msg) {
+    uint64_t t_send_start = uv_hrtime();
+
+    // Note: send_response frees the buffer automatically on failure
+    if (send_response(client, task->response_msg, task->total_msg_size) != 0) {
+      printf("FAILED SEND QUERY RESPONSE.\n");
+    } else {
+      double send_us = (uv_hrtime() - t_send_start) / 1000.0;
+      double total_ms = (uv_hrtime() - task->t_start_ns) / 1000000.0;
+
+      printf("[Profile] Reqs: 1 | Records: %lu | Total: %.3f ms | Iter: %lu us | Send: %.0f us\n", 
+          task->records_count, total_ms, task->t_iter_us, send_us);
+    }
+  } else {
+    // If the client closed while the thread was running, free the buffer manually
+    if (task->response_msg) {
+      free(task->response_msg);
+    }
+  }
+
+  s->active_queries_count--;
+  if (s->active_queries_count < GLOBAL_MAX_QUERIES) {
+    client_t *c = s->query_clients_head;
+    while (c != NULL) {
+      if (c->ctx.query.is_paused && !c->closing) {
+        c->ctx.query.is_paused = false;
+        uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_client_query);
+        dispatch_queries(c); 
+
+        if (s->active_queries_count >= GLOBAL_MAX_QUERIES) break;
+      }
+      c = c->next;
+    }
+  }
+  client_release(client);
+  free(task);
 }

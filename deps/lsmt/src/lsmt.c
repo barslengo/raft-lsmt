@@ -2,8 +2,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#define _GNU_SOURCE
 #include <pthread.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -21,21 +21,32 @@
 #include <time.h>
 #include <unistd.h>
 
+#define SIZE_THRESHOLD (16 * 1024 * 1024)
 
-
-#define SIZE_THRESHOLD (2 * 1024 * 1024)
-
-#define POOL_SIZE 4 
-#define ZERO_LEVEL_MAX_SIZE (8 * 1024 * 1024) //maximum size for level 0 sstables.
+#define ZERO_LEVEL_MAX_SIZE (4 * 16 * 1024 * 1024) //maximum size for level 0 sstables.
 #define SSTABLE_MERGE_LIMIT 4 //maximum number of sstable to merge
 
 #define SST_FILENAME_MAX_LENGTH 256
 #define SST_EXT ".sbrolf"
 #define SST_INDEX_EXT ".prot"
 
-/* Accrocchio temporaneo per dumpare la memtable su disco in multithreading */
-static pthread_t thread_pool[POOL_SIZE];
-static size_t thread_idx = 0;
+
+/* Callback setter functions */
+void lsmt_set_compaction_callback(lsmt_t *lsmt,
+    lsmt_compaction_callback_t callback, void *user_data) {
+  if (lsmt) {
+    lsmt->compaction_callback = callback;
+    lsmt->callback_user_data = user_data;
+  }
+}
+
+void lsmt_set_memtable_flush_callback(lsmt_t *lsmt,
+    lsmt_memtable_flush_callback_t callback, void *user_data) {
+  if (lsmt) {
+    lsmt->memtable_flush_callback = callback;
+    lsmt->callback_user_data = user_data;
+  }
+}
 
 static const size_t index_block_size = 4 * 1024; // 4KB
 
@@ -43,6 +54,9 @@ static const size_t index_block_size = 4 * 1024; // 4KB
 static const uint8_t RECORD_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t) + sizeof(uint32_t);
 
 static void *dump_to_disk(void *arg);
+static sst_metadata_record_t memtable_to_disk(lsmt_t *lsmt, sl_t *memtable,
+    uint8_t *result_code);
+static void *compaction_daemon(void *arg);
 
 typedef struct dump_task {
   lsmt_t *lsmt;
@@ -85,7 +99,7 @@ static sst_file_paths_t new_sstable_filename(const char *dir) {
   return files;
 }
 
-static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t length, const char *db_path) {
+static sst_metadata_record_t sst_merge(lsmt_t *lsmt, sst_metadata_record_t *records[], uint8_t length, const char *db_path) {
   sst_file_paths_t file_paths = new_sstable_filename(db_path);
 
   // 1. Setup the Set Iterator (Handles all reading, merging, and sorting)
@@ -102,7 +116,17 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t
     perror("Failed to open new sst file");
     exit(1);
   }
-  setvbuf(new_file, NULL, _IOFBF, 128 * 1024);
+
+  uint64_t input_bytes = 0;
+  for (int k = 0; k < length; k++) {
+    input_bytes += records[k]->total_bytes;
+  }
+
+  while (lsmt->flush_active || lsmt->immutable_count > 0) {
+    usleep(10000);
+  }
+  posix_fallocate(fileno(new_file), 0, input_bytes);
+  setvbuf(new_file, NULL, _IOFBF, 1024 * 1024);
 
   index_t *index = index_init(1024);
   uint64_t offset = 0;
@@ -113,7 +137,12 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t
   bool first = true;
 
   kv_raw_record_t *rec;
+  size_t bytes_written_since_sleep = 0; 
+
   while ((rec = sst_k_iterators_next(&set_it)) != NULL) {
+    while (lsmt->flush_active || lsmt->immutable_count > 0) {
+      usleep(10000);
+    }
     if (first) {
       min_key = rec->key;
       first = false;
@@ -131,7 +160,16 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t
 
     offset += rec->total_size;
     current_block_size += rec->total_size;
+    bytes_written_since_sleep += rec->total_size;
+
     if (current_block_size >= index_block_size) current_block_size = 0;
+
+    /* Micro-sleep to throttle CPU and I/O, allowing main thread to regain control.
+     * Throttled to 5ms to give higher priority to memtable flushes. */
+    if (bytes_written_since_sleep >= 1024 * 1024) { // Every 1 Megabyte written.
+      usleep(5000);
+      bytes_written_since_sleep = 0;
+    }
   }
 
   if (fflush(new_file) != 0 || fsync(fileno(new_file)) != 0) {
@@ -160,7 +198,12 @@ static sst_metadata_record_t sst_merge(sst_metadata_record_t *records[], uint8_t
 
 /* Iterate over all the tiers and compact the sstables
  * whose sum of their size exceed the tier threshold. */
-static int sst_compact(sst_metadata_t *sst_meta, const char *db_path, pthread_mutex_t *mutex) {
+static int sst_compact(lsmt_t *lsmt, sst_metadata_t *sst_meta, const char *db_path, pthread_mutex_t *mutex) {
+  uint64_t compaction_start_ts = get_monotonic_time_ms();
+  uint32_t total_merged = 0;
+  uint64_t total_input_bytes = 0;
+  uint64_t total_output_bytes = 0;
+  uint8_t compaction_level = 0;
 
   /* This buffer holds the merged sstables from all the tier processed
    * in this cycle. They are holded until the metadata are flushed to disk
@@ -213,15 +256,23 @@ static int sst_compact(sst_metadata_t *sst_meta, const char *db_path, pthread_mu
         exit(1);
         continue; 
       }
- 
+
       /* Merge the selected sstables into a new one with incremented tier. 
        * If returns any error, then i must push back the records into the metadata list. (TODO) */
       pthread_mutex_unlock(mutex);
 
-      sst_metadata_record_t new_sst = sst_merge(records, j, db_path);
+      sst_metadata_record_t new_sst = sst_merge(lsmt, records, j, db_path);
 
       pthread_mutex_lock(mutex);
       sst_metadata_add(sst_meta, new_sst); 
+
+      /* Track compaction metrics for this merge */
+      total_merged += j;
+      for (int k = 0; k < j; k++) {
+        total_input_bytes += records[k]->total_bytes;
+      }
+      total_output_bytes += new_sst.total_bytes;
+      compaction_level = new_sst.level;
 
       /* Store the sst to be deleted later on. */
       for (int k = 0; k < j; k++) {
@@ -245,36 +296,162 @@ static int sst_compact(sst_metadata_t *sst_meta, const char *db_path, pthread_mu
   }
 
   if (must_flush == true) {
-    pthread_mutex_lock(mutex);
+    sst_metadata_record_t *records = NULL;
+    int count = 0;
+    uint8_t version = 0;
+    uint8_t highest_tier = 0;
+    uint64_t my_generation = 0;
 
-    if (sst_metadata_flush(sst_meta) != 0) {
-      fprintf(stderr, "Critical Error: Failed to flush metadata. Cannot delete old files.\n");
-      exit(1);
-    }
+    pthread_mutex_lock(mutex);
+    lsmt->metadata_generation++;
+    my_generation = lsmt->metadata_generation;
+    sst_metadata_copy_records(sst_meta, &records, &count, &version, &highest_tier);
     pthread_mutex_unlock(mutex);
+
+    pthread_mutex_lock(&lsmt->metadata_write_lock);
+    if (my_generation > lsmt->disk_generation) {
+      if (sst_metadata_write_records(sst_meta, records, count, version, highest_tier) != 0) {
+        fprintf(stderr, "Critical Error: Failed to flush metadata. Cannot delete old files.\n");
+        exit(1);
+      }
+      lsmt->disk_generation = my_generation;
+    }
+    pthread_mutex_unlock(&lsmt->metadata_write_lock);
+    free(records);
 
     /* Delete merged sst tables. */
     for (int k = 0; k < delete_count; k++) {
       sst_to_delete[k]->old = true;
       sst_metadata_record_release(sst_to_delete[k]);
     }
+
+    /* Invoke compaction callback if set */
+    uint64_t end_ts = get_monotonic_time_ms();
+    if (lsmt && lsmt->compaction_callback && total_merged > 0) {
+      uint64_t duration_ms = end_ts - compaction_start_ts;
+
+      lsmt->compaction_callback(lsmt->callback_user_data,
+          get_unix_epoch(), duration_ms, total_merged, total_input_bytes,
+          total_output_bytes, compaction_level);
+    }
   }
   return 0;
 }
 
-static void *dump_to_disk(void *arg) {
-  dump_task_t *task_args = (dump_task_t *)arg;
-  lsmt_t *lsmt = task_args->lsmt;
-  sl_t *memtable = task_args->memtable;
-  free(task_args);
+static void unregister_immutable_memtable(lsmt_t *lsmt, sl_t *memtable) {
+    pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
+    for (int i = 0; i < lsmt->immutable_count; i++) {
+      if (lsmt->immutables[i] == memtable) {
+        for (int j = i; j < lsmt->immutable_count - 1; j++) {
+          lsmt->immutables[j] = lsmt->immutables[j+1];
+        }
+        lsmt->immutable_count--;
+        break;
+      }
+    }
+    pthread_rwlock_unlock(&lsmt->memtable_rwlock);
+    sl_release(memtable);
 
-  if (!memtable) return NULL;
+    lsmt->flush_active = false;
+}
+
+/* Serialize all the immutable memtables to disk. */
+static void *dump_to_disk(void *arg) {
+  lsmt_t *lsmt = (lsmt_t *)arg;
+
+  while (1) {
+    sl_t *memtable = NULL;
+
+    pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
+
+    if (lsmt->immutable_count > 0) {
+      memtable = lsmt->immutables[0];
+    } else {
+      pthread_mutex_lock(&lsmt->thread_pool_mutex);
+      lsmt->active_background_threads = 0;
+      pthread_cond_broadcast(&lsmt->thread_pool_cond);
+      pthread_mutex_unlock(&lsmt->thread_pool_mutex);
+    }
+    pthread_rwlock_unlock(&lsmt->memtable_rwlock);
+
+    if (memtable == NULL) {
+      break;
+    }
+
+    uint64_t start_ts = get_monotonic_time_ms();
+    lsmt->flush_active = true;
+
+    uint8_t write_result = 0;
+    sst_metadata_record_t metadata = memtable_to_disk(lsmt, memtable, &write_result);
+
+    /* On write error shift the immutable list by one and skip to the next. */
+    if (write_result != 0) {
+      unregister_immutable_memtable(lsmt, memtable);
+
+      pthread_mutex_lock(&lsmt->thread_pool_mutex);
+      pthread_cond_broadcast(&lsmt->thread_pool_cond);
+      pthread_mutex_unlock(&lsmt->thread_pool_mutex);
+      continue;
+    }
+
+    sst_metadata_record_t *records = NULL;
+    int count = 0;
+    uint8_t version = 0;
+    uint8_t highest_tier = 0;
+    uint64_t my_generation = 0;
+
+    pthread_mutex_lock(&lsmt->metadata_lock);
+    metadata.id = lsmt->sstable_id++;
+    sst_metadata_add(lsmt->metadata, metadata);
+    lsmt->metadata_generation++;
+    my_generation = lsmt->metadata_generation;
+    sst_metadata_copy_records(lsmt->metadata, &records, &count, &version, &highest_tier);
+    pthread_mutex_unlock(&lsmt->metadata_lock);
+
+    pthread_mutex_lock(&lsmt->metadata_write_lock);
+    if (my_generation > lsmt->disk_generation) {
+      if (sst_metadata_write_records(lsmt->metadata, records, count, version, highest_tier) != 0) {
+        fprintf(stderr, "Critical Error: Failed to flush metadata in dump_to_disk\n");
+        exit(1);
+      }
+      lsmt->disk_generation = my_generation;
+    }
+    pthread_mutex_unlock(&lsmt->metadata_write_lock);
+    free(records);
+
+    unregister_immutable_memtable(lsmt, memtable);
+
+    /* Signal the compaction daemon thread to run compaction */
+    pthread_mutex_lock(&lsmt->compaction_mutex);
+    lsmt->compaction_needed = true;
+    pthread_cond_signal(&lsmt->compaction_cond);
+    pthread_mutex_unlock(&lsmt->compaction_mutex);
+
+    /* Invoke memtable flush callback */
+    uint64_t end_ts = get_monotonic_time_ms();
+    if (lsmt->memtable_flush_callback) {
+      uint64_t duration_ms = end_ts - start_ts;
+
+      lsmt->memtable_flush_callback(lsmt->callback_user_data,
+          get_unix_epoch(), duration_ms, metadata.total_bytes);
+    }
+
+    /* Notify the pool that this thread is finished */
+    pthread_mutex_lock(&lsmt->thread_pool_mutex);
+    pthread_cond_broadcast(&lsmt->thread_pool_cond);
+    pthread_mutex_unlock(&lsmt->thread_pool_mutex);
+  }
+  return NULL;
+}
+
+static sst_metadata_record_t memtable_to_disk(lsmt_t *lsmt,
+    sl_t *memtable, uint8_t *result_code) {
+  *result_code = 0;
 
   node_t *node = memtable->bottom_level->next;
   if (node == NULL) {
-    // memtable is empty 
-    sl_release(memtable);
-    return NULL;
+    *result_code = 1;
+    return (sst_metadata_record_t){0};
   }
 
   sst_file_paths_t files = new_sstable_filename(lsmt->db_path);
@@ -283,6 +460,12 @@ static void *dump_to_disk(void *arg) {
     perror("Failed to open db file!");
     exit(1);
   }
+
+  /* Preallocate SIZE_THRESHOLD file size. */
+  posix_fallocate(fileno(fp), 0, SIZE_THRESHOLD);
+
+  /* 1MB buffer for fwrite */
+  setvbuf(fp, NULL, _IOFBF, 1024 * 1024);
 
   uint64_t offset = 0;
   sl_uint128_t min_key = node->key; 
@@ -331,7 +514,6 @@ static void *dump_to_disk(void *arg) {
       capacity = new_cap;
     }
 
-
     memcpy(buf, &node->key, sizeof(sl_uint128_t));
     memcpy(buf + sizeof(sl_uint128_t), data, buf_size - sizeof(sl_uint128_t));
 
@@ -369,66 +551,81 @@ static void *dump_to_disk(void *arg) {
 
   index_flush(index, files.index_file); 
   index_free(index);
-  sl_release(memtable);
 
   sst_metadata_record_t metadata = create_sst_metadata(0, 0, offset, min_key, max_key, files.sst_file, files.index_file);
   free(files.sst_file);
   free(files.index_file);
- 
-  pthread_mutex_lock(&lsmt->metadata_lock);
-  metadata.id = lsmt->sstable_id++;
 
-  sst_metadata_add(lsmt->metadata, metadata);
-  sst_metadata_flush(lsmt->metadata);
+  return metadata;
+}
 
-  pthread_mutex_unlock(&lsmt->metadata_lock);
+static void *compaction_daemon(void *arg) {
+  lsmt_t *lsmt = (lsmt_t *)arg;
+  while (1) {
+    pthread_mutex_lock(&lsmt->compaction_mutex);
+    while (!lsmt->compaction_needed && !lsmt->stop_compaction) {
+      pthread_cond_wait(&lsmt->compaction_cond, &lsmt->compaction_mutex);
+    }
 
-  sst_compact(lsmt->metadata, lsmt->db_path, &lsmt->metadata_lock);
-/*
-  size_t total_size = memtable->size + sizeof(sl_t);
-  printf("levels: %ld\n", memtable->levels);
-  printf("allocated memory: %ld bytes (~ %.3f KB, %.3f MB)\n", total_size, (double)total_size/(1 << 10), (double)total_size/(1 << 20)); 
-  printf("generated SSTable at %s; %ld bytes (~ %.3f KB, %.3f MB)\n", sst_file, offset, (double)offset/(1 << 10), (double)offset/(1 << 20));
-  printf("generated index at %s; %ld bytes (~ %.3f KB, %.3f MB)\n", idx_file, offset, (double)offset/(1 << 10), (double)offset/(1 << 20));
-  */
+    if (lsmt->stop_compaction) {
+      pthread_mutex_unlock(&lsmt->compaction_mutex);
+      break;
+    }
+
+    lsmt->compaction_needed = false;
+    pthread_mutex_unlock(&lsmt->compaction_mutex);
+
+    sst_compact(lsmt, lsmt->metadata, lsmt->db_path, &lsmt->metadata_lock);
+  }
   return NULL;
 }
 
-
 static int ensureDir(const char *dir)
 {
-    int rv;
-    struct stat sb;
-    rv = stat(dir, &sb);
-    if (rv == -1) {
-        if (errno == ENOENT) {
-            rv = mkdir(dir, 0700);
-            if (rv != 0) {
-                printf("error: create directory '%s': %s", dir,
-                       strerror(errno));
-                return 1;
-            }
-        } else {
-            printf("error: stat directory '%s': %s", dir, strerror(errno));
-            return 1;
-        }
+  int rv;
+  struct stat sb;
+  rv = stat(dir, &sb);
+  if (rv == -1) {
+    if (errno == ENOENT) {
+      rv = mkdir(dir, 0700);
+      if (rv != 0) {
+        printf("error: create directory '%s': %s", dir,
+            strerror(errno));
+        return 1;
+      }
     } else {
-        if ((sb.st_mode & S_IFMT) != S_IFDIR) {
-            printf("error: path '%s' is not a directory", dir);
-            return 1;
-        }
+      printf("error: stat directory '%s': %s", dir, strerror(errno));
+      return 1;
     }
-    return 0;
+  } else {
+    if ((sb.st_mode & S_IFMT) != S_IFDIR) {
+      printf("error: path '%s' is not a directory", dir);
+      return 1;
+    }
+  }
+  return 0;
 }
 
 lsmt_t *lsmt_init(const char *db_path) {
   lsmt_t *db = malloc(sizeof(lsmt_t));
   db->last_index = NULL;
   db->memtable = sl_init();
-  if (pthread_mutex_init(&db->memtable_lock, NULL) != 0) {
+  db->immutable_count = 0;
+  db->flush_active = false;
+
+  for (int i = 0; i < MAX_IMMUTABLES; i++) {
+    db->immutables[i] = NULL;
+  }
+
+  pthread_rwlockattr_t attr;
+  pthread_rwlockattr_init(&attr);
+  pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+
+  if (pthread_rwlock_init(&db->memtable_rwlock, &attr) != 0) {
     perror("LSMT INIT memtable_lock.");
     exit(1);
   }
+  pthread_rwlockattr_destroy(&attr);
 
   db->db_path = strdup(db_path);
 
@@ -443,33 +640,92 @@ lsmt_t *lsmt_init(const char *db_path) {
     perror("LSMT INIT");
     exit(1);
   }
+  if (pthread_mutex_init(&db->metadata_write_lock, NULL) != 0) {
+    perror("LSMT INIT metadata_write_lock");
+    exit(1);
+  }
+  db->metadata_generation = 0;
+  db->disk_generation = 0;
+
+  pthread_mutex_init(&db->thread_pool_mutex, NULL);
+  pthread_cond_init(&db->thread_pool_cond, NULL);
+  db->active_background_threads = 0;
+
+  /* Initialize callbacks to NULL */
+  db->compaction_callback = NULL;
+  db->memtable_flush_callback = NULL;
+  db->callback_user_data = NULL;
+
+  /* Initialize compaction daemon thread and synchronization primitives */
+  db->stop_compaction = false;
+  db->compaction_needed = false;
+  if (pthread_mutex_init(&db->compaction_mutex, NULL) != 0) {
+    perror("LSMT INIT compaction_mutex");
+    exit(1);
+  }
+  if (pthread_cond_init(&db->compaction_cond, NULL) != 0) {
+    perror("LSMT INIT compaction_cond");
+    exit(1);
+  }
+  if (pthread_create(&db->compaction_thread, NULL, compaction_daemon, db) != 0) {
+    perror("LSMT INIT compaction_thread");
+    exit(1);
+  }
 
   return db;
 }
 
 void lsmt_flush(lsmt_t *lsmt) {
-  pthread_mutex_lock(&lsmt->memtable_lock);
-  for(size_t i = 0; i < thread_idx; i++) {
-    pthread_join(thread_pool[i], NULL);
-  }
-  thread_idx = 0;
-
-  dump_task_t *task_args = malloc(sizeof(dump_task_t));
-  task_args->lsmt = lsmt;
-  task_args->memtable = lsmt->memtable;
-
-  dump_to_disk(task_args);
+  pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
+  sl_t *memtable_to_flush = lsmt->memtable;
+  lsmt->immutables[lsmt->immutable_count++] = memtable_to_flush;
   lsmt->memtable = sl_init();
-  pthread_mutex_unlock(&lsmt->memtable_lock);
+  pthread_rwlock_unlock(&lsmt->memtable_rwlock);
+
+  pthread_mutex_lock(&lsmt->thread_pool_mutex);
+  bool need_spawn = false;
+  if (lsmt->active_background_threads == 0) {
+    lsmt->active_background_threads = 1;
+    need_spawn = true;
+  }
+  pthread_mutex_unlock(&lsmt->thread_pool_mutex);
+
+  if (need_spawn) {
+    pthread_t t;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&t, &attr, dump_to_disk, lsmt);
+    pthread_attr_destroy(&attr);
+  }
+
+  /* Wait for all background threads to finish. */
+  pthread_mutex_lock(&lsmt->thread_pool_mutex);
+  while (lsmt->active_background_threads > 0) {
+    pthread_cond_wait(&lsmt->thread_pool_cond, &lsmt->thread_pool_mutex);
+  }
+  pthread_mutex_unlock(&lsmt->thread_pool_mutex);
 }
 
 void lsmt_free(lsmt_t *lsmt) {
   if (lsmt == NULL) return;
+
+  /* Stop compaction daemon thread */
+  pthread_mutex_lock(&lsmt->compaction_mutex);
+  lsmt->stop_compaction = true;
+  pthread_cond_signal(&lsmt->compaction_cond);
+  pthread_mutex_unlock(&lsmt->compaction_mutex);
+
+  pthread_join(lsmt->compaction_thread, NULL);
+  pthread_mutex_destroy(&lsmt->compaction_mutex);
+  pthread_cond_destroy(&lsmt->compaction_cond);
+
   if (lsmt->last_index != NULL) index_free(lsmt->last_index);
   if (lsmt->metadata) sst_metadata_free(lsmt->metadata); 
   if (lsmt->db_path) free(lsmt->db_path);
   pthread_mutex_destroy(&lsmt->metadata_lock);
-  pthread_mutex_destroy(&lsmt->memtable_lock);
+  pthread_mutex_destroy(&lsmt->metadata_write_lock);
+  pthread_rwlock_destroy(&lsmt->memtable_rwlock);
 
   free(lsmt);
 }
@@ -477,31 +733,52 @@ void lsmt_free(lsmt_t *lsmt) {
 int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size) {
   if (lsmt == NULL || lsmt->memtable == NULL) return -1;
 
-  if (lsmt->memtable->size > SIZE_THRESHOLD) {
-    pthread_mutex_lock(&lsmt->memtable_lock);
-    //dump content to disk in a new thread.
-    dump_task_t *task_args = malloc(sizeof(dump_task_t));
-    task_args->lsmt = lsmt;
+  bool need_spawn = false;
 
-    /* Transfering ownership. */
-    task_args->memtable = lsmt->memtable;
-    
+  pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
+  while (lsmt->memtable->size > SIZE_THRESHOLD && lsmt->immutable_count >= MAX_IMMUTABLES) {
 
-    if (thread_idx < POOL_SIZE) {
-      pthread_create(&thread_pool[thread_idx++], NULL, dump_to_disk, task_args);
-    }
-    else {
-      for(size_t i = 0; i < thread_idx; i++) {
-        pthread_join(thread_pool[i], NULL);
-      }
-      thread_idx = 0;
-      pthread_create(&thread_pool[thread_idx++], NULL, dump_to_disk, task_args);
+    pthread_rwlock_unlock(&lsmt->memtable_rwlock);
+    pthread_mutex_lock(&lsmt->thread_pool_mutex);
+
+    if (lsmt->immutable_count >= MAX_IMMUTABLES) {
+      pthread_cond_wait(&lsmt->thread_pool_cond, &lsmt->thread_pool_mutex);
     }
 
-    lsmt->memtable = sl_init();
-    pthread_mutex_unlock(&lsmt->memtable_lock);
+    pthread_mutex_unlock(&lsmt->thread_pool_mutex);
+    pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
   }
+
+  if (lsmt->memtable->size > SIZE_THRESHOLD) {
+    /* Register immutable memtable. */
+    sl_t *old_memtable = lsmt->memtable;
+    lsmt->immutables[lsmt->immutable_count++] = old_memtable;
+    lsmt->memtable = sl_init();
+
+    pthread_mutex_lock(&lsmt->thread_pool_mutex);
+    if (lsmt->active_background_threads == 0) {
+      lsmt->active_background_threads = 1;
+      need_spawn = true;
+    }
+
+    pthread_mutex_unlock(&lsmt->thread_pool_mutex);
+  }
+
   int rv = sl_insert(lsmt->memtable, key, content, size);
+  pthread_rwlock_unlock(&lsmt->memtable_rwlock);
+
+  if (need_spawn) {
+    /* dump content to disk in a new thread. */
+    pthread_t t;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    /* Create a detached Threads */
+    pthread_create(&t, &attr, dump_to_disk, lsmt);
+    pthread_attr_destroy(&attr);
+  }
+
   return rv;
 }
 
@@ -594,7 +871,7 @@ lsmt_iterator_t lsmt_iterator_create(lsmt_t *lsmt) {
   it.active = true;
 
   pthread_mutex_lock(&lsmt->metadata_lock);
-  pthread_mutex_lock(&lsmt->memtable_lock);
+  pthread_rwlock_rdlock(&lsmt->memtable_rwlock);
 
   /* Initialize Memtable Iterator. */
   if (lsmt->memtable && lsmt->memtable->size > 0) {
@@ -626,25 +903,26 @@ lsmt_iterator_t lsmt_iterator_create(lsmt_t *lsmt) {
     it.sst_list.count = 0;
   }
 
-  pthread_mutex_unlock(&lsmt->memtable_lock);
+  pthread_rwlock_unlock(&lsmt->memtable_rwlock);
   pthread_mutex_unlock(&lsmt->metadata_lock);
   return it;
 }
 
 void lsmt_iterator_close(lsmt_iterator_t *it) {
-  if (it && it->active) {
+  if (!it) return;
 
-    if (it->sl_count > 0 && it->sl_its) {
-      for (size_t i = 0; i < it->sl_count; i++) {
-        wr_sl_iterator_close(&it->sl_its[i]);
-      }
-      free(it->sl_its);
-      it->sl_its = NULL;
+
+  if (it->sl_count > 0 && it->sl_its) {
+    for (size_t i = 0; i < it->sl_count; i++) {
+      wr_sl_iterator_close(&it->sl_its[i]);
     }
-
-    sst_k_iterators_close(&it->sst_list);
-    it->active = false;
+    free(it->sl_its);
+    it->sl_its = NULL;
+    it->sl_count = 0;
   }
+
+  sst_k_iterators_close(&it->sst_list);
+  it->active = false;
 }
 
 void lsmt_iterator_seek(lsmt_iterator_t *it, sl_uint128_t start, sl_uint128_t end) {
@@ -669,7 +947,9 @@ kv_raw_record_t lsmt_iterator_next(lsmt_iterator_t *it) {
   /* Peek Memtable. */
   kv_raw_record_t *mem_rec = NULL;
   if (it->sl_count > 0) {
+    pthread_rwlock_rdlock(&it->lsmt->memtable_rwlock);
     wr_sl_ensure_buffered(&it->sl_its[0]);
+    pthread_rwlock_unlock(&it->lsmt->memtable_rwlock);
     if (it->sl_its[0].buffered_record.valid) {
       mem_rec = &it->sl_its[0].buffered_record;
     }
@@ -717,3 +997,8 @@ kv_raw_record_t lsmt_iterator_next(lsmt_iterator_t *it) {
 
   return result;
 }
+
+const char *lsmt_version(void) {
+  return "v1.2.0-20260615";
+}
+

@@ -1,0 +1,10 @@
+build/
+libs/
+include/lsmt/
+include/uv/
+include/raft/
+deps/lsmt/build/
+deps/libuv/.libs/
+deps/raft/.libs/
+*.o
+*.a

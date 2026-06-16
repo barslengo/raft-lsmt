@@ -1,0 +1,57 @@
+# Dichiariamo una variabile (Anchor) con la mappa del cluster.
+# Usiamo i nomi dei container (node1, node2, node3) come se fossero IP.
+x-cluster-nodes: &cluster_nodes "1,node1:9000,7000;2,node2:9000,7000;3,node3:9000,7000"
+
+services:
+  node1:
+    build: .
+    hostname: node1
+    environment:
+      NODE_ID: 1
+      CLUSTER_NODES: *cluster_nodes
+    volumes:
+      - node1_data:/data
+    ports:
+      - "7001:7000"   # Mappa la porta WRITE (PC_Host:Container)
+      - "11001:11000" # Mappa la porta READ
+    networks:
+      - raft_net
+
+  node2:
+    build: .
+    hostname: node2
+    environment:
+      NODE_ID: 2
+      CLUSTER_NODES: *cluster_nodes
+    volumes:
+      - node2_data:/data
+    ports:
+      - "7002:7000"
+      - "11002:11000"
+    networks:
+      - raft_net
+
+  node3:
+    build: .
+    hostname: node3
+    environment:
+      NODE_ID: 3
+      CLUSTER_NODES: *cluster_nodes
+    volumes:
+      - node3_data:/data
+    ports:
+      - "7003:7000"
+      - "11003:11000"
+    networks:
+      - raft_net
+
+# I volumi persistono i log di Raft e le tue SSTable
+volumes:
+  node1_data:
+  node2_data:
+  node3_data:
+
+# Crea una rete privata virtuale per farli comunicare tra loro
+networks:
+  raft_net:
+    driver: bridge

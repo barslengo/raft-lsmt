@@ -19,9 +19,9 @@ typedef struct sst_metadata_record {
   uint64_t total_bytes;
   sl_uint128_t min_key;
   sl_uint128_t max_key;
-  index_t *cached_index;
   bool old;
-  FILE *fp; //file pointer to the sst file.
+  index_t *cached_index;
+  pthread_mutex_t index_lock;
   atomic_int refcount;
 } sst_metadata_record_t;
 
@@ -70,6 +70,7 @@ typedef struct sst_iterator {
   bool active;
   uint64_t current_offset;
   sst_metadata_record_t *meta;
+  FILE *fp;
   sl_uint128_t start_key;
   sl_uint128_t end_key;
 
@@ -115,6 +116,8 @@ void sst_metadata_record_retain(sst_metadata_record_t *meta);
 
 int sst_metadata_free(sst_metadata_t *sst_meta);
 int sst_metadata_flush(sst_metadata_t *sst_meta);
+int sst_metadata_copy_records(sst_metadata_t *sst_meta, sst_metadata_record_t **records_out, int *count_out, uint8_t *version_out, uint8_t *highest_tier_out);
+int sst_metadata_write_records(sst_metadata_t *sst_meta, sst_metadata_record_t *records, int count, uint8_t version, uint8_t highest_tier);
 int sst_metadata_add(sst_metadata_t *sst_meta, sst_metadata_record_t record); 
 sst_metadata_record_t *sst_metadata_pop(sst_metadata_t *sst_meta, uint8_t tier);
 sst_metadata_record_t create_sst_metadata(uint64_t id, uint32_t level, uint64_t size, sl_uint128_t min_key, sl_uint128_t max_key, char* sst_path, char *index_path);

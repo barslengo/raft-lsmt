@@ -10,5 +10,6 @@ typedef struct sl_uint128 {
 
 
 uint64_t get_unix_epoch();
+uint64_t get_monotonic_time_ms();
 
 #endif

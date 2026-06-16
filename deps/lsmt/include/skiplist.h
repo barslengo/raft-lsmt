@@ -1,6 +1,7 @@
 #ifndef SKIPLIST_H
 #define SKIPLIST_H
 
+#include <stdbool.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include "utils.h"
