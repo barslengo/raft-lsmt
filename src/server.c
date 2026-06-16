@@ -536,7 +536,7 @@ static void background_query_cb(uv_work_t *req) {
   sl_uint128_t max_key = { .id = 1, .timestamp = 0 };
 
   /*
-   * If the request has been idle for more than 8 seconds, then skip the search
+   * If the request has been idle for more than 32 seconds, then skip the search
    * and respond back.
    */
   if (t_iter_start - task->t_start_ns > 32000000000ULL) {
@@ -777,23 +777,6 @@ static int FsmApply(struct raft_fsm *fsm,
         data_ptr + sizeof(uint32_t) + sizeof(sl_uint128_t), 
         record_value_size);
 
-    /*
-       uint32_t value_size = *((uint32_t *)(f->insert_cmd.record_value + sizeof(uint8_t)));
-       printf("insert: key=%lu %lu, record_length=%u, value_type=%u, value_size=%u, value_content: \n[",
-       f->insert_cmd.record_key.id,
-       f->insert_cmd.record_key.timestamp,
-       record_value_size,
-       f->insert_cmd.record_value[0],
-       value_size);
-
-       uint32_t value_offset = record_value_size - value_size;
-       for (uint32_t i = record_value_size-1; i >= value_offset; i--) {
-       printf(" %02x", f->insert_cmd.record_value[i]);
-       }
-       printf("]\n\n");
-       fflush(stdout);
-       */
-
     int e = lsmt_insert(db, f->insert_cmd.record_key,
         f->insert_cmd.record_value, 
         record_value_size);
@@ -964,20 +947,13 @@ static void serverTimerCloseCb(struct uv_handle_s *handle)
 }
 
 static void serverApplyCb(struct raft_apply *req, int status, void *result);
-
 static bool process_insert_buffer(client_t *client);
-
-
-// Helper function to safely close and free a client's resources
-
 
 // Callback that fires after a client's handle is fully closed
 static void on_client_close(uv_handle_t *handle) {
   client_t *client = (client_t *)handle->data;
   client_release(client);
 }
-
-
 
 static void on_ack_write_complete(uv_write_t *req, int status) {
   ack_write_t *wr = (ack_write_t *)req;
@@ -1049,7 +1025,7 @@ static void batch_buffer_flush(struct Server *s, client_t *c) {
   /* Reset Batch State */
   ins_ctx->batch_offset = 0;
   ins_ctx->batched_req_count = 0;
-  memset(ins_ctx->batch_buffer, 0, ins_ctx->buffer_capacity); // Optional: clear buffer for debug
+  memset(ins_ctx->batch_buffer, 0, ins_ctx->buffer_capacity);
 }
 
 // Libuv callback to allocate memory for an incoming client read
@@ -1171,11 +1147,6 @@ static bool process_insert_buffer(client_t *client) {
             total_msg_len);
         ins_ctx->batch_offset += total_msg_len;
         ins_ctx->batched_req_count++;
-
-        /* Stats. */
-        //s->stats.total_received++;
-
-        //printf("[MSG BATCHED] payload_len=%u\n", total_msg_len);
       } else {
         Logf(s->id, "Error: Message too large for batch buffer (%u > %u)", 
             total_msg_len, ins_ctx->buffer_capacity);
@@ -1271,7 +1242,6 @@ static void on_client_query(uv_stream_t *stream, ssize_t nread, const uv_buf_t *
 
   if (nread > 0) {
     if (client->buffer_len + nread > client->buffer_cap) {
-      // Logic to prevent infinite growth or handle OOM could go here
       size_t new_cap = (client->buffer_len + nread) * 2;
       char *new_buf = realloc(client->buffer, new_cap);
       if (!new_buf) {
@@ -1359,16 +1329,13 @@ static int client_uv_init(struct Server *s, uv_tcp_t *tcp_handle,
   rv = uv_tcp_bind(tcp_handle, (const struct sockaddr*)&addr, 0);
   if (rv != 0) {
     Logf(s->id, "uv_tcp_bind(): %s", uv_strerror(rv));
-    // Add proper cleanup here if other handles were init'd
     return -1;
-    //goto err;
   }
 
   rv = uv_listen((uv_stream_t*)tcp_handle, 128, on_connection);
   if (rv != 0) {
     Logf(s->id, "uv_listen(): %s", uv_strerror(rv));
     return -2;
-    //goto err;
   }
   Logf(s->id, "TCP server listening on port %d", port);
   return 0;
@@ -1403,7 +1370,6 @@ static void setup_high_level_stats(struct Server * s, const char *path) {
 
   s->stats.total_requests = 0;
   s->stats.total_bytes = 0;
-  //s->stats.total_received = 0;
   s->stats.period_latency_sum = 0;
   s->stats.period_batches_count = 0; 
   
@@ -1428,7 +1394,6 @@ static void setup_storage_events_file(struct Server *s, const char *path) {
   fprintf(s->storage_events_file, ",bytes_flushed\n");
   fflush(s->storage_events_file);
   
-  /* Initialize buffer */
   s->storage_events_count = 0;
 }
 
@@ -1463,13 +1428,6 @@ static int ServerInit(struct Server *s,
   timespec_get(&now, TIME_UTC);
   srandom((unsigned)(now.tv_nsec ^ now.tv_sec));
 
-  /* Allocate the batch request buffer. */
-  /*
-     s->batch_buffer = calloc(BATCH_SIZE, sizeof(insert_cmd_t));
-     s->batch_offset = 0;
-     s->batched_req_count = 0;
-     s->buffer_capacity = BATCH_SIZE * sizeof(insert_cmd_t);
-     */
   s->loop = loop;
   s->last_state = -1;
 
@@ -1507,7 +1465,6 @@ static int ServerInit(struct Server *s,
   s->id = id;
   s->active_queries_count = 0;
 
-  /* Render the address. */
   strcpy(s->address, node_config->raft_address);
 
   /* Initialize and start the engine, using the libuv-based I/O backend. */
@@ -1543,11 +1500,9 @@ static int ServerInit(struct Server *s,
   raft_set_pre_vote(&s->raft, true);
   raft_set_capacity_threshold(&s->raft, 0);
 
-  raft_set_election_timeout(&s->raft, 4000);   // 5 Seconds
-  raft_set_heartbeat_timeout(&s->raft, 500);   // 0.5 Seconds
+  raft_set_election_timeout(&s->raft, 4000);  //Ms
+  raft_set_heartbeat_timeout(&s->raft, 500);  //Ms
 
-  /* Allow more data in flight to fill. 
-   * With 4KB batches, 256 entries = 1MB of in-flight data. */
   raft_set_max_inflight_entries(&s->raft, 128);
 
   s->transfer.data = s;
@@ -1762,7 +1717,7 @@ static void statsTimerCb(uv_timer_t *timer)
   s->stats.period_latency_sum = 0;
   s->stats.period_batches_count = 0;
   
-  /* Flush storage events periodically (every 10 seconds = 100 * 100ms) */
+  /* Flush storage events periodically. */
   static uint64_t last_storage_flush = 0;
   if (now - last_storage_flush >= STORAGE_EVENTS_METRICS_FLUSH_TIME) {
     storage_events_flush(s);
@@ -1773,7 +1728,6 @@ static void statsTimerCb(uv_timer_t *timer)
   latency_buffer_init(&s->latency_buffer);
 }
 
-/* Called periodically every APPLY_RATE milliseconds. */
 /* Start the example server. */
 static int ServerStart(struct Server *s)
 {
@@ -1804,7 +1758,6 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
 {
   s->close_cb = cb;
   Log(s->id, "stopping");
-  //lsmt_free(s->db);
 
   /* Close the timer asynchronously if it was successfully
    * initialized. Otherwise invoke the callback immediately. */
@@ -1854,12 +1807,6 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
   }
   Log(s->id, "Shutted down.");
 }
-
-/********************************************************************
- *
- * Top-level main loop.
- *
- ********************************************************************/
 
 static void mainServerCloseCb(struct Server *server)
 {
