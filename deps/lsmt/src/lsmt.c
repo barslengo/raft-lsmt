@@ -23,7 +23,6 @@
 
 #define SIZE_THRESHOLD (16 * 1024 * 1024)
 
-#define POOL_SIZE 1 
 #define ZERO_LEVEL_MAX_SIZE (4 * 16 * 1024 * 1024) //maximum size for level 0 sstables.
 #define SSTABLE_MERGE_LIMIT 4 //maximum number of sstable to merge
 
@@ -55,6 +54,8 @@ static const size_t index_block_size = 4 * 1024; // 4KB
 static const uint8_t RECORD_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t) + sizeof(uint32_t);
 
 static void *dump_to_disk(void *arg);
+static sst_metadata_record_t memtable_to_disk(lsmt_t *lsmt, sl_t *memtable,
+    uint8_t *result_code);
 static void *compaction_daemon(void *arg);
 
 typedef struct dump_task {
@@ -337,6 +338,24 @@ static int sst_compact(lsmt_t *lsmt, sst_metadata_t *sst_meta, const char *db_pa
   return 0;
 }
 
+static void unregister_immutable_memtable(lsmt_t *lsmt, sl_t *memtable) {
+    pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
+    for (int i = 0; i < lsmt->immutable_count; i++) {
+      if (lsmt->immutables[i] == memtable) {
+        for (int j = i; j < lsmt->immutable_count - 1; j++) {
+          lsmt->immutables[j] = lsmt->immutables[j+1];
+        }
+        lsmt->immutable_count--;
+        break;
+      }
+    }
+    pthread_rwlock_unlock(&lsmt->memtable_rwlock);
+    sl_release(memtable);
+
+    lsmt->flush_active = false;
+}
+
+/* Serialize all the immutable memtables to disk. */
 static void *dump_to_disk(void *arg) {
   lsmt_t *lsmt = (lsmt_t *)arg;
 
@@ -344,6 +363,7 @@ static void *dump_to_disk(void *arg) {
     sl_t *memtable = NULL;
 
     pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
+
     if (lsmt->immutable_count > 0) {
       memtable = lsmt->immutables[0];
     } else {
@@ -361,130 +381,18 @@ static void *dump_to_disk(void *arg) {
     uint64_t start_ts = get_monotonic_time_ms();
     lsmt->flush_active = true;
 
-    node_t *node = memtable->bottom_level->next;
-    if (node == NULL) {
-      pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
-      for (int i = 0; i < lsmt->immutable_count; i++) {
-        if (lsmt->immutables[i] == memtable) {
-          for (int j = i; j < lsmt->immutable_count - 1; j++) {
-            lsmt->immutables[j] = lsmt->immutables[j+1];
-          }
-          lsmt->immutable_count--;
-          break;
-        }
-      }
-      pthread_rwlock_unlock(&lsmt->memtable_rwlock);
-      sl_release(memtable);
+    uint8_t write_result = 0;
+    sst_metadata_record_t metadata = memtable_to_disk(lsmt, memtable, &write_result);
 
-      lsmt->flush_active = false;
+    /* On write error shift the immutable list by one and skip to the next. */
+    if (write_result != 0) {
+      unregister_immutable_memtable(lsmt, memtable);
 
       pthread_mutex_lock(&lsmt->thread_pool_mutex);
       pthread_cond_broadcast(&lsmt->thread_pool_cond);
       pthread_mutex_unlock(&lsmt->thread_pool_mutex);
       continue;
     }
-
-    sst_file_paths_t files = new_sstable_filename(lsmt->db_path);
-    FILE *fp = fopen(files.sst_file, "wb");
-    if (!fp) {
-      perror("Failed to open db file!");
-      exit(1);
-    }
-
-    /* Preallocate SIZE_THRESHOLD file size. */
-    posix_fallocate(fileno(fp), 0, SIZE_THRESHOLD);
-
-    /* 1MB buffer for fwrite */
-    setvbuf(fp, NULL, _IOFBF, 1024 * 1024);
-
-    uint64_t offset = 0;
-    sl_uint128_t min_key = node->key; 
-    sl_uint128_t max_key = min_key;
-
-    uint8_t *buf = NULL;
-    size_t capacity = 256;
-
-    buf = malloc(capacity);
-    if (!buf) {
-      perror("malloc on dumping sst to disk");
-      exit(1);
-    }
-
-    index_t *index = index_init(1024);
-    bool first_record = true;
-    size_t current_block_size = 0;
-    while(node != NULL) {
-      /*Add index_block. */
-      if (first_record || current_block_size == 0) {
-        if (index_add(index, node->key, offset) != 0) {
-          fprintf(stderr, "Failed to add index entry\n");
-          exit(1);
-        }
-        first_record = false;
-      }
-
-      uint8_t *data = (uint8_t*)node->content;
-
-      uint32_t record_content_size;
-      memcpy(&record_content_size, data + sizeof(uint8_t), sizeof(uint32_t));
-
-      size_t buf_size = RECORD_HEADER_SIZE + record_content_size;
-
-      /* grow buffer if needed */
-      if (buf_size > capacity) {
-        size_t new_cap = buf_size * 2;
-        uint8_t *tmp = realloc(buf, new_cap);
-        if (!tmp) {
-          perror("realloc buffer for kv record dump.");
-          free(buf);
-          fclose(fp);
-          exit(1);
-        }
-        buf = tmp;
-        capacity = new_cap;
-      }
-
-      memcpy(buf, &node->key, sizeof(sl_uint128_t));
-      memcpy(buf + sizeof(sl_uint128_t), data, buf_size - sizeof(sl_uint128_t));
-
-      if (fwrite(buf, buf_size, 1, fp) != 1) {
-        perror("Failed to write kv record to disk");
-        free(buf);
-        exit(1);
-      }
-
-      offset += buf_size; 
-      current_block_size += buf_size;
-
-      if (current_block_size >= index_block_size) {
-        current_block_size = 0;
-      }
-
-      max_key = node->key;
-      node = node->next;
-    }
-
-    if (fflush(fp) != 0) {
-      perror("Failed to flush memtable.");
-      fclose(fp);
-      exit(1);
-    }
-
-    if (fsync(fileno(fp)) != 0) {
-      perror("Failed to dump memtable to disk.");
-      fclose(fp);
-      exit(1);
-    }
-
-    fclose(fp);
-    free(buf);
-
-    index_flush(index, files.index_file); 
-    index_free(index);
-
-    sst_metadata_record_t metadata = create_sst_metadata(0, 0, offset, min_key, max_key, files.sst_file, files.index_file);
-    free(files.sst_file);
-    free(files.index_file);
 
     sst_metadata_record_t *records = NULL;
     int count = 0;
@@ -511,21 +419,7 @@ static void *dump_to_disk(void *arg) {
     pthread_mutex_unlock(&lsmt->metadata_write_lock);
     free(records);
 
-    /* Unregister the immutable memtable. */
-    pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
-    for (int i = 0; i < lsmt->immutable_count; i++) {
-      if (lsmt->immutables[i] == memtable) {
-        for (int j = i; j < lsmt->immutable_count - 1; j++) {
-          lsmt->immutables[j] = lsmt->immutables[j+1];
-        }
-        lsmt->immutable_count--;
-        break;
-      }
-    }
-    pthread_rwlock_unlock(&lsmt->memtable_rwlock);
-    sl_release(memtable);
-
-    lsmt->flush_active = false;
+    unregister_immutable_memtable(lsmt, memtable);
 
     /* Signal the compaction daemon thread to run compaction */
     pthread_mutex_lock(&lsmt->compaction_mutex);
@@ -539,7 +433,7 @@ static void *dump_to_disk(void *arg) {
       uint64_t duration_ms = end_ts - start_ts;
 
       lsmt->memtable_flush_callback(lsmt->callback_user_data,
-          get_unix_epoch(), duration_ms, offset);
+          get_unix_epoch(), duration_ms, metadata.total_bytes);
     }
 
     /* Notify the pool that this thread is finished */
@@ -548,6 +442,121 @@ static void *dump_to_disk(void *arg) {
     pthread_mutex_unlock(&lsmt->thread_pool_mutex);
   }
   return NULL;
+}
+
+static sst_metadata_record_t memtable_to_disk(lsmt_t *lsmt,
+    sl_t *memtable, uint8_t *result_code) {
+  *result_code = 0;
+
+  node_t *node = memtable->bottom_level->next;
+  if (node == NULL) {
+    *result_code = 1;
+    return (sst_metadata_record_t){0};
+  }
+
+  sst_file_paths_t files = new_sstable_filename(lsmt->db_path);
+  FILE *fp = fopen(files.sst_file, "wb");
+  if (!fp) {
+    perror("Failed to open db file!");
+    exit(1);
+  }
+
+  /* Preallocate SIZE_THRESHOLD file size. */
+  posix_fallocate(fileno(fp), 0, SIZE_THRESHOLD);
+
+  /* 1MB buffer for fwrite */
+  setvbuf(fp, NULL, _IOFBF, 1024 * 1024);
+
+  uint64_t offset = 0;
+  sl_uint128_t min_key = node->key; 
+  sl_uint128_t max_key = min_key;
+
+  uint8_t *buf = NULL;
+  size_t capacity = 256;
+
+  buf = malloc(capacity);
+  if (!buf) {
+    perror("malloc on dumping sst to disk");
+    exit(1);
+  }
+
+  index_t *index = index_init(1024);
+  bool first_record = true;
+  size_t current_block_size = 0;
+  while(node != NULL) {
+    /*Add index_block. */
+    if (first_record || current_block_size == 0) {
+      if (index_add(index, node->key, offset) != 0) {
+        fprintf(stderr, "Failed to add index entry\n");
+        exit(1);
+      }
+      first_record = false;
+    }
+
+    uint8_t *data = (uint8_t*)node->content;
+
+    uint32_t record_content_size;
+    memcpy(&record_content_size, data + sizeof(uint8_t), sizeof(uint32_t));
+
+    size_t buf_size = RECORD_HEADER_SIZE + record_content_size;
+
+    /* grow buffer if needed */
+    if (buf_size > capacity) {
+      size_t new_cap = buf_size * 2;
+      uint8_t *tmp = realloc(buf, new_cap);
+      if (!tmp) {
+        perror("realloc buffer for kv record dump.");
+        free(buf);
+        fclose(fp);
+        exit(1);
+      }
+      buf = tmp;
+      capacity = new_cap;
+    }
+
+    memcpy(buf, &node->key, sizeof(sl_uint128_t));
+    memcpy(buf + sizeof(sl_uint128_t), data, buf_size - sizeof(sl_uint128_t));
+
+    if (fwrite(buf, buf_size, 1, fp) != 1) {
+      perror("Failed to write kv record to disk");
+      free(buf);
+      exit(1);
+    }
+
+    offset += buf_size; 
+    current_block_size += buf_size;
+
+    if (current_block_size >= index_block_size) {
+      current_block_size = 0;
+    }
+
+    max_key = node->key;
+    node = node->next;
+  }
+
+  if (fflush(fp) != 0) {
+    perror("Failed to flush memtable.");
+    fclose(fp);
+    exit(1);
+  }
+
+  if (fsync(fileno(fp)) != 0) {
+    perror("Failed to dump memtable to disk.");
+    fclose(fp);
+    exit(1);
+  }
+
+  fclose(fp);
+  free(buf);
+
+  index_flush(index, files.index_file); 
+  index_free(index);
+
+  sst_metadata_record_t metadata = create_sst_metadata(0, 0, offset, min_key, max_key, files.sst_file, files.index_file);
+  free(files.sst_file);
+  free(files.index_file);
+
+  return metadata;
 }
 
 static void *compaction_daemon(void *arg) {
@@ -570,8 +579,6 @@ static void *compaction_daemon(void *arg) {
   }
   return NULL;
 }
-
-
 
 static int ensureDir(const char *dir)
 {
@@ -730,6 +737,7 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
 
   pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
   while (lsmt->memtable->size > SIZE_THRESHOLD && lsmt->immutable_count >= MAX_IMMUTABLES) {
+
     pthread_rwlock_unlock(&lsmt->memtable_rwlock);
     pthread_mutex_lock(&lsmt->thread_pool_mutex);
 
@@ -742,6 +750,7 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
   }
 
   if (lsmt->memtable->size > SIZE_THRESHOLD) {
+    /* Register immutable memtable. */
     sl_t *old_memtable = lsmt->memtable;
     lsmt->immutables[lsmt->immutable_count++] = old_memtable;
     lsmt->memtable = sl_init();
@@ -751,13 +760,15 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
       lsmt->active_background_threads = 1;
       need_spawn = true;
     }
+
     pthread_mutex_unlock(&lsmt->thread_pool_mutex);
   }
+
   int rv = sl_insert(lsmt->memtable, key, content, size);
   pthread_rwlock_unlock(&lsmt->memtable_rwlock);
 
   if (need_spawn) {
-    //dump content to disk in a new thread.
+    /* dump content to disk in a new thread. */
     pthread_t t;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
