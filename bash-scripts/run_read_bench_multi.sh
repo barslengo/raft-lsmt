@@ -7,7 +7,7 @@ ROUTING_STRATEGY="hash"
 DATA_DIST="uniform"
 MAX_KEY=5000000
 RANGE_SIZE=10
-THREAD_POOL_SIZE=64
+THREAD_POOL_SIZE=16
 BATCH_SIZE=32
 KEY_START_BASE=1
 
@@ -26,7 +26,7 @@ show_help() {
     echo "  -d, --dist      <dist>   Query key distribution: sequential, uniform, zipfian (default: uniform)"
     echo "  -k, --max-key   <num>    Maximum key ID existing in the database (default: 5000000)"
     echo "  -g, --range     <num>    How many keys to fetch per query (default: 10)"
-    echo "  -t, --threads   <num>    Thread pool size for concurrent requests per worker (default: 64)"
+    echo "  -t, --threads   <num>    Thread pool size for concurrent requests per worker (default: 16)"
     echo "  -b, --batch     <num>    Query request batch size per worker (default: 32)"
     echo "  --key-start     <num>    Start of the key range (default: 1)"
     echo "  -h, --help               Show this help message"

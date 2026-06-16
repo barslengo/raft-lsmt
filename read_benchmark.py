@@ -292,7 +292,7 @@ def main():
                         help="Query key distribution strategy")
     parser.add_argument("--max-key", type=int, default=5000000, help="The maximum key ID existing in the database")
     parser.add_argument("--range-size", type=int, default=10, help="How many keys to fetch per query (Range Size)")
-    parser.add_argument("--thread-pool-size", type=int, default=64, help="Thread pool size for concurrent I/O requests")
+    parser.add_argument("--thread-pool-size", type=int, default=16, help="Thread pool size for concurrent I/O requests")
     parser.add_argument("--batch-size", type=int, default=32, help="Number of query requests to batch together")
     
     parser.add_argument("--key-start", type=int, default=1, help="Start of the key range (inclusive)")
