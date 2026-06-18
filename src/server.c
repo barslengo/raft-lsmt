@@ -10,7 +10,7 @@
 #include <lsmt/lsmt.h>
 
 #define APPLY_RATE 1000 /* Store new statistic entry every 1000 ms. */
-#define GLOBAL_MAX_QUERIES 128 // Limite massimo di query simultanee nel server
+#define GLOBAL_MAX_QUERIES 256 // Limite massimo di query simultanee nel server
 #define STORAGE_EVENTS_METRICS_FLUSH_TIME (8 * 1000) //dump to disk every 8 seconds.
 #define MAX_LATENCY_SAMPLES 2000 /* Max samples for latency distribution */
 #define STORAGE_EVENT_BUFFER_SIZE 8192 /* Buffer size for storage events */
@@ -1827,7 +1827,7 @@ static void mainSigintCb(struct uv_signal_s *handle, int signum)
 
 int main(int argc, char *argv[])
 {
-  setvbuf(stdout, NULL, _IOLBF, 0);
+  //setvbuf(stdout, NULL, _IOLBF, 0);
   setvbuf(stderr, NULL, _IONBF, 0);
   memset(ACK_BUFFER, 1, BATCH_SIZE);
 
@@ -1916,6 +1916,8 @@ err:
  * Safely sends the memory buffer via the TCP socket.
  */
 static void after_query_cb(uv_work_t *req, int status) {
+  static uint64_t profile_count = 0;
+
   query_task_t *task = (query_task_t *)req->data;
   client_t *client = task->client;
   struct Server *s = task->client->server;
@@ -1927,11 +1929,15 @@ static void after_query_cb(uv_work_t *req, int status) {
     if (send_response(client, task->response_msg, task->total_msg_size) != 0) {
       printf("FAILED SEND QUERY RESPONSE.\n");
     } else {
-      double send_us = (uv_hrtime() - t_send_start) / 1000.0;
-      double total_ms = (uv_hrtime() - task->t_start_ns) / 1000000.0;
+      profile_count++;
 
-      printf("[Profile] Reqs: 1 | Records: %lu | Total: %.3f ms | Iter: %lu us | Send: %.0f us\n", 
-          task->records_count, total_ms, task->t_iter_us, send_us);
+      if ((profile_count % 10000) == 0) {
+        double send_us = (uv_hrtime() - t_send_start) / 1000.0;
+        double total_ms = (uv_hrtime() - task->t_start_ns) / 1000000.0;
+
+        printf("[Profile] Reqs: 1 | Records: %lu | Total: %.3f ms | Iter: %lu us | Send: %.0f us\n", 
+            task->records_count, total_ms, task->t_iter_us, send_us);
+      }
     }
   } else {
     // If the client closed while the thread was running, free the buffer manually

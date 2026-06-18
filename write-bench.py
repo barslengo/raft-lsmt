@@ -156,9 +156,9 @@ def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key
     batch_buffer = []
     buffer_size = 8192
 
-    stop_event = threading.Event()
-    reporter_thread = threading.Thread(target=throughput_reporter, args=(stop_event,), daemon=True)
-    reporter_thread.start()
+    #stop_event = threading.Event()
+    #reporter_thread = threading.Thread(target=throughput_reporter, args=(stop_event,), daemon=True)
+    #reporter_thread.start()
 
     base_ts = int(time.time() * 1000) * 100 + (worker_id % 100)
     stream = record_stream(requests, data_dist, key_start, key_end, base_ts)
@@ -168,7 +168,7 @@ def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key
         batch_buffer.append(record)
         total_processed += 1
 
-        if total_processed % 1_000_000 == 0:
+        if total_processed % 5_000_000 == 0:
             timestamp = time.strftime('%H:%M:%S')
             print(f"[{timestamp}] Progress: {total_processed:,} records queued and flying...")
 
@@ -182,7 +182,7 @@ def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key
             batch_buffer = []
             
             # Throttle if there are too many in-flight request futures
-            if len(futures) > 256:
+            if len(futures) > 512:
                 print("Throttling ...")
                 done, not_done = wait(futures, return_when=FIRST_COMPLETED)
                 for f in done:
@@ -212,8 +212,9 @@ def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key
             except Exception as e:
                 print(f"[Error] Trailing batch failed: {e}")
 
-    stop_event.set()
-    reporter_thread.join()
+    #stop_event.set()
+    #reporter_thread.join()
+    """
 
     global total_acked_records, total_acked_bytes, first_request_time, last_ack_time
 
@@ -230,6 +231,7 @@ def bench(dbclient: DbClient, data_dist: str, requests: int, key_start: int, key
     else:
         print("No metrics recorded or time was too short.")
 
+    """
     dbclient.disconnect()
 
 def main():
@@ -283,8 +285,8 @@ def main():
         thread_pool_size=3,
         batch_size=8192,
         write_timeout=10.0,
-        read_timeout=10.0,
-        write_cb=write_batch_cb
+        read_timeout=10.0#,
+        #write_cb=write_batch_cb
     )
 
     db_client = DbClient(client_config, router)

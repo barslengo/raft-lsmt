@@ -141,6 +141,30 @@ class TestReadBenchmark(unittest.TestCase):
         self.assertIn("READ BENCHMARK COMPLETED", result.stdout)
         self.assertIn("Total Records read:  1,250", result.stdout)
 
+    def test_benchmark_range_routing(self):
+        cmd = [
+            "python3",
+            "read_benchmark.py",
+            "--config", self.config_file,
+            "--requests", "50",
+            "--routing-strategy", "range",
+            "--data-dist", "uniform",
+            "--max-key", "1000",
+            "--range-size", "5",
+            "--batch-size", "8"
+        ]
+        
+        print(f"Running range routing command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        
+        print("Subprocess STDOUT:")
+        print(result.stdout)
+        print("Subprocess STDERR:")
+        print(result.stderr)
+        
+        self.assertEqual(result.returncode, 0, f"Range routing benchmark failed with code {result.returncode}")
+        self.assertIn("READ BENCHMARK COMPLETED", result.stdout)
+
     def test_priority_thread_pool_executor(self):
         from client.dbclient import PriorityThreadPoolExecutor
         import threading

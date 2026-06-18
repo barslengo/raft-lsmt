@@ -82,6 +82,13 @@ class TestRoundRobinRoutingStrategy(unittest.TestCase):
         self.assertEqual(n6.cluster_name, "C")
         self.assertEqual(n6.id, 7)
 
+        # Test query routing: should query all 3 clusters
+        from client.db_datatypes import QueryRequest
+        q = QueryRequest(min_id=1, min_ts=0, max_id=10, max_ts=0)
+        query_nodes = strategy.get_node_query(q, leader_registry, clusters)
+        self.assertEqual(len(query_nodes), 3)
+        self.assertEqual({n.cluster_name for n in query_nodes}, {"A", "B", "C"})
+
 class TestHashRoutingStrategy(unittest.TestCase):
     def test_hash_routing_uses_id_and_timestamp(self):
         nodes_a = [Node("A", 1, "127.0.0.1", 18091)]
@@ -105,6 +112,13 @@ class TestHashRoutingStrategy(unittest.TestCase):
         self.assertIn(n1, [nodes_a[0], nodes_b[0]])
         self.assertIn(n2, [nodes_a[0], nodes_b[0]])
 
+        # Test query routing: should query all clusters
+        from client.db_datatypes import QueryRequest
+        q = QueryRequest(min_id=1, min_ts=0, max_id=10, max_ts=0)
+        query_nodes = strategy.get_node_query(q, leader_registry, clusters)
+        self.assertEqual(len(query_nodes), 2)
+        self.assertEqual({n.cluster_name for n in query_nodes}, {"A", "B"})
+
 class TestLeaderRoutingStrategy(unittest.TestCase):
     def test_leader_routing_returns_leader(self):
         nodes_a = [
@@ -124,6 +138,72 @@ class TestLeaderRoutingStrategy(unittest.TestCase):
         n1 = strategy.get_node_insert(r1, leader_registry, clusters)
         # Should return the registered leader (node 2) instead of a random node
         self.assertEqual(n1.id, 2)
+
+        # Test query routing: should query all clusters
+        from client.db_datatypes import QueryRequest
+        q = QueryRequest(min_id=1, min_ts=0, max_id=10, max_ts=0)
+        query_nodes = strategy.get_node_query(q, leader_registry, clusters)
+        self.assertEqual(len(query_nodes), 1)
+        self.assertEqual({n.cluster_name for n in query_nodes}, {"A"})
+
+class TestRangeRoutingStrategy(unittest.TestCase):
+    def test_range_routing(self):
+        # 3 clusters A, B, C with max_keyspace=300
+        # Cluster A should get keys <= 100
+        # Cluster B should get keys 101 to 200
+        # Cluster C should get keys 201 to inf
+        nodes_a = [Node("A", 1, "127.0.0.1", 18091)]
+        nodes_b = [Node("B", 2, "127.0.0.1", 18092)]
+        nodes_c = [Node("C", 3, "127.0.0.1", 18093)]
+        clusters = {"A": nodes_a, "B": nodes_b, "C": nodes_c}
+        
+        leader_registry = LeaderRegistry()
+        leader_registry.set_leader(nodes_a[0])
+        leader_registry.set_leader(nodes_b[0])
+        leader_registry.set_leader(nodes_c[0])
+        
+        from client.routing_strats import RangeRoutingStrategy
+        strategy = RangeRoutingStrategy(max_keyspace=300)
+        
+        # Test get_node_insert
+        # key 50 -> A
+        n = strategy.get_node_insert(Record(key_id=50, timestamp=0, content=""), leader_registry, clusters)
+        self.assertEqual(n.cluster_name, "A")
+        # key 150 -> B
+        n = strategy.get_node_insert(Record(key_id=150, timestamp=0, content=""), leader_registry, clusters)
+        self.assertEqual(n.cluster_name, "B")
+        # key 250 -> C
+        n = strategy.get_node_insert(Record(key_id=250, timestamp=0, content=""), leader_registry, clusters)
+        self.assertEqual(n.cluster_name, "C")
+        
+        # Test get_node_query range overlaps
+        from client.db_datatypes import QueryRequest
+        # Query: min_id=10, max_id=50 -> overlap with A only
+        q = QueryRequest(min_id=10, min_ts=0, max_id=50, max_ts=0)
+        nodes = strategy.get_node_query(q, leader_registry, clusters)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].cluster_name, "A")
+        
+        # Query: min_id=50, max_id=150 -> overlap with A and B
+        q = QueryRequest(min_id=50, min_ts=0, max_id=150, max_ts=0)
+        nodes = strategy.get_node_query(q, leader_registry, clusters)
+        self.assertEqual(len(nodes), 2)
+        names = {n.cluster_name for n in nodes}
+        self.assertEqual(names, {"A", "B"})
+        
+        # Query: min_id=150, max_id=250 -> overlap with B and C
+        q = QueryRequest(min_id=150, min_ts=0, max_id=250, max_ts=0)
+        nodes = strategy.get_node_query(q, leader_registry, clusters)
+        self.assertEqual(len(nodes), 2)
+        names = {n.cluster_name for n in nodes}
+        self.assertEqual(names, {"B", "C"})
+        
+        # Query: min_id=10, max_id=250 -> overlap with A, B, C
+        q = QueryRequest(min_id=10, min_ts=0, max_id=250, max_ts=0)
+        nodes = strategy.get_node_query(q, leader_registry, clusters)
+        self.assertEqual(len(nodes), 3)
+        names = {n.cluster_name for n in nodes}
+        self.assertEqual(names, {"A", "B", "C"})
 
 if __name__ == "__main__":
     unittest.main()
