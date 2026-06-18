@@ -453,11 +453,20 @@ class DbClient:
             future.set_result({})
             return future
             
-        nodes = self.router.get_nodes_for_read(queries[0])
+        # Map each node to the list of queries it needs to handle, and their original index
+        node_queries = defaultdict(list)
+        for idx, query in enumerate(queries):
+            nodes = self.router.get_nodes_for_read(query)
+            for node in nodes:
+                node_queries[node].append((idx, query))
+                
         futures = []
-        for node in nodes:
-            future = self.io_pool.submit(self._query_batch_single_node, node, queries, skip_records)
+        future_to_info = {}
+        for node, query_pairs in node_queries.items():
+            sub_queries = [q for _, q in query_pairs]
+            future = self.io_pool.submit(self._query_batch_single_node, node, sub_queries, skip_records)
             futures.append(future)
+            future_to_info[future] = (node, query_pairs)
 
         def _aggregate():
             results = {}
@@ -480,7 +489,7 @@ class DbClient:
                         
                         # Check if this is a pagination future or an initial batch future
                         if future in pagination_tracker:
-                            n, idx, expected_req_id = pagination_tracker[future]
+                            n, idx, orig_query_idx, expected_req_id = pagination_tracker[future]
                             # A pagination future returns (node, page_response, net_start, net_end)
                             node, page_response, net_start, net_end = result_tuple
                             
@@ -505,14 +514,14 @@ class DbClient:
                             resp_dict["max_id"] = page_response["max_id"]
                             resp_dict["max_ts"] = page_response["max_ts"]
                             
-                            orig_query = queries[idx]
+                            orig_query = queries[orig_query_idx]
                             # If limit is reached, spawn next page
                             if resp_dict["limit_reached"] and resp_dict["max_id"] < orig_query.max_id:
                                 next_min_id = resp_dict["max_id"] + 1
                                 next_req_id = random.randint(1, 10000000)
                                 page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=orig_query.max_id, max_ts=orig_query.max_ts)
                                 next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=1)
-                                pagination_tracker[next_fut] = (n, idx, next_req_id)
+                                pagination_tracker[next_fut] = (n, idx, orig_query_idx, next_req_id)
                                 active_futures.append(next_fut)
                             else:
                                 resp_dict["limit_reached"] = False
@@ -525,8 +534,12 @@ class DbClient:
                             
                             node_to_accumulated[n] = list(responses)
                             
-                            for idx, resp_dict in enumerate(responses):
-                                orig_query = queries[idx]
+                            # Get the query pairs for this future
+                            node_info = future_to_info[future]
+                            query_pairs = node_info[1]
+                            
+                            for sub_idx, resp_dict in enumerate(responses):
+                                orig_query_idx, orig_query = query_pairs[sub_idx]
                                 
                                 if resp_dict["limit_reached"] and resp_dict["records_count"] == 0:
                                     raise ConnectionError("Server timeout or saturation during initial query: 0 records returned with limit_reached=True")
@@ -539,7 +552,7 @@ class DbClient:
                                     next_req_id = random.randint(1, 10000000)
                                     page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=orig_query.max_id, max_ts=orig_query.max_ts)
                                     next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=1)
-                                    pagination_tracker[next_fut] = (n, idx, next_req_id)
+                                    pagination_tracker[next_fut] = (n, sub_idx, orig_query_idx, next_req_id)
                                     active_futures.append(next_fut)
                                 else:
                                     resp_dict["limit_reached"] = False

@@ -46,25 +46,43 @@ class RangeRoutingStrategy(RoutingStrategy):
     def get_node_query(self,
                        query: QueryRequest,
                        leader_registry: LeaderRegistry,
-                       clusters: Dict[str, List[Node]]) -> List[Node]:
-        
-        # Per le query di range, manteniamo lo Scatter-Gather interrogando 
-        # un follower per ogni cluster (come nelle altre strategie).
-        nodes_to_query = []
-        for cluster_name, nodes in clusters.items():
-            leader = leader_registry.get_leader(cluster_name)
-            selected_node = None
-            for node in nodes:
-                if node != leader:
-                    selected_node = node
-                    break
+                       clusters: Dict[str, List[Node]]) -> List[Node]: 
+        cluster_names = sorted(list(clusters.keys()))
+        num_clusters = len(cluster_names)
+        if num_clusters == 0:
+            return []
             
-            if not selected_node and nodes:
-                selected_node = nodes[0]
+        chunk_size = math.ceil(self.max_keyspace / num_clusters)
+        
+        nodes_to_query = []
+        for idx, cluster_name in enumerate(cluster_names):
+            # Determinazione dei limiti dell'intervallo per questo cluster idx
+            if idx == 0:
+                low = float('-inf')
+            else:
+                low = idx * chunk_size + 1
                 
-            if selected_node:
-                nodes_to_query.append(selected_node)
+            if idx == num_clusters - 1:
+                high = float('inf')
+            else:
+                high = (idx + 1) * chunk_size
                 
+            # Verifica se c'è sovrapposizione tra [query.min_id, query.max_id] e [low, high]
+            if query.min_id <= high and query.max_id >= low:
+                nodes = clusters[cluster_name]
+                leader = leader_registry.get_leader(cluster_name)
+                selected_node = None
+                for node in nodes:
+                    if node != leader:
+                        selected_node = node
+                        break
+                
+                if not selected_node and nodes:
+                    selected_node = nodes[0]
+                    
+                if selected_node:
+                    nodes_to_query.append(selected_node)
+                    
         return nodes_to_query
 
 class HashRoutingStrategy(RoutingStrategy):
