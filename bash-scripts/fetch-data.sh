@@ -8,7 +8,7 @@ show_help() {
     echo "Usage: $0 [options]"
     echo ""
     echo "Options:"
-    echo "  -p, --prefix <name>   Folder name prefix (default: stats-folder)"
+    echo "  -p, --prefix <name>   Folder name prefix or exact existing folder (default: stats-folder)"
     echo "  -m, --minutes <num>   Minutes limit to search for recent CSV files (default: 10)"
     echo "  -h, --help            Show this help message"
     echo ""
@@ -45,12 +45,17 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-# Genera un timestamp nel formato YYYYMMDD_HHMMSS
-TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-TARGET_DIR="${PREFIX}-${TIMESTAMP}"
-
-echo "=== Creazione cartella: $TARGET_DIR ==="
-mkdir -p "$TARGET_DIR"
+# Controllo se la cartella passata in input esiste già
+if [[ -d "$PREFIX" ]]; then
+    TARGET_DIR="$PREFIX"
+    echo "=== Cartella '$TARGET_DIR' trovata. Uso quella esistente. ==="
+else
+    # Se non esiste, la consideriamo un prefisso e generiamo il timestamp
+    TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+    TARGET_DIR="${PREFIX}-${TIMESTAMP}"
+    echo "=== Creazione cartella: $TARGET_DIR ==="
+    mkdir -p "$TARGET_DIR"
+fi
 
 # Impostazioni di connessione
 REMOTE_USER="Garavagliaadmin"

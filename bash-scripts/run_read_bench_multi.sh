@@ -7,10 +7,11 @@ ROUTING_STRATEGY="hash"
 DATA_DIST="uniform"
 MAX_KEY=5000000
 RANGE_SIZE=10
-THREAD_POOL_SIZE=16
+THREAD_POOL_SIZE=2
 BATCH_SIZE=32
 KEY_START_BASE=1
 GLOBAL_KEYSPACE="false"
+BATCH_JITTER=0.0
 
 # Auto-detect cores
 CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
@@ -29,6 +30,7 @@ show_help() {
     echo "  -g, --range     <num>    How many keys to fetch per query (default: 10)"
     echo "  -t, --threads   <num>    Thread pool size for concurrent requests per worker (default: 16)"
     echo "  -b, --batch     <num>    Query request batch size per worker (default: 32)"
+    echo "  -j, --jitter    <sec>    Max random batch jitter sleep in seconds (default: 0.0)"
     echo "  --key-start     <num>    Start of the key range (default: 1)"
     echo "  --global-keyspace        All workers share the same global key range (default: false)"
     echo "  -h, --help               Show this help message"
@@ -122,6 +124,14 @@ while [[ "$#" -gt 0 ]]; do
             GLOBAL_KEYSPACE="true"
             shift 1
             ;;
+        -j|--jitter)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Option $1 requires an argument."
+                exit 1
+            fi
+            BATCH_JITTER="$2"
+            shift 2
+            ;;
         -h|--help)
             show_help
             exit 0
@@ -147,6 +157,7 @@ echo "Thread Pool Size     : $THREAD_POOL_SIZE"
 echo "Batch Size           : $BATCH_SIZE"
 echo "Key Start Base       : $KEY_START_BASE"
 echo "Global Keyspace      : $GLOBAL_KEYSPACE"
+echo "Batch Jitter         : $BATCH_JITTER"
 echo "=========================================================="
 
 # Compute requests and key range per worker
@@ -199,7 +210,8 @@ for i in $(seq 0 $((WORKERS - 1))); do
         --thread-pool-size "$THREAD_POOL_SIZE" \
         --batch-size "$BATCH_SIZE" \
         --key-start "$KEY_START" \
-        --key-end "$KEY_END" &
+        --key-end "$KEY_END" \
+        --batch-jitter "$BATCH_JITTER" &
         
     pids+=($!)
 done
