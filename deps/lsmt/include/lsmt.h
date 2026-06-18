@@ -8,7 +8,7 @@
 
 #define LSMT_TYPE_INT 1
 #define LSMT_TYPE_STRING 2
-#define MAX_IMMUTABLES 16
+#define MAX_IMMUTABLES 32
 
 /* Callback types for storage events */
 typedef void (*lsmt_compaction_callback_t)(void *user_data, uint64_t ts,
@@ -51,6 +51,13 @@ typedef struct lsmt {
   pthread_cond_t compaction_cond;
   bool compaction_needed;
   bool stop_compaction;
+
+  /* Flush daemon thread and synchronization primitives */
+  pthread_t flush_thread;
+  pthread_mutex_t flush_mutex;
+  pthread_cond_t flush_cond;
+  bool flush_needed;
+  bool stop_flush;
 } lsmt_t;
 
 typedef struct wrapper_sl_it {

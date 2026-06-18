@@ -53,7 +53,7 @@ static const size_t index_block_size = 4 * 1024; // 4KB
 /* key + type + content_length. */
 static const uint8_t RECORD_HEADER_SIZE = sizeof(sl_uint128_t) + sizeof(uint8_t) + sizeof(uint32_t);
 
-static void *dump_to_disk(void *arg);
+static void *flush_daemon(void *arg);
 static sst_metadata_record_t memtable_to_disk(lsmt_t *lsmt, sl_t *memtable,
     uint8_t *result_code);
 static void *compaction_daemon(void *arg);
@@ -139,9 +139,14 @@ static sst_metadata_record_t sst_merge(lsmt_t *lsmt, sst_metadata_record_t *reco
   kv_raw_record_t *rec;
   size_t bytes_written_since_sleep = 0; 
 
+  size_t records_processed = 0;
   while ((rec = sst_k_iterators_next(&set_it)) != NULL) {
-    while (lsmt->flush_active || lsmt->immutable_count > 0) {
-      usleep(10000);
+    records_processed++;
+    if (records_processed >= 4096) {
+      records_processed = 0;
+      while (lsmt->flush_active || lsmt->immutable_count > 0) {
+        usleep(10000);
+      }
     }
     if (first) {
       min_key = rec->key;
@@ -178,6 +183,9 @@ static sst_metadata_record_t sst_merge(lsmt_t *lsmt, sst_metadata_record_t *reco
     exit(1);
   }
 
+  if (ftruncate(fileno(new_file), offset) != 0) {
+    perror("Failed to truncate merged sstable file");
+  }
   fclose(new_file);
   sst_k_iterators_close(&set_it);
 
@@ -355,91 +363,104 @@ static void unregister_immutable_memtable(lsmt_t *lsmt, sl_t *memtable) {
     lsmt->flush_active = false;
 }
 
-/* Serialize all the immutable memtables to disk. */
-static void *dump_to_disk(void *arg) {
+/* Serialize all the immutable memtables to disk in a persistent daemon thread. */
+static void *flush_daemon(void *arg) {
   lsmt_t *lsmt = (lsmt_t *)arg;
 
   while (1) {
-    sl_t *memtable = NULL;
-
-    pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
-
-    if (lsmt->immutable_count > 0) {
-      memtable = lsmt->immutables[0];
-    } else {
-      pthread_mutex_lock(&lsmt->thread_pool_mutex);
-      lsmt->active_background_threads = 0;
-      pthread_cond_broadcast(&lsmt->thread_pool_cond);
-      pthread_mutex_unlock(&lsmt->thread_pool_mutex);
+    pthread_mutex_lock(&lsmt->flush_mutex);
+    while (!lsmt->flush_needed && !lsmt->stop_flush) {
+      pthread_cond_wait(&lsmt->flush_cond, &lsmt->flush_mutex);
     }
-    pthread_rwlock_unlock(&lsmt->memtable_rwlock);
-
-    if (memtable == NULL) {
+    if (lsmt->stop_flush) {
+      pthread_mutex_unlock(&lsmt->flush_mutex);
       break;
     }
+    lsmt->flush_needed = false;
+    pthread_mutex_unlock(&lsmt->flush_mutex);
 
-    uint64_t start_ts = get_monotonic_time_ms();
-    lsmt->flush_active = true;
+    while (1) {
+      sl_t *memtable = NULL;
 
-    uint8_t write_result = 0;
-    sst_metadata_record_t metadata = memtable_to_disk(lsmt, memtable, &write_result);
+      pthread_rwlock_wrlock(&lsmt->memtable_rwlock);
 
-    /* On write error shift the immutable list by one and skip to the next. */
-    if (write_result != 0) {
+      if (lsmt->immutable_count > 0) {
+        memtable = lsmt->immutables[0];
+      } else {
+        pthread_mutex_lock(&lsmt->thread_pool_mutex);
+        lsmt->active_background_threads = 0;
+        pthread_cond_broadcast(&lsmt->thread_pool_cond);
+        pthread_mutex_unlock(&lsmt->thread_pool_mutex);
+      }
+      pthread_rwlock_unlock(&lsmt->memtable_rwlock);
+
+      if (memtable == NULL) {
+        break;
+      }
+
+      uint64_t start_ts = get_monotonic_time_ms();
+      lsmt->flush_active = true;
+
+      uint8_t write_result = 0;
+      sst_metadata_record_t metadata = memtable_to_disk(lsmt, memtable, &write_result);
+
+      /* On write error shift the immutable list by one and skip to the next. */
+      if (write_result != 0) {
+        unregister_immutable_memtable(lsmt, memtable);
+
+        pthread_mutex_lock(&lsmt->thread_pool_mutex);
+        pthread_cond_broadcast(&lsmt->thread_pool_cond);
+        pthread_mutex_unlock(&lsmt->thread_pool_mutex);
+        continue;
+      }
+
+      sst_metadata_record_t *records = NULL;
+      int count = 0;
+      uint8_t version = 0;
+      uint8_t highest_tier = 0;
+      uint64_t my_generation = 0;
+
+      pthread_mutex_lock(&lsmt->metadata_lock);
+      metadata.id = lsmt->sstable_id++;
+      sst_metadata_add(lsmt->metadata, metadata);
+      lsmt->metadata_generation++;
+      my_generation = lsmt->metadata_generation;
+      sst_metadata_copy_records(lsmt->metadata, &records, &count, &version, &highest_tier);
+      pthread_mutex_unlock(&lsmt->metadata_lock);
+
+      pthread_mutex_lock(&lsmt->metadata_write_lock);
+      if (my_generation > lsmt->disk_generation) {
+        if (sst_metadata_write_records(lsmt->metadata, records, count, version, highest_tier) != 0) {
+          fprintf(stderr, "Critical Error: Failed to flush metadata in flush_daemon\n");
+          exit(1);
+        }
+        lsmt->disk_generation = my_generation;
+      }
+      pthread_mutex_unlock(&lsmt->metadata_write_lock);
+      free(records);
+
       unregister_immutable_memtable(lsmt, memtable);
 
+      /* Signal the compaction daemon thread to run compaction */
+      pthread_mutex_lock(&lsmt->compaction_mutex);
+      lsmt->compaction_needed = true;
+      pthread_cond_signal(&lsmt->compaction_cond);
+      pthread_mutex_unlock(&lsmt->compaction_mutex);
+
+      /* Invoke memtable flush callback */
+      uint64_t end_ts = get_monotonic_time_ms();
+      if (lsmt->memtable_flush_callback) {
+        uint64_t duration_ms = end_ts - start_ts;
+
+        lsmt->memtable_flush_callback(lsmt->callback_user_data,
+            get_unix_epoch(), duration_ms, metadata.total_bytes);
+      }
+
+      /* Notify the pool that this thread is finished */
       pthread_mutex_lock(&lsmt->thread_pool_mutex);
       pthread_cond_broadcast(&lsmt->thread_pool_cond);
       pthread_mutex_unlock(&lsmt->thread_pool_mutex);
-      continue;
     }
-
-    sst_metadata_record_t *records = NULL;
-    int count = 0;
-    uint8_t version = 0;
-    uint8_t highest_tier = 0;
-    uint64_t my_generation = 0;
-
-    pthread_mutex_lock(&lsmt->metadata_lock);
-    metadata.id = lsmt->sstable_id++;
-    sst_metadata_add(lsmt->metadata, metadata);
-    lsmt->metadata_generation++;
-    my_generation = lsmt->metadata_generation;
-    sst_metadata_copy_records(lsmt->metadata, &records, &count, &version, &highest_tier);
-    pthread_mutex_unlock(&lsmt->metadata_lock);
-
-    pthread_mutex_lock(&lsmt->metadata_write_lock);
-    if (my_generation > lsmt->disk_generation) {
-      if (sst_metadata_write_records(lsmt->metadata, records, count, version, highest_tier) != 0) {
-        fprintf(stderr, "Critical Error: Failed to flush metadata in dump_to_disk\n");
-        exit(1);
-      }
-      lsmt->disk_generation = my_generation;
-    }
-    pthread_mutex_unlock(&lsmt->metadata_write_lock);
-    free(records);
-
-    unregister_immutable_memtable(lsmt, memtable);
-
-    /* Signal the compaction daemon thread to run compaction */
-    pthread_mutex_lock(&lsmt->compaction_mutex);
-    lsmt->compaction_needed = true;
-    pthread_cond_signal(&lsmt->compaction_cond);
-    pthread_mutex_unlock(&lsmt->compaction_mutex);
-
-    /* Invoke memtable flush callback */
-    uint64_t end_ts = get_monotonic_time_ms();
-    if (lsmt->memtable_flush_callback) {
-      uint64_t duration_ms = end_ts - start_ts;
-
-      lsmt->memtable_flush_callback(lsmt->callback_user_data,
-          get_unix_epoch(), duration_ms, metadata.total_bytes);
-    }
-
-    /* Notify the pool that this thread is finished */
-    pthread_mutex_lock(&lsmt->thread_pool_mutex);
-    pthread_cond_broadcast(&lsmt->thread_pool_cond);
-    pthread_mutex_unlock(&lsmt->thread_pool_mutex);
   }
   return NULL;
 }
@@ -546,6 +567,9 @@ static sst_metadata_record_t memtable_to_disk(lsmt_t *lsmt,
     exit(1);
   }
 
+  if (ftruncate(fileno(fp), offset) != 0) {
+    perror("Failed to truncate sstable file");
+  }
   fclose(fp);
   free(buf);
 
@@ -672,6 +696,22 @@ lsmt_t *lsmt_init(const char *db_path) {
     exit(1);
   }
 
+  /* Initialize flush daemon thread and synchronization primitives */
+  db->stop_flush = false;
+  db->flush_needed = false;
+  if (pthread_mutex_init(&db->flush_mutex, NULL) != 0) {
+    perror("LSMT INIT flush_mutex");
+    exit(1);
+  }
+  if (pthread_cond_init(&db->flush_cond, NULL) != 0) {
+    perror("LSMT INIT flush_cond");
+    exit(1);
+  }
+  if (pthread_create(&db->flush_thread, NULL, flush_daemon, db) != 0) {
+    perror("LSMT INIT flush_thread");
+    exit(1);
+  }
+
   return db;
 }
 
@@ -683,21 +723,15 @@ void lsmt_flush(lsmt_t *lsmt) {
   pthread_rwlock_unlock(&lsmt->memtable_rwlock);
 
   pthread_mutex_lock(&lsmt->thread_pool_mutex);
-  bool need_spawn = false;
   if (lsmt->active_background_threads == 0) {
     lsmt->active_background_threads = 1;
-    need_spawn = true;
   }
   pthread_mutex_unlock(&lsmt->thread_pool_mutex);
 
-  if (need_spawn) {
-    pthread_t t;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_create(&t, &attr, dump_to_disk, lsmt);
-    pthread_attr_destroy(&attr);
-  }
+  pthread_mutex_lock(&lsmt->flush_mutex);
+  lsmt->flush_needed = true;
+  pthread_cond_signal(&lsmt->flush_cond);
+  pthread_mutex_unlock(&lsmt->flush_mutex);
 
   /* Wait for all background threads to finish. */
   pthread_mutex_lock(&lsmt->thread_pool_mutex);
@@ -709,6 +743,16 @@ void lsmt_flush(lsmt_t *lsmt) {
 
 void lsmt_free(lsmt_t *lsmt) {
   if (lsmt == NULL) return;
+
+  /* Stop flush daemon thread */
+  pthread_mutex_lock(&lsmt->flush_mutex);
+  lsmt->stop_flush = true;
+  pthread_cond_signal(&lsmt->flush_cond);
+  pthread_mutex_unlock(&lsmt->flush_mutex);
+
+  pthread_join(lsmt->flush_thread, NULL);
+  pthread_mutex_destroy(&lsmt->flush_mutex);
+  pthread_cond_destroy(&lsmt->flush_cond);
 
   /* Stop compaction daemon thread */
   pthread_mutex_lock(&lsmt->compaction_mutex);
@@ -768,15 +812,10 @@ int lsmt_insert(lsmt_t *lsmt, sl_uint128_t key, uint8_t *content, uint32_t size)
   pthread_rwlock_unlock(&lsmt->memtable_rwlock);
 
   if (need_spawn) {
-    /* dump content to disk in a new thread. */
-    pthread_t t;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-
-    /* Create a detached Threads */
-    pthread_create(&t, &attr, dump_to_disk, lsmt);
-    pthread_attr_destroy(&attr);
+    pthread_mutex_lock(&lsmt->flush_mutex);
+    lsmt->flush_needed = true;
+    pthread_cond_signal(&lsmt->flush_cond);
+    pthread_mutex_unlock(&lsmt->flush_mutex);
   }
 
   return rv;
