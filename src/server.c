@@ -171,6 +171,7 @@ typedef struct {
   uint32_t buffer_capacity;     /* Total size of batch_buffer */
   uint32_t batched_req_count;  /* Number of items currently in batch */
   uint64_t batch_start_ts;     /* Timestamp (ms) when first item arrived */
+  bool is_paused;
 } client_insert_ctx_t;
 
 /* Context specific to QUERY clients */
@@ -1105,6 +1106,14 @@ static bool process_insert_buffer(client_t *client) {
   size_t offset = 0;
   client_insert_ctx_t *ins_ctx = &client->ctx.insert;
 
+  if (s->db && s->db->immutable_count >= 24) {
+    if (!ins_ctx->is_paused) {
+      uv_read_stop((uv_stream_t *)&client->handle);
+      ins_ctx->is_paused = true;
+    }
+    return true;
+  }
+
   // Loop as long as we might have a complete message in the buffer
   while (offset + sizeof(uint32_t) <= client->buffer_len) {
 
@@ -1672,6 +1681,14 @@ static void statsTimerCb(uv_timer_t *timer)
 
     // Also flush stale data here
     batch_buffer_flush(s, c);
+
+    // Resume client if paused and LSMT has caught up with flushes
+    if (s->db && s->db->immutable_count < 12 && c->ctx.insert.is_paused) {
+      c->ctx.insert.is_paused = false;
+      uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_client_read);
+      process_insert_buffer(c);
+    }
+
     c = next;
   }
 
