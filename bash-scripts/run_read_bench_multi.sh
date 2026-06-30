@@ -256,11 +256,9 @@ if [ $exit_code -eq 0 ]; then
 import sys
 import os
 import time
-from collections import defaultdict
 
 files = sys.argv[1:]
-data_by_time = defaultdict(list)
-all_timestamps = set()
+all_rows = []
 
 for fpath in files:
     if not os.path.exists(fpath):
@@ -272,58 +270,27 @@ for fpath in files:
             if not line:
                 continue
             parts = line.split(',')
-            if len(parts) < 8:
+            if len(parts) < 6:
                 continue
             try:
-                ts = int(parts[0])
-                total_rec = int(parts[1])
-                total_bytes = int(parts[2])
-                qps_cum = int(parts[3])
-                mb_cum = float(parts[4])
-                avg_l = float(parts[5])
-                p50_l = float(parts[6])
-                p95_l = float(parts[7])
-                data_by_time[ts].append((fpath, total_rec, total_bytes, qps_cum, mb_cum, avg_l, p50_l, p95_l))
-                all_timestamps.add(ts)
+                req_id = int(parts[0])
+                query_id = int(parts[1])
+                send_ts = float(parts[2])
+                recv_ts = float(parts[3])
+                rec_count = int(parts[4])
+                rec_bytes = int(parts[5])
+                all_rows.append((req_id, query_id, send_ts, recv_ts, rec_count, rec_bytes))
             except ValueError:
                 continue
 
-if not all_timestamps:
-    print("No valid throughput metrics found to merge.")
-    sys.exit(0)
-
-sorted_ts = sorted(list(all_timestamps))
-latest_by_file_rec = {}
-latest_by_file_bytes = {}
-latest_by_file_qps = {}
-latest_by_file_mb = {}
-merged_rows = []
-
-for ts in sorted_ts:
-    for fpath, total_rec, total_bytes, qps_cum, mb_cum, avg_l, p50_l, p95_l in data_by_time[ts]:
-        latest_by_file_rec[fpath] = total_rec
-        latest_by_file_bytes[fpath] = total_bytes
-        latest_by_file_qps[fpath] = qps_cum
-        latest_by_file_mb[fpath] = mb_cum
-        
-    sum_total_rec = sum(latest_by_file_rec.values())
-    sum_total_bytes = sum(latest_by_file_bytes.values())
-    sum_qps = sum(latest_by_file_qps.values())
-    sum_mb = sum(latest_by_file_mb.values())
-    
-    # Average latency over workers reporting at this ts
-    active_rows = data_by_time[ts]
-    avg_l_val = sum(r[5] for r in active_rows) / len(active_rows)
-    p50_l_val = sum(r[6] for r in active_rows) / len(active_rows)
-    p95_l_val = sum(r[7] for r in active_rows) / len(active_rows)
-    
-    merged_rows.append((ts, sum_total_rec, sum_total_bytes, sum_qps, sum_mb, avg_l_val, p50_l_val, p95_l_val))
+# Sort chronologically by send timestamp (index 2)
+all_rows.sort(key=lambda r: r[2])
 
 merged_filename = f"read_throughput_merged_{int(time.time())}.csv"
 with open(merged_filename, 'w') as f:
-    f.write("Timestamp,Total_ACKed_Records,Total_ACKed_Bytes,QPS,MBps,Avg_Latency_ms,P50_Latency_ms,P95_Latency_ms\n")
-    for row in merged_rows:
-        f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]:.2f},{row[5]:.2f},{row[6]:.2f},{row[7]:.2f}\n")
+    f.write("Request_ID,Query_ID,Send_Timestamp_ms,Recv_Timestamp_ms,Record_Count,Records_Bytes\n")
+    for row in all_rows:
+        f.write(f"{row[0]},{row[1]},{row[2]:.3f},{row[3]:.3f},{row[4]},{row[5]}\n")
 
 print(f"✅ Merged throughput CSV generated: {merged_filename}")
 EOF

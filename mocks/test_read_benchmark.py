@@ -93,24 +93,22 @@ class TestReadBenchmark(unittest.TestCase):
         self.assertGreater(len(lines), 0, "Generated CSV is empty")
         header = lines[0].strip()
         
-        # Expected header: Timestamp,Total_ACKed_Records,Total_ACKed_Bytes,QPS,MBps,Avg_Latency_ms,P50_Latency_ms,P95_Latency_ms
-        expected_header = "Timestamp,Total_ACKed_Records,Total_ACKed_Bytes,QPS,MBps,Avg_Latency_ms,P50_Latency_ms,P95_Latency_ms"
+        # Expected header: Request_ID,Query_ID,Send_Timestamp_ms,Recv_Timestamp_ms,Record_Count,Records_Bytes
+        expected_header = "Request_ID,Query_ID,Send_Timestamp_ms,Recv_Timestamp_ms,Record_Count,Records_Bytes"
         self.assertEqual(header, expected_header, f"CSV header does not match. Expected '{expected_header}', got '{header}'")
         
         # Check that we have some data rows and they contain numeric values
         if len(lines) > 1:
             data_row = lines[1].strip().split(",")
-            self.assertEqual(len(data_row), 8, "Data row must have exactly 8 values")
+            self.assertEqual(len(data_row), 6, "Data row must have exactly 6 values")
             # Verify they are convertible to numeric types
             try:
-                int(data_row[0])  # Timestamp
-                int(data_row[1])  # Total_ACKed_Records
-                int(data_row[2])  # Total_ACKed_Bytes
-                int(data_row[3])  # QPS
-                float(data_row[4])  # MBps
-                float(data_row[5])  # Avg_Latency_ms
-                float(data_row[6])  # P50_Latency_ms
-                float(data_row[7])  # P95_Latency_ms
+                int(data_row[0])    # Request_ID
+                int(data_row[1])    # Query_ID
+                float(data_row[2])  # Send_Timestamp_ms
+                float(data_row[3])  # Recv_Timestamp_ms
+                int(data_row[4])    # Record_Count
+                int(data_row[5])    # Records_Bytes
             except ValueError as e:
                 self.fail(f"Failed to parse CSV data values: {e}")
 

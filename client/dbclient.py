@@ -11,7 +11,8 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future, wait, FIRST_COMPLETED
 from collections import defaultdict
 from .router import Router
-from .db_datatypes import Node, Record, QueryRequest, BatchMetrics
+from .db_datatypes import Node, Record, QueryRequest, BatchMetrics, ReadRequestMetrics
+
 
 # Protocol constants matching the server
 LSMT_TYPE_INT = 1
@@ -95,6 +96,8 @@ class DbClientConfig:
     write_cb: Callable[[BatchMetrics], None] = None
 
 
+
+
 class DbClient:
     def __init__(self, config: DbClientConfig, router: Router):
         self.config = config
@@ -108,6 +111,7 @@ class DbClient:
         self._buffer_lock = threading.Lock()
         self.clusters: Dict[str, List[Node]] = {}
         self.router = router 
+        self._req_id_counter = itertools.count(1)
 
     # ====================== CONNECTION MANAGEMENT ======================
     def connect(self, clusters: Dict[str, List[Node]]):
@@ -347,15 +351,17 @@ class DbClient:
     def read(self, query: QueryRequest, timeout: Optional[float] = None, skip_records: bool = False) -> Future[Dict[str, Any]]:
         nodes = self.router.get_nodes_for_read(query)
         futures = []
+        initial_req_id = next(self._req_id_counter)
         for node in nodes:
             # Sottomettiamo le letture I/O al pool di rete
-            future = self.io_pool.submit(self._query_single_node, node, query, skip_records)
+            future = self.io_pool.submit(self._query_single_node, node, query, skip_records, initial_req_id)
             futures.append(future)
 
         def _aggregate():
             results = {}
             min_start = float('inf')
             max_end = 0.0
+            batch_request_metrics = []
             
             node_to_accumulated = {}
             pagination_tracker = {}
@@ -383,6 +389,15 @@ class DbClient:
                             if page_response["limit_reached"] and page_response["records_count"] == 0:
                                 raise ConnectionError("Server timeout or saturation during pagination: 0 records returned with limit_reached=True")
 
+                            batch_request_metrics.append(ReadRequestMetrics(
+                                query_id=query.query_id,
+                                req_id=page_response["req_id"],
+                                send_time_ms=net_start,
+                                recv_time_ms=net_end,
+                                record_count=page_response["records_count"],
+                                records_bytes=page_response["records_bytes"]
+                            ))
+
                             resp_dict = node_to_accumulated[n]
                             
                             if page_response["limit_reached"] and page_response["max_id"] < resp_dict["max_id"]:
@@ -397,9 +412,9 @@ class DbClient:
                             
                             if resp_dict["limit_reached"] and resp_dict["max_id"] < query.max_id:
                                 next_min_id = resp_dict["max_id"] + 1
-                                next_req_id = random.randint(1, 1000000)
-                                page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=query.max_id, max_ts=query.max_ts)
-                                next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=1)
+                                next_req_id = next(self._req_id_counter)
+                                page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=query.max_id, max_ts=query.max_ts, query_id=query.query_id)
+                                next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=-1)
                                 pagination_tracker[next_fut] = (n, next_req_id)
                                 active_futures.append(next_fut)
                             else:
@@ -420,11 +435,20 @@ class DbClient:
                             node_to_accumulated[n] = dict(response)
                             resp_dict = node_to_accumulated[n]
                             
+                            batch_request_metrics.append(ReadRequestMetrics(
+                                query_id=query.query_id,
+                                req_id=resp_dict["req_id"],
+                                send_time_ms=net_start,
+                                recv_time_ms=net_end,
+                                record_count=resp_dict["records_count"],
+                                records_bytes=resp_dict["records_bytes"]
+                            ))
+
                             if resp_dict["limit_reached"] and resp_dict["max_id"] < query.max_id:
                                 next_min_id = resp_dict["max_id"] + 1
-                                next_req_id = random.randint(1, 1000000)
-                                page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=query.max_id, max_ts=query.max_ts)
-                                next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=1)
+                                next_req_id = next(self._req_id_counter)
+                                page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=query.max_id, max_ts=query.max_ts, query_id=query.query_id)
+                                next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=-1)
                                 pagination_tracker[next_fut] = (n, next_req_id)
                                 active_futures.append(next_fut)
                             else:
@@ -442,6 +466,7 @@ class DbClient:
                 results[n.cluster_name].append({node_name: (n, response)})
                 
             results["_latency_ms"] = max_end - min_start if max_end > 0 else 0.0
+            results["_request_metrics"] = batch_request_metrics
             return results
             
         # Sottomettiamo l'aggregazione a un pool separato per EVITARE STARVATION!
@@ -453,6 +478,9 @@ class DbClient:
             future.set_result({})
             return future
             
+        # Generate initial req_id for each logical query in the batch
+        initial_req_ids = [next(self._req_id_counter) for _ in queries]
+
         # Map each node to the list of queries it needs to handle, and their original index
         node_queries = defaultdict(list)
         for idx, query in enumerate(queries):
@@ -464,7 +492,8 @@ class DbClient:
         future_to_info = {}
         for node, query_pairs in node_queries.items():
             sub_queries = [q for _, q in query_pairs]
-            future = self.io_pool.submit(self._query_batch_single_node, node, sub_queries, skip_records)
+            sub_req_ids = [initial_req_ids[idx] for idx, _ in query_pairs]
+            future = self.io_pool.submit(self._query_batch_single_node, node, sub_queries, skip_records, sub_req_ids)
             futures.append(future)
             future_to_info[future] = (node, query_pairs)
 
@@ -472,6 +501,7 @@ class DbClient:
             results = {}
             min_start = float('inf')
             max_end = 0.0
+            batch_request_metrics = []
             
             node_to_accumulated = {}
             pagination_tracker = {}
@@ -502,6 +532,15 @@ class DbClient:
                             if page_response["limit_reached"] and page_response["records_count"] == 0:
                                 raise ConnectionError("Server timeout or saturation during pagination: 0 records returned with limit_reached=True")
 
+                            batch_request_metrics.append(ReadRequestMetrics(
+                                query_id=orig_query.query_id,
+                                req_id=page_response["req_id"],
+                                send_time_ms=net_start,
+                                recv_time_ms=net_end,
+                                record_count=page_response["records_count"],
+                                records_bytes=page_response["records_bytes"]
+                            ))
+
                             resp_dict = node_to_accumulated[n][idx]
                             
                             if page_response["limit_reached"] and page_response["max_id"] < resp_dict["max_id"]:
@@ -518,9 +557,9 @@ class DbClient:
                             # If limit is reached, spawn next page
                             if resp_dict["limit_reached"] and resp_dict["max_id"] < orig_query.max_id:
                                 next_min_id = resp_dict["max_id"] + 1
-                                next_req_id = random.randint(1, 10000000)
-                                page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=orig_query.max_id, max_ts=orig_query.max_ts)
-                                next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=1)
+                                next_req_id = next(self._req_id_counter)
+                                page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=orig_query.max_id, max_ts=orig_query.max_ts, query_id=orig_query.query_id)
+                                next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=-1)
                                 pagination_tracker[next_fut] = (n, idx, orig_query_idx, next_req_id)
                                 active_futures.append(next_fut)
                             else:
@@ -547,11 +586,20 @@ class DbClient:
                                 if resp_dict["limit_reached"] and resp_dict["max_id"] < orig_query.min_id:
                                     raise ConnectionError(f"Server returned invalid max_id {resp_dict['max_id']} which is less than query min_id {orig_query.min_id}")
 
+                                batch_request_metrics.append(ReadRequestMetrics(
+                                    query_id=orig_query.query_id,
+                                    req_id=resp_dict["req_id"],
+                                    send_time_ms=net_start,
+                                    recv_time_ms=net_end,
+                                    record_count=resp_dict["records_count"],
+                                    records_bytes=resp_dict["records_bytes"]
+                                ))
+
                                 if resp_dict["limit_reached"] and resp_dict["max_id"] < orig_query.max_id:
                                     next_min_id = resp_dict["max_id"] + 1
-                                    next_req_id = random.randint(1, 10000000)
-                                    page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=orig_query.max_id, max_ts=orig_query.max_ts)
-                                    next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=1)
+                                    next_req_id = next(self._req_id_counter)
+                                    page_query = QueryRequest(min_id=next_min_id, min_ts=0, max_id=orig_query.max_id, max_ts=orig_query.max_ts, query_id=orig_query.query_id)
+                                    next_fut = self.io_pool.submit(self._query_single_node, n, page_query, skip_records, next_req_id, priority=-1)
                                     pagination_tracker[next_fut] = (n, sub_idx, orig_query_idx, next_req_id)
                                     active_futures.append(next_fut)
                                 else:
@@ -570,6 +618,7 @@ class DbClient:
                 results[n.cluster_name].append({node_name: (n, responses)})
                 
             results["_latency_ms"] = max_end - min_start if max_end > 0 else 0.0
+            results["_request_metrics"] = batch_request_metrics
             return results
             
         return self.aggregator_pool.submit(_aggregate)
@@ -590,7 +639,7 @@ class DbClient:
                 net_start = time.time() * 1000
                 sock = None
                 
-                actual_req_id = req_id if req_id is not None else random.randint(1, 1000000)
+                actual_req_id = req_id if req_id is not None else next(self._req_id_counter)
                 start_key = struct.pack("<QQ", query.min_id, query.min_ts)
                 end_key = struct.pack("<QQ", query.max_id, query.max_ts)
                 req_data = struct.pack(QUERY_REQ_FMT, actual_req_id, start_key, end_key)
@@ -639,7 +688,7 @@ class DbClient:
         
         raise RuntimeError(f"Query to cluster {cluster_name} failed after trying {len(preferred_nodes)} nodes. Last error: {last_error}")
 
-    def _query_batch_single_node(self, node: Node, queries: List[QueryRequest], skip_records: bool = False) -> Tuple[Node, List[Dict], float, float]:
+    def _query_batch_single_node(self, node: Node, queries: List[QueryRequest], skip_records: bool = False, req_ids: Optional[List[int]] = None) -> Tuple[Node, List[Dict], float, float]:
         cluster_name = node.cluster_name
         nodes = self.clusters.get(cluster_name, [])
         leader = self.router.leader_registry.get_leader(cluster_name)
@@ -660,9 +709,7 @@ class DbClient:
                 req_id_to_idx = {}
                 
                 for idx, query in enumerate(queries):
-                    req_id = random.randint(1, 10000000)
-                    while req_id in req_id_to_idx:
-                        req_id = random.randint(1, 10000000)
+                    req_id = req_ids[idx] if req_ids is not None else next(self._req_id_counter)
                     req_id_to_idx[req_id] = idx
                     
                     start_key = struct.pack("<QQ", query.min_id, query.min_ts)

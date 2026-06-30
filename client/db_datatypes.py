@@ -19,6 +19,7 @@ class QueryRequest:
     min_ts: int
     max_id: int
     max_ts: int
+    query_id: int = 0
 
 @dataclass(frozen=True)
 class BatchMetrics:
@@ -26,3 +27,13 @@ class BatchMetrics:
     ack_recv_time_ms: int
     record_count: int
     batch_bytes: int
+
+@dataclass(frozen=True)
+class ReadRequestMetrics:
+    query_id: int
+    req_id: int
+    send_time_ms: float
+    recv_time_ms: float
+    record_count: int
+    records_bytes: int
+

@@ -90,14 +90,13 @@ class TestReadBenchmarkMulti(unittest.TestCase):
         self.assertEqual(len(worker_csv_files), 3, f"Expected 3 worker CSV files, found {len(worker_csv_files)}: {worker_csv_files}")
         self.assertEqual(len(merged_csv_files), 1, f"Expected 1 merged CSV file, found {len(merged_csv_files)}: {merged_csv_files}")
         
-        # Check that each file is non-empty and has the correct headers
-        # Expected header: Timestamp,Total_ACKed_Records,Total_ACKed_Bytes,QPS,MBps,Avg_Latency_ms,P50_Latency_ms,P95_Latency_ms
+        # Expected header: Request_ID,Query_ID,Send_Timestamp_ms,Recv_Timestamp_ms,Record_Count,Records_Bytes
         for csv_file in all_csv_files:
             with open(csv_file, "r") as f:
                 lines = f.readlines()
             self.assertGreater(len(lines), 0, f"CSV file {csv_file} is empty")
             header = lines[0].strip()
-            self.assertEqual(header, "Timestamp,Total_ACKed_Records,Total_ACKed_Bytes,QPS,MBps,Avg_Latency_ms,P50_Latency_ms,P95_Latency_ms")
+            self.assertEqual(header, "Request_ID,Query_ID,Send_Timestamp_ms,Recv_Timestamp_ms,Record_Count,Records_Bytes")
 
 if __name__ == "__main__":
     unittest.main()
