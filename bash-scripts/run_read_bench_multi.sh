@@ -12,6 +12,7 @@ BATCH_SIZE=32
 KEY_START_BASE=1
 GLOBAL_KEYSPACE="false"
 BATCH_JITTER=0.0
+OUTPUT_DIR=""
 
 # Auto-detect cores
 CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
@@ -33,6 +34,7 @@ show_help() {
     echo "  -j, --jitter    <sec>    Max random batch jitter sleep in seconds (default: 0.0)"
     echo "  --key-start     <num>    Start of the key range (default: 1)"
     echo "  --global-keyspace        All workers share the same global key range (default: false)"
+    echo "  -o, --output-dir <path>  Path to move all produced CSVs and logs (default: none)"
     echo "  -h, --help               Show this help message"
     echo ""
 }
@@ -132,6 +134,14 @@ while [[ "$#" -gt 0 ]]; do
             BATCH_JITTER="$2"
             shift 2
             ;;
+        -o|--output-dir)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Option $1 requires an argument."
+                exit 1
+            fi
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
         -h|--help)
             show_help
             exit 0
@@ -158,6 +168,7 @@ echo "Batch Size           : $BATCH_SIZE"
 echo "Key Start Base       : $KEY_START_BASE"
 echo "Global Keyspace      : $GLOBAL_KEYSPACE"
 echo "Batch Jitter         : $BATCH_JITTER"
+echo "Output Directory     : ${OUTPUT_DIR:-[current directory]}"
 echo "=========================================================="
 
 # Compute requests and key range per worker
@@ -191,7 +202,7 @@ for i in $(seq 0 $((WORKERS - 1))); do
         fi
     fi
     
-    echo "▶️ Launching Worker $i with range [$KEY_START, $KEY_END] ($WORKER_REQS requests)..."
+    echo "▶️ Launching Worker $i with range [$KEY_START, $KEY_END] ($WORKER_REQS requests) -> logging to log-worker-$i.txt..."
     
     # Run python read_benchmark.py in background
     if [ -f "read_benchmark.py" ]; then
@@ -211,7 +222,7 @@ for i in $(seq 0 $((WORKERS - 1))); do
         --batch-size "$BATCH_SIZE" \
         --key-start "$KEY_START" \
         --key-end "$KEY_END" \
-        --batch-jitter "$BATCH_JITTER" &
+        --batch-jitter "$BATCH_JITTER" > "log-worker-$i.txt" 2>&1 &
         
     pids+=($!)
 done
@@ -301,5 +312,37 @@ else
     echo "=========================================================="
     echo "⚠️ Benchmark completed with errors!"
     echo "=========================================================="
-    exit $exit_code
 fi
+
+if [ -n "$OUTPUT_DIR" ]; then
+    echo "📁 Moving produced files to $OUTPUT_DIR..."
+    mkdir -p "$OUTPUT_DIR"
+    
+    # Move individual CSV files
+    for pid in "${pids[@]}"; do
+        for f in read_throughput_*_"${pid}".csv; do
+            if [ -f "$f" ]; then
+                mv "$f" "$OUTPUT_DIR/"
+            fi
+        done
+    done
+    
+    # Move merged CSV file
+    merged_pattern="read_throughput_merged_*.csv"
+    for f in $merged_pattern; do
+        if [ -f "$f" ]; then
+            mv "$f" "$OUTPUT_DIR/"
+        fi
+    done
+    
+    # Move worker logs
+    for i in $(seq 0 $((WORKERS - 1))); do
+        log_file="log-worker-$i.txt"
+        if [ -f "$log_file" ]; then
+            mv "$log_file" "$OUTPUT_DIR/"
+        fi
+    done
+    echo "✅ Files moved successfully."
+fi
+
+exit $exit_code

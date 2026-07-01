@@ -590,7 +590,7 @@ class DbClient:
                                     query_id=orig_query.query_id,
                                     req_id=resp_dict["req_id"],
                                     send_time_ms=net_start,
-                                    recv_time_ms=net_end,
+                                    recv_time_ms=resp_dict.get("_recv_ts", net_end),
                                     record_count=resp_dict["records_count"],
                                     records_bytes=resp_dict["records_bytes"]
                                 ))
@@ -632,6 +632,9 @@ class DbClient:
         non_leaders = [n for n in nodes if n != leader]
         leader_node = [n for n in nodes if n == leader]
         preferred_nodes = non_leaders + leader_node
+        if node in preferred_nodes:
+            preferred_nodes.remove(node)
+            preferred_nodes.insert(0, node)
         
         last_error = None
         for n in preferred_nodes:
@@ -696,6 +699,9 @@ class DbClient:
         non_leaders = [n for n in nodes if n != leader]
         leader_node = [n for n in nodes if n == leader]
         preferred_nodes = non_leaders + leader_node
+        if node in preferred_nodes:
+            preferred_nodes.remove(node)
+            preferred_nodes.insert(0, node)
         
         last_error = None
         for n in preferred_nodes:
@@ -744,6 +750,7 @@ class DbClient:
                                                     min_id, min_ts, max_id, max_ts,
                                                     records_bytes, records_count, body_data,
                                                     skip_records=skip_records)
+                    resp_dict["_recv_ts"] = time.time() * 1000
                     
                     responses.append(resp_dict)
                 

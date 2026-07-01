@@ -205,5 +205,56 @@ class TestRangeRoutingStrategy(unittest.TestCase):
         names = {n.cluster_name for n in nodes}
         self.assertEqual(names, {"A", "B", "C"})
 
+class TestFollowerRoundRobinQueryRouting(unittest.TestCase):
+    def test_round_robin_selection_among_followers(self):
+        # Cluster A has 3 nodes: leader (node 1), follower (node 2), follower (node 3)
+        nodes_a = [
+            Node("A", 1, "127.0.0.1", 18091),
+            Node("A", 2, "127.0.0.1", 18092),
+            Node("A", 3, "127.0.0.1", 18093),
+        ]
+        clusters = {"A": nodes_a}
+        
+        leader_registry = LeaderRegistry()
+        leader_registry.set_leader(nodes_a[0]) # Node 1 is leader
+        
+        # Test with HashRoutingStrategy
+        from client.routing_strats import HashRoutingStrategy
+        strategy = HashRoutingStrategy()
+        
+        from client.db_datatypes import QueryRequest
+        q = QueryRequest(min_id=1, min_ts=0, max_id=10, max_ts=0)
+        
+        # Call multiple times and assert they alternate
+        # 1st query: should return node 2
+        nodes = strategy.get_node_query(q, leader_registry, clusters)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].id, 2)
+        
+        # 2nd query: should return node 3
+        nodes = strategy.get_node_query(q, leader_registry, clusters)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].id, 3)
+        
+        # 3rd query: should return node 2 again
+        nodes = strategy.get_node_query(q, leader_registry, clusters)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].id, 2)
+
+        # Test with RangeRoutingStrategy
+        from client.routing_strats import RangeRoutingStrategy
+        strategy_range = RangeRoutingStrategy(max_keyspace=100)
+        
+        # 1st query: should return node 2
+        nodes = strategy_range.get_node_query(q, leader_registry, clusters)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].id, 2)
+        
+        # 2nd query: should return node 3
+        nodes = strategy_range.get_node_query(q, leader_registry, clusters)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].id, 3)
+
 if __name__ == "__main__":
     unittest.main()
+

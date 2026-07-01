@@ -2,10 +2,20 @@ import struct
 import hashlib
 import random
 import threading
-from typing import List, Dict
+from typing import List, Dict, Optional
 from .router import RoutingStrategy, LeaderRegistry
 from .db_datatypes import Record, QueryRequest, Node
 import math
+
+def _select_follower_round_robin(cluster_name: str, nodes: List[Node], leader: Optional[Node], indices: Dict[str, int], lock: threading.Lock) -> Optional[Node]:
+    followers = [n for n in nodes if n != leader]
+    if not followers:
+        return leader if leader else (nodes[0] if nodes else None)
+    with lock:
+        idx = indices.get(cluster_name, 0)
+        selected = followers[idx % len(followers)]
+        indices[cluster_name] = (idx + 1) % len(followers)
+        return selected
 
 class RangeRoutingStrategy(RoutingStrategy):
     """
@@ -19,6 +29,8 @@ class RangeRoutingStrategy(RoutingStrategy):
     def __init__(self, max_keyspace: int = 5000000):
         # Definisci il limite massimo di chiavi per calcolare le frazioni
         self.max_keyspace = max_keyspace
+        self._query_indices = {}
+        self._query_lock = threading.Lock()
 
     def get_node_insert(self,
                         record: Record,
@@ -71,15 +83,7 @@ class RangeRoutingStrategy(RoutingStrategy):
             if query.min_id <= high and query.max_id >= low:
                 nodes = clusters[cluster_name]
                 leader = leader_registry.get_leader(cluster_name)
-                selected_node = None
-                for node in nodes:
-                    if node != leader:
-                        selected_node = node
-                        break
-                
-                if not selected_node and nodes:
-                    selected_node = nodes[0]
-                    
+                selected_node = _select_follower_round_robin(cluster_name, nodes, leader, self._query_indices, self._query_lock)
                 if selected_node:
                     nodes_to_query.append(selected_node)
                     
@@ -87,6 +91,10 @@ class RangeRoutingStrategy(RoutingStrategy):
 
 class HashRoutingStrategy(RoutingStrategy):
     """Default strategy: Hashing (id + timestamp) to determine target node."""
+    def __init__(self):
+        self._query_indices = {}
+        self._query_lock = threading.Lock()
+
     def get_node_insert(self,
                         record: Record,
                         leader_registry: LeaderRegistry,
@@ -110,16 +118,7 @@ class HashRoutingStrategy(RoutingStrategy):
         nodes_to_query = []
         for cluster_name, nodes in clusters.items():
             leader = leader_registry.get_leader(cluster_name)
-            # Prefer a follower; fall back to leader if no followers
-            selected_node = None
-            for node in nodes:
-                if node != leader:
-                    selected_node = node
-                    break
-            
-            if not selected_node and nodes:
-                selected_node = nodes[0]
-                
+            selected_node = _select_follower_round_robin(cluster_name, nodes, leader, self._query_indices, self._query_lock)
             if selected_node:
                 nodes_to_query.append(selected_node)
                 
@@ -131,6 +130,8 @@ class RoundRobinRoutingStrategy(RoutingStrategy):
     def __init__(self):
         self._counter = 0
         self._lock = threading.Lock()
+        self._query_indices = {}
+        self._query_lock = threading.Lock()
 
     def get_node_insert(self,
                         record: Record,
@@ -156,15 +157,7 @@ class RoundRobinRoutingStrategy(RoutingStrategy):
         nodes_to_query = []
         for cluster_name, nodes in clusters.items():
             leader = leader_registry.get_leader(cluster_name)
-            selected_node = None
-            for node in nodes:
-                if node != leader:
-                    selected_node = node
-                    break
-            
-            if not selected_node and nodes:
-                selected_node = nodes[0]
-                
+            selected_node = _select_follower_round_robin(cluster_name, nodes, leader, self._query_indices, self._query_lock)
             if selected_node:
                 nodes_to_query.append(selected_node)
         return nodes_to_query
@@ -172,6 +165,10 @@ class RoundRobinRoutingStrategy(RoutingStrategy):
 
 class LeaderRoutingStrategy(RoutingStrategy):
     """Strategy that always returns the leader of the target cluster determined by modulo on key_id."""
+    def __init__(self):
+        self._query_indices = {}
+        self._query_lock = threading.Lock()
+
     def get_node_insert(self,
                         record: Record,
                         leader_registry: LeaderRegistry,
@@ -189,15 +186,7 @@ class LeaderRoutingStrategy(RoutingStrategy):
         nodes_to_query = []
         for cluster_name, nodes in clusters.items():
             leader = leader_registry.get_leader(cluster_name)
-            selected_node = None
-            for node in nodes:
-                if node != leader:
-                    selected_node = node
-                    break
-            
-            if not selected_node and nodes:
-                selected_node = nodes[0]
-                
+            selected_node = _select_follower_round_robin(cluster_name, nodes, leader, self._query_indices, self._query_lock)
             if selected_node:
                 nodes_to_query.append(selected_node)
         return nodes_to_query
