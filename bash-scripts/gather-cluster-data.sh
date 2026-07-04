@@ -1,12 +1,28 @@
 #!/bin/bash
 set -e
 
-# --- Input Validation ---
-if [ -z "$1" ]; then
-    echo "Error: No arguments provided."
-    echo "Usage: $0 [all | <cluster_name_1> <cluster_name_2> ...]"
-    echo "Example: $0 all"
-    echo "Example: $0 A B C"
+# --- Argument Parsing ---
+SOURCE_DIR=""
+CLUSTER_NAME=""
+
+while getopts "s:c:" opt; do
+    case $opt in
+        s) SOURCE_DIR="$OPTARG" ;;
+        c) CLUSTER_NAME="$OPTARG" ;;
+        *) echo "Usage: $0 -s <source_dir> [-c <cluster_name>]"; exit 1 ;;
+    esac
+done
+
+if [ -z "$SOURCE_DIR" ]; then
+    echo "Error: Source directory (-s) is required."
+    echo "Usage: $0 -s <source_dir> [-c <cluster_name>]"
+    exit 1
+fi
+
+# Resolve source directory
+SOURCE_DIR=$(realpath "$SOURCE_DIR")
+if [ ! -d "$SOURCE_DIR" ]; then
+    echo "Error: Source directory '$SOURCE_DIR' does not exist."
     exit 1
 fi
 
@@ -14,49 +30,45 @@ fi
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 DATA_DIR="data-${TIMESTAMP}"
 
-# --- Determine clusters to gather ---
-TOPLOGY_ENV="topology.env"
-if [ "$1" = "all" ]; then
-    if [ ! -f "$TOPLOGY_ENV" ]; then
-        echo "Error: $TOPLOGY_ENV not found. Run setup-clusters.sh first."
-        exit 1
-    fi
-    source "$TOPLOGY_ENV"
-    # Get all CLUSTER_*_NODE_ID variables and extract cluster names
-    CLUSTER_NAMES=$(compgen -v | grep '^CLUSTER_' | grep '_NODE_ID$' | sed 's/CLUSTER_\(.*\)_NODE_ID/\1/' | sort)
-    if [ -z "$CLUSTER_NAMES" ]; then
-        echo "Error: No clusters found in $TOPLOGY_ENV"
-        exit 1
-    fi
-else
-    CLUSTER_NAMES="$@"
-fi
-
 # --- Create master directory ---
 mkdir -p "$DATA_DIR"
 
-# --- Gather data from each cluster ---
-for CLUSTER_NAME in $CLUSTER_NAMES; do
-    if [ ! -d "$CLUSTER_NAME" ]; then
-        echo "Warning: Cluster folder '$CLUSTER_NAME' not found. Skipping."
-        continue
+# --- Helper Function: Gather Data for a Cluster ---
+gather_cluster_data() {
+    local c_name="$1"
+    local cluster_path="$SOURCE_DIR/$c_name"
+    if [ ! -d "$cluster_path" ]; then
+        echo "Warning: Cluster folder '$cluster_path' not found. Skipping."
+        return 1
     fi
     
-    DEST_DIR="$DATA_DIR/$CLUSTER_NAME"
-    mkdir -p "$DEST_DIR"
+    local dest_dir="$DATA_DIR/$c_name"
+    mkdir -p "$dest_dir"
     
     # Find and copy all CSV files and server logs, preserving relative path within cluster folder
-    find "$CLUSTER_NAME" \( -name '*.csv' -o -name 'server_*.log' \) | while read -r src_file; do
+    find "$cluster_path" \( -name '*.csv' -o -name 'server_*.log' \) | while read -r src_file; do
         # Get relative path from cluster folder
-        rel_path="${src_file#$CLUSTER_NAME/}"
+        local rel_path="${src_file#$cluster_path/}"
         # Create destination path
-        dest="$DEST_DIR/$rel_path"
+        local dest="$dest_dir/$rel_path"
         mkdir -p "$(dirname "$dest")"
         cp "$src_file" "$dest"
     done
     
-    echo "  Gathered data from cluster '$CLUSTER_NAME'"
-done
+    echo "  Gathered data from cluster '$c_name'"
+}
+
+# --- Main Dispatch ---
+if [ -n "$CLUSTER_NAME" ]; then
+    gather_cluster_data "$CLUSTER_NAME"
+else
+    # Gather all clusters present in SOURCE_DIR (containing a cluster.config)
+    for d in "$SOURCE_DIR"/*; do
+        if [ -d "$d" ] && [ -f "$d/cluster.config" ]; then
+            gather_cluster_data "$(basename "$d")"
+        fi
+    done
+fi
 
 # --- Print absolute path ---
 ABS_PATH=$(cd "$DATA_DIR" && pwd)
