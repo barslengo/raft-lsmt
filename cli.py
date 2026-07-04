@@ -5,9 +5,9 @@ import sys
 import time
 from typing import List, Optional
 
-from client import Node, Record, QueryRequest
+from client import Node, Record, QueryRequest, BatchMetrics
 from client import DbClient, DbClientConfig
-from client import Router, HashRoutingStrategy, RoundRobinRoutingStrategy, LeaderRoutingStrategy
+from client import Router, HashRoutingStrategy, RoundRobinRoutingStrategy, RangeRoutingStrategy
 
 from concurrent.futures import wait
 
@@ -237,9 +237,10 @@ def main():
     parser = argparse.ArgumentParser(description="Raft DB CLI")
     parser.add_argument("--config", required=True, help="Path to cluster_conf.json")
     parser.add_argument("--routing-strategy", 
-                        choices=["hash", "round-robin", "leader"], 
+                        choices=["hash", "round-robin", "range"], 
                         default="hash", 
                         help="Routing strategy to use")
+    parser.add_argument("--max-key", type=int, default=5000000, help="The maximum key ID in the global keyspace (for range routing)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     args = parser.parse_args()
 
@@ -258,7 +259,7 @@ def main():
     strategy_map = {
         "hash": HashRoutingStrategy(),
         "round-robin": RoundRobinRoutingStrategy(),
-        "leader": LeaderRoutingStrategy()
+        "range": RangeRoutingStrategy(max_keyspace=args.max_key)
     }
     strategy = strategy_map[args.routing_strategy]
     router = Router(strategy)
@@ -267,8 +268,8 @@ def main():
     # 3. Setup DbClient
     client_config = DbClientConfig(
         thread_pool_size=32,
-        batch_size=4096,
-        write_timeout=5.0,
+        batch_size=8192,
+        write_timeout=10.0,
         read_timeout=10.0,
         write_cb = write_batch_cb
     )
