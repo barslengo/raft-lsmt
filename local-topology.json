@@ -1,0 +1,12 @@
+{
+  "A": [
+    { "id": 1, "host": "127.0.0.1", "raft_port": 17001, "tcp_port": 18001 },
+    { "id": 2, "host": "127.0.0.1", "raft_port": 17002, "tcp_port": 18002 },
+    { "id": 3, "host": "127.0.0.1", "raft_port": 17003, "tcp_port": 18003 }
+  ],
+  "B": [
+    { "id": 1, "host": "127.0.0.1", "raft_port": 17004, "tcp_port": 18004 },
+    { "id": 2, "host": "127.0.0.1", "raft_port": 17005, "tcp_port": 18005 },
+    { "id": 3, "host": "127.0.0.1", "raft_port": 17006, "tcp_port": 18006 }
+  ]
+}
