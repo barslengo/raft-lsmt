@@ -69,35 +69,41 @@ Configure the directory structure on each machine. creates folders only for node
 ```bash
 ./run-clusters.sh -s <output_dir> [-c <cluster_name>] [-n <node_id>]
 ```
-- **Run all local nodes in all clusters**:
-  ```bash
-  ./run-clusters.sh -s my-clusters
-  ```
-- **Run all local nodes in cluster A**:
-  ```bash
-  ./run-clusters.sh -s my-clusters -c A
-  ```
-- **Run only node 2 of cluster B**:
-  ```bash
-  ./run-clusters.sh -s my-clusters -c B -n 2
-  ```
+
+Run all local nodes in all clusters:
+```bash
+./run-clusters.sh -s my-clusters
+```
+
+Run all local nodes in cluster A:
+```bash
+./run-clusters.sh -s my-clusters -c A
+```
+
+Run only node 2 of cluster B:
+```bash
+./run-clusters.sh -s my-clusters -c B -n 2
+```
 
 ### 3. Stop Clusters
 ```bash
 ./stop-clusters.sh -s <output_dir> [-c <cluster_name>] [-n <node_id>]
 ```
-- **Stop all local nodes**:
-  ```bash
-  ./stop-clusters.sh -s my-clusters
-  ```
-- **Stop all local nodes in cluster A**:
-  ```bash
-  ./stop-clusters.sh -s my-clusters -c A
-  ```
-- **Stop only node 2 of cluster B**:
-  ```bash
-  ./stop-clusters.sh -s my-clusters -c B -n 2
-  ```
+
+Stop all local nodes:
+```bash
+./stop-clusters.sh -s my-clusters
+```
+
+Stop all local nodes in cluster A:
+```bash
+./stop-clusters.sh -s my-clusters -c A
+```
+
+Stop only node 2 of cluster B:
+```bash
+./stop-clusters.sh -s my-clusters -c B -n 2
+```
 
 ## Client Python CLI
 connect to the cluster topology and perform manual write or query operations.
@@ -106,6 +112,6 @@ connect to the cluster topology and perform manual write or query operations.
 python3 cli.py --config <topology_json> [--routing-strategy {hash,round-robin,range}] [--max-key <max_key>]
 ```
 
-  ```bash
-  python3 cli.py --config local-topology.json --routing-strategy range --max-key 5000000
-  ```
+```bash
+python3 cli.py --config local-topology.json --routing-strategy range --max-key 5000000
+```
