@@ -168,68 +168,6 @@ int sst_metadata_free(sst_metadata_t *sst_meta) {
   return 0;
 }
 
-int sst_metadata_flush(sst_metadata_t *sst_meta) { 
-  char temp_path[256];
-  snprintf(temp_path, sizeof(temp_path), "%s.tmp", sst_meta->disk_path);
-
-  FILE *fp = fopen(temp_path, "w");
-  if (!fp) {
-    perror("FAILED FLUSHING METADATA");
-    exit(1);
-  }
-
-  fwrite(&sst_meta->version, sizeof(sst_meta->version), 1, fp);
-  fwrite(&sst_meta->highest_tier, sizeof(sst_meta->highest_tier), 1, fp);
-
-  sst_node_t *node = sst_meta->list;
-  size_t meta_max_size = sizeof(sst_metadata_record_t);
-  while (node != NULL) {
-    uint8_t buf[meta_max_size];
-    uint32_t off = 0;
-    sst_metadata_record_t data = *node->content;
-
-    memcpy(buf + off, data.sstable_filename, sizeof(data.sstable_filename));
-    off += sizeof(data.sstable_filename);
-    memcpy(buf + off, data.sst_index_filename, sizeof(data.sst_index_filename));
-    off += sizeof(data.sst_index_filename);
-    memcpy(buf + off, &data.id, sizeof(data.id));
-    off += sizeof(data.id);
-    memcpy(buf + off, &data.level, sizeof(data.level));
-    off += sizeof(data.level);
-    memcpy(buf + off, &data.created_at, sizeof(data.created_at));
-    off += sizeof(data.created_at);
-    memcpy(buf + off, &data.total_bytes, sizeof(data.total_bytes));
-    off += sizeof(data.total_bytes);
-    memcpy(buf + off, &data.min_key, sizeof(data.min_key));
-    off += sizeof(data.min_key);
-    memcpy(buf + off, &data.max_key, sizeof(data.max_key));
-    off += sizeof(data.max_key);
-
-    fwrite(buf, off, 1, fp);
-    node = node->next;
-  }
-
-  if (fflush(fp) != 0) {
-    perror("Failed to flush buffer");
-    fclose(fp);
-    exit(1);
-  }
-
-  if (fsync(fileno(fp)) != 0) {
-    perror("Failed to sync to disk");
-    fclose(fp);
-    exit(1);
-  }
-
-  fclose(fp);
-
-  if (rename(temp_path, sst_meta->disk_path) != 0) {
-    perror("Failed to rename the file");
-    exit(1);
-  }
-  return 0;
-}
-
 int sst_metadata_copy_records(sst_metadata_t *sst_meta, sst_metadata_record_t **records_out, int *count_out, uint8_t *version_out, uint8_t *highest_tier_out) {
   if (sst_meta == NULL) return -1;
   int count = 0;
